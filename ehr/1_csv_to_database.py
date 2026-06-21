@@ -33,12 +33,12 @@ if __name__ == "__main__":
     athena_download = args.athena_download
     num_threads = args.num_threads
     
-    os.makedirs(TARGET_DIR)
+    os.makedirs(TARGET_DIR, exist_ok=True)
 
     LOG_DIR = os.path.join(TARGET_DIR, "logs")
     EXTRACT_DIR = os.path.join(TARGET_DIR, "extract")
 
-    os.system(f"etl_omop_femr {INPUT_DIR} {EXTRACT_DIR} {LOG_DIR} --num_threads {num_threads} --athena_download {athena_download}")
+    os.system(f"etl_generic_omop {INPUT_DIR} {EXTRACT_DIR} {LOG_DIR} --num_threads {num_threads}")
 
     logger.info(f"Femr database saved in path: {TARGET_DIR}")
     logger.info("Testing the database")

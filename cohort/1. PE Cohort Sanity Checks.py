@@ -35,9 +35,9 @@
 
 import os 
 
-USER        = "steven.ravar@mail.mcgill.ca"
-CREDENTIALS = os.path.expanduser(f"~/.config/gcloud/legacy_credentials/{USER}/adc.json")
-PROJECT     = "INSPECT_custom_data_preprocessing"
+USER        = "steven.ravary@mail.mcgill.ca"
+CREDENTIALS = os.path.expanduser("~/.cache/google-vscode-extension/auth/application_default_credentials.json")
+PROJECT     = "inspect-custom-preprocessing"
 DATASET     = "shahlab_omop_cdm5_subset_2023_03_05"
 
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS
@@ -137,7 +137,7 @@ def query_starr_omop(query,
     dtypes=kwargs['dtypes'] if "dtypes" in kwargs else None
     
     if not os.path.exists(cache_dir):
-        os.mkdir(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
     if use_cache and os.path.exists(fpath):
         #df = pd.read_csv(fpath, sep='\t', dtype=dtypes)
         print(f"Loaded from cache {hash_value}")
@@ -475,5 +475,7 @@ print(f"Numver of patient with overlaps: {d[d.mrn_date > 1].shape[0]}")
 # In[ ]:
 
 
-final_df.to_csv('radfusion_3.0_orderproc_cohort_10d_delta.csv', index=False)
+output_dir = os.path.expanduser('~/Documents/Internship_INSPECT/DATA_PROCESSED')
+os.makedirs(output_dir, exist_ok=True)
+final_df.to_csv(f'{output_dir}/radfusion_3.0_orderproc_cohort_10d_delta.csv', index=False)
 
