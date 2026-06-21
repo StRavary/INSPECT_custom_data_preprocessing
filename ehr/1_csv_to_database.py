@@ -38,7 +38,7 @@ if __name__ == "__main__":
     LOG_DIR = os.path.join(TARGET_DIR, "logs")
     EXTRACT_DIR = os.path.join(TARGET_DIR, "extract")
 
-    os.system(f"etl_simple_femr {INPUT_DIR} {EXTRACT_DIR} {LOG_DIR} --num_threads {num_threads} --athena_download {athena_download}")
+    os.system(f"etl_omop_femr {INPUT_DIR} {EXTRACT_DIR} {LOG_DIR} --num_threads {num_threads} --athena_download {athena_download}")
 
     logger.info(f"Femr database saved in path: {TARGET_DIR}")
     logger.info("Testing the database")

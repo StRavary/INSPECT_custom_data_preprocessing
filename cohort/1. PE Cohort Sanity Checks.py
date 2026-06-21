@@ -35,9 +35,9 @@
 
 import os 
 
-USER        = "mschuang@stanford.edu"
+USER        = "steven.ravar@mail.mcgill.ca"
 CREDENTIALS = os.path.expanduser(f"~/.config/gcloud/legacy_credentials/{USER}/adc.json")
-PROJECT     = "som-nero-phi-nigam-starr"
+PROJECT     = "INSPECT_custom_data_preprocessing"
 DATASET     = "shahlab_omop_cdm5_subset_2023_03_05"
 
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS

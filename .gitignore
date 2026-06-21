@@ -1,2 +1,9 @@
 .qodo
+.venv/
+__pycache__/
+*.pyc
 .env
+DATA_RAW/
+*.parquet
+columns_manifest.txt
+.DS_Store
