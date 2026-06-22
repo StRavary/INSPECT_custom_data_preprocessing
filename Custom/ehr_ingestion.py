@@ -7,7 +7,7 @@ import numpy as np
 
 class OMOPIngestionEngine:
     """
-    High-Performance EHR Ingestion Engine using PyArrow.
+    EHR Ingestion Engine using PyArrow.
     Extracts structured clinical data, constructs dense feature matrices,
     and generates binary missingness masks for self-supervised imputation.
     """
@@ -17,12 +17,33 @@ class OMOPIngestionEngine:
         os.makedirs(self.output_dir, exist_ok=True)
         
         # Define target features based on OMOP measurement_concept_id
-        # These are placeholders for common PE-related measurements (Vitals, D-dimer, Troponin, etc.)
+        # These are placeholders for common PE-related measurements (Vitals, D-dimer, Troponin, etc.), more could be added.
         self.target_measurements = {
+            # 1. Vital Signs (Hemodynamics)
             3027018: "Heart_Rate",
+            3024171: "Respiratory_Rate",
+            3027484: "Oxygen_Saturation_SpO2",
+            3004249: "Systolic_BP",
             3012888: "Diastolic_BP",
-            3023314: "Hematocrit",
-            # Add more specific concept IDs here based on clinician input
+            3020891: "Body_Temperature",
+            
+            # 2. PE Biomarkers
+            3010156: "D_Dimer",         
+            3044109: "Troponin_I",      
+            3042942: "Troponin_T",      
+            3000905: "BNP",             
+            3013721: "NT_proBNP",       
+            # 3. General Labs (CBC & Renal)
+            3016723: "Creatinine_Serum",
+            3053283: "eGFR",            
+            3000963: "Hemoglobin",      
+            3023314: "Hematocrit",      
+            3024929: "Platelet_Count",  
+            3010813: "WBC_Count",       
+            # 4. Arterial Blood Gas (ABG)
+            3027494: "PaO2_Arterial",   
+            3027495: "PaCO2_Arterial",  
+            3018445: "pH_Arterial",     
         }
 
     def ingest_measurements(self):
@@ -38,7 +59,7 @@ class OMOPIngestionEngine:
             include_columns=["person_id", "measurement_concept_id", "value_as_number", "measurement_datetime"]
         )
         
-        # Read table efficiently
+        # Read table
         table = pv.read_csv(measurement_path, convert_options=convert_options)
         
         # Filter for our target measurement concept IDs
