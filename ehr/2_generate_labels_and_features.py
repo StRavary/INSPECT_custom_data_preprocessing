@@ -234,7 +234,7 @@ if __name__ == "__main__":
     patient_ids = {row[PATIENT_ID_COLUMN] for row in cohort_lines}
 
     mortality_codes = list(
-        femr.labelers.omop.map_omop_concept_codes_to_femr_codes(
+        femr.labelers.omop.get_femr_codes(
             ontology,
             femr.labelers.omop.get_death_concepts(),
             is_ontology_expansion=True,
