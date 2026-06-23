@@ -24,11 +24,11 @@ df_master = pd.merge(df_mapping, df_labels, on='impression_id', how='inner')
 print("Loading OMOP clinical anchors...")
 # 1. Load visit start datetimes
 df_visit = pd.read_csv(visit_path, usecols=['person_id', 'visit_start_DATETIME'])
-latest_visits = df_visit.groupby('person_id')['visit_start_DATETIME'].max().reset_index()
+latest_visits = df_visit.groupby('person_id')['visit_start_DATETIME'].min().reset_index()
 
 # 2. Load procedure datetimes
 df_proc = pd.read_csv(proc_path, usecols=['person_id', 'procedure_DATETIME'])
-latest_procs = df_proc.groupby('person_id')['procedure_DATETIME'].max().reset_index()
+latest_procs = df_proc.groupby('person_id')['procedure_DATETIME'].min().reset_index()
 
 # 3. Get the absolute global minimum procedure date for the orphaned rows
 global_min_date = df_proc['procedure_DATETIME'].min()
@@ -38,14 +38,10 @@ print("Performing OMOP left joins on person_id...")
 df_master = pd.merge(df_master, latest_visits, on='person_id', how='left')
 df_master = pd.merge(df_master, latest_procs, on='person_id', how='left')
 
-# Combine datetimes into a single StudyTime column using a robust 5-tier fallback
-df_master['StudyTime'] = df_master['procedure_DATETIME_x'].fillna(
-    df_master['note_DATETIME']).fillna(
-    df_master['visit_start_DATETIME']).fillna(
-    df_master['procedure_DATETIME_y']).fillna(
-    global_min_date)
+# Combine datetimes into a single StudyTime column (no fallback to omitted records)
+df_master['StudyTime'] = df_master['procedure_DATETIME_x'].fillna(df_master['note_DATETIME'])
 
-# Drop any rows that STILL have missing StudyTime
+# Drop any rows that STILL have missing StudyTime (intentional drop to match study)
 missing_before = len(df_master)
 df_master = df_master.dropna(subset=['StudyTime'])
 missing_after = len(df_master)

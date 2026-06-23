@@ -311,6 +311,11 @@ if __name__ == "__main__":
         labeler = None
         labels = collections.defaultdict(list)
         for row in cohort_lines:
+            # Skip ghost patients physically missing from the scrubbed Redivis database
+            try:
+                _ = database[row[PATIENT_ID_COLUMN]]
+            except IndexError:
+                continue
             labels[row[PATIENT_ID_COLUMN]].append(
                 femr.labelers.Label(
                     time=row[TIME_COLUMN] - datetime.timedelta(days=1),

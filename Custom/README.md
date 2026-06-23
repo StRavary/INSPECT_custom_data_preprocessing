@@ -31,7 +31,7 @@ After downloading the raw CSVs (Step 1) and before merging the labels (Step 2), 
 This custom pipeline requires specific libraries that may not be present in the base legacy environment (e.g., PyArrow for massive matrix processing, Streamlit for data validation).
 Ensure your active virtual environment has the following installed:
 ```bash
-pip install pandas numpy pyarrow streamlit
+pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai
 ```
 *(Note: `femr` must also be installed in your active virtual environment to execute the legacy portions of the pipeline).*
 
@@ -41,7 +41,7 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 
 1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables.
 2. *(Run legacy `ehr/1_csv_to_database.py`)*
-3. `2_merge_labels.py`: Reconstructs the master cohort using OMOP clinical event anchoring to recover "ghost" patients.
+3. `2_merge_labels.py`: Reconstructs the master cohort.
 4. `3_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights.
 5. `4_custom_sanity_checks.py`: Validates the integrity of the generated sparse feature matrices.
 6. `5_ehr_ingestion.py`: Extracts dense feature matrices via PyArrow for custom MONAI pipelines.
