@@ -19,7 +19,7 @@ def download_ehr_data():
     dataset = redivis.organization("ShahLab").dataset("inspect_ehr")
     
     # Resolve the path relative to your home directory cleanly
-    output_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR")
+    output_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_CSV")
     os.makedirs(output_path, exist_ok=True)
     
     try:
@@ -37,7 +37,7 @@ def download_ehr_data():
             
             table.download(
                 path=os.path.join(output_path, safe_name),
-                format="parquet"
+                format="csv"
             )
             
         print("\n🎉 Success! All INSPECT EHR tables have been downloaded.")
