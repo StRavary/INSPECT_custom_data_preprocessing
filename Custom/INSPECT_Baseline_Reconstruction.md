@@ -39,9 +39,14 @@ To bypass this dependency, a clean Python wrapper (`Custom/run_baseline_benchmar
 The targeted script ran flawlessly, ingesting all 23,248 patients and successfully outputting the final, baseline clinical features to `DATA_RAW/EHR_FEMR_DB/features/PE`. This definitively validated the structural integrity of the local data environment, completing the baseline reproduction phase.
 
 **8. GBM Benchmark Results & AUROC Discrepancy**
-Following feature extraction, the GBM baseline was trained and evaluated for the PE diagnostic taskusing `ehr/3_train_gbm.py`, which performs hyperparameter tuning via `GridSearchCV` over a predefined train/validation split and reports test-set AUROC.
+Following feature extraction, the GBM baseline was trained and evaluated for the PE diagnostic task using `ehr/3_train_gbm.py`, which performs hyperparameter tuning via `GridSearchCV` over a predefined train/validation split and reports test-set AUROC.
 
-The reproduced GBM achieved a test AUROC of **0.7550**, compared to the **0.681** reported in the original paper — a gap of approximately 0.074.
+The reproduced GBM achieved the following metrics:
+- **Train AUROC:** 0.7799
+- **Validation AUROC:** 0.7686
+- **Test AUROC:** 0.7550
+
+This **0.7550** test AUROC is significantly higher than the **0.681** reported in the original paper — a gap of approximately 0.074.
 
 **Investigation of potential data leakage** was conducted to determine whether the inflated result was an artifact of the reconstruction process:
 
