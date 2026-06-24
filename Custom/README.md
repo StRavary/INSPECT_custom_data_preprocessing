@@ -41,8 +41,8 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 
 1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables.
 2. *(Run legacy `ehr/1_csv_to_database.py`)*
-3. `2_merge_labels.py`: Reconstructs the master cohort.
-4. `3_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights.
+3. `2_merge_labels.py`: Reconstructs the master cohort using OMOP clinical event anchoring to recover "ghost" patients.
+4. `3_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
 5. `4_custom_sanity_checks.py`: Validates the integrity of the generated sparse feature matrices.
 6. `5_ehr_ingestion.py`: Extracts dense feature matrices via PyArrow for custom MONAI pipelines.
 7. `6_image_ingestion.py`: Lazy-loads 3D CTPA volumes via MONAI.

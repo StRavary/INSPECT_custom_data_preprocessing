@@ -1,9 +1,10 @@
 import os
-import subprocess
 import sys
+import subprocess
+import argparse
 
-def run_baseline_pipeline():
-    print("Starting PE Baseline Label & Feature Generation...")
+def run_baseline_pipeline(task):
+    print(f"Starting {task} Baseline Label & Feature Generation...")
     
     # Anchor paths to the project root
     base_dir = os.path.expanduser("~/Documents/Internship_INSPECT/INSPECT_custom_data_preprocessing")
@@ -14,7 +15,7 @@ def run_baseline_pipeline():
     
     cohort_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
     db_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/extract")
-    output_dir = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/features/PE")
+    output_dir = os.path.expanduser(f"~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/features/{task}")
     
     # Construct the command array
     command = [
@@ -23,7 +24,7 @@ def run_baseline_pipeline():
         "--path_to_cohort", cohort_path,
         "--path_to_database", db_path,
         "--path_to_output_dir", output_dir,
-        "--labeling_function", "PE",
+        "--labeling_function", task,
         "--num_threads", "14"
     ]
     
@@ -36,7 +37,7 @@ def run_baseline_pipeline():
         
         if process.returncode == 0:
             print("\n==============================================================================")
-            print("Pipeline complete! Features are saved in: DATA_RAW/EHR_FEMR_DB/features/PE")
+            print(f"Pipeline complete! Features are saved in: DATA_RAW/EHR_FEMR_DB/features/{task}")
             print("==============================================================================")
         else:
             print(f"\n[!] Pipeline failed with exit code {process.returncode}")
@@ -45,4 +46,7 @@ def run_baseline_pipeline():
         print(f"Failed to execute pipeline: {e}")
 
 if __name__ == "__main__":
-    run_baseline_pipeline()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', type=str, default='PE', help='Task to generate features for')
+    args = parser.parse_args()
+    run_baseline_pipeline(args.task)

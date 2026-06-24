@@ -241,66 +241,36 @@ if __name__ == "__main__":
         )
     )
 
-    if args.labeling_function == "12_month_mortality":
-        labeler = CodeLabeler(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=365)),
-            mortality_codes,
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "6_month_mortality":
-        labeler = CodeLabeler(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=180)),
-            mortality_codes,
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "1_month_mortality":
-        labeler = CodeLabeler(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=30)),
-            mortality_codes,
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "1_month_readmission":
-        labeler = ModifiedReadmission(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=30)),
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "6_month_readmission":
-        labeler = ModifiedReadmission(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=180)),
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "12_month_readmission":
-        labeler = ModifiedReadmission(
-            cohort_lines,
-            TimeHorizon(datetime.timedelta(minutes=1), datetime.timedelta(days=365)),
-            database.get_ontology(),
-        )
-    elif args.labeling_function == "12_month_PH":
-        # We have to disable this since we aren't currently releasing source codes due to PHI issues.
-        # We hope to re-enable this shortly in the future
-        # labeler = SourceCodeLabeler(
-        #     cohort_lines,
-        #     femr.labelers.TimeHorizon(
-        #         datetime.timedelta(days=1), datetime.timedelta(days=365)
-        #     ),
-        #     PH_codes,
-        #     database.get_ontology(),
-        # )
-
+    # Changed OMOP CodeLabeler strategy for mortality/readmission to directly extract from pre-computed CSV columns 
+    # to allow for successful feature generation on the scrubbed Redivis dataset (which lacks the true positive condition_occurrence codes).
+    # Also fixed the capitalization bug for boolean evaluations.
+    auxiliary_tasks = [
+        "1_month_mortality", "6_month_mortality", "12_month_mortality",
+        "1_month_readmission", "6_month_readmission", "12_month_readmission",
+        "12_month_PH"
+    ]
+    if args.labeling_function in auxiliary_tasks:
         labeler = None
         labels = collections.defaultdict(list)
         for row in cohort_lines:
-            label = row[args.labeling_function]
-            if label == "Censored":
+            # Read the pre-computed outcome column from the labels.tsv merge
+            label = str(row.get(args.labeling_function, "")).strip().upper()
+            
+            # Skip missing or censored data
+            if label in ["CENSORED", "NAN", ""]:
+                continue
+
+            # Skip ghost patients physically missing from the scrubbed Redivis database
+            try:
+                _ = database[row[PATIENT_ID_COLUMN]]
+            except IndexError:
                 continue
 
             labels[row[PATIENT_ID_COLUMN]].append(
-                femr.labelers.Label(time=row[TIME_COLUMN], value=label == "True")
+                femr.labelers.Label(
+                    time=row[TIME_COLUMN], # Preserve the forward-looking temporal index originally used by CodeLabeler
+                    value=label == "TRUE"  # Compare against uppercase TRUE to fix case sensitivity bugs
+                )
             )
 
         for _, v in labels.items():
@@ -339,7 +309,6 @@ if __name__ == "__main__":
         labeled_patients = labeler.apply(
             path_to_patient_database=PATH_TO_PATIENT_DATABASE,
             num_threads=NUM_THREADS,
-            patient_ids=patient_ids,
         )
 
     labeled_patients.save(PATH_TO_SAVE_LABELED_PATIENTS)
