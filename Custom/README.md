@@ -2,7 +2,7 @@
 
 This directory contains the custom scripts engineered to successfully reproduce the INSPECT baseline benchmark cohort, bypassing undocumented missing data errors, un-anonymization artifacts, and hardcoded infrastructure dependencies.
 
-## 🚀 Quickstart & Prerequisites
+## Quickstart & Prerequisites
 
 To completely rebuild the baseline dataset from scratch using these custom scripts, you must ensure the following four prerequisites are met. Failure to do so will result in missing data or authentication errors.
 
@@ -11,7 +11,7 @@ Script `1_INSPECT_DL_EHR.py` connects to the Redivis API to download the raw OMO
 * Generate a Redivis API token from your account settings.
 * Export it to your terminal environment:
   ```bash
-  export REDIVIS_API_TOKEN="your_token_here"
+  export REDIVIS_API_TOKEN="your_token_here" #Safeguard API token via .env importing and .env in .gitignore
   ```
 
 ### 2. Manual AIMI Portal Downloads

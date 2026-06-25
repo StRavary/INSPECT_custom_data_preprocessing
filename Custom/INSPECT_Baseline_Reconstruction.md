@@ -4,8 +4,8 @@ Reconstructing the baseline dataset was a complex debugging process. Here is a f
 
 **1. Raw Data Download & Format Conversion**
 To conserve disk space, a Redivis downloader script (`Custom/INSPECT_DL_EHR.py`) was initially developed to download all 32+ raw OMOP tables (e.g., measurement, condition_occurrence, person) as highly compressed `.parquet` files.
-* **The Catch:** While the `.parquet` format is highly optimized for future custom processing pipelines, it was discovered that the legacy baseline pipeline strictly required uncompressed `.csv` files.
-* **The Fix:** The downloader script was updated to target the `EHR_CSV` directory directly, and a conversion script (`Custom/convert_parquet_to_csv.py`) was used to expand existing Parquet files back into flat `.csv` formats.
+* **Issue #1:** While the `.parquet` format is highly optimized for future custom processing pipelines, it was discovered that the legacy baseline pipeline strictly required uncompressed `.csv` files.
+* **Solution:** The downloader script was updated to target the `EHR_CSV` directory directly, and a conversion script (`Custom/convert_parquet_to_csv.py`) was used to expand existing Parquet files back into flat `.csv` formats.
 * **Database Compilation:** The legacy `ehr/1_csv_to_database.py` script was then successfully executed. This utilized the `femr` framework to ingest the raw CSVs and compile them into a highly optimized, longitudinal patient database located at `DATA_RAW/EHR_FEMR_DB/extract`.
 
 **2. Diagnosing the Missing Labels**
@@ -21,8 +21,8 @@ After hitting a dead end with the public dataset, an inquiry was sent to Profess
 **4. Data Reconstruction & OMOP Clinical Anchoring (`merge_labels.py`)**
 Following the download of the missing `labels_20250611.tsv` and `study_mapping_20250611.tsv` files from the AIMI portal, a custom Python script (`Custom/merge_labels.py`) was engineered to reconstruct the master file.
 * An inner join was executed between the true labels and the official study mapping.
-* **The Catch:** It was identified that exactly 779 scans in the official dataset were completely missing timestamp data (`procedure_DATETIME`). Specifically, during Stanford's strict PHI de-identification scrubbing process, the `procedure_occurrence_id` relational key was stripped entirely from 710 records, turning them into "ghost" patients.
-* **The Fix:** Because the `femr` pipeline relies on timestamps to calculate patient history, these 779 ghost records were intentionally dropped to replicate the exact constraints of the original study. The resulting master file successfully processed the remaining valid timestamped records.
+* **Issue #2:** It was identified that exactly 779 scans in the official dataset were completely missing timestamp data (`procedure_DATETIME`). Specifically, during Stanford's strict PHI de-identification scrubbing process, the `procedure_occurrence_id` relational key was stripped entirely from 710 records, turning them into "ghost" patients.
+* **Solution:** Because the `femr` pipeline relies on timestamps to calculate patient history, these 779 ghost records were intentionally dropped to replicate the exact constraints of the original study. The resulting master file successfully processed the remaining valid timestamped records.
 * The result was a cleaned `cohort_0.2.0_master_file_anon.csv` that matches the exact restricted distribution used in the official baseline benchmark.
 
 **5. Data Validation Dashboard**
@@ -66,7 +66,7 @@ During this process, three major legacy pipeline bugs were identified and patche
 * **Scrubbed OMOP Concepts:** The legacy pipeline relies on `femr.labelers.omop.CodeLabeler` to search the patient's EHR timeline for exact death/readmission codes. Because Stanford scrubbed these precise codes from the public Redivis `condition_occurrence` tables to prevent re-identification, the labeler silently failed and yielded 100% `False` evaluations.
 * **Case Sensitivity:** For `12_month_PH`, the original script attempted to read the CSV column directly via `label == "True"`. However, the boolean strings exported in the 2025 AIMI dataset are fully capitalized (`"TRUE"`).
 
-**The Fix:** Since all 7 outcomes were actually pre-computed and appended to `labels_20250611.tsv` prior to OMOP scrubbing, the script was refactored to permanently bypass `CodeLabeler` and explicitly extract the ground-truth endpoints directly from the merged cohort file.
+**Solution:** Since all 7 outcomes were actually pre-computed and appended to `labels_20250611.tsv` prior to OMOP scrubbing, the script was refactored to permanently bypass `CodeLabeler` and explicitly extract the ground-truth endpoints directly from the merged cohort file.
 
 The resulting test-set AUROC scores confirm a highly robust and functioning benchmark replication:
 
@@ -80,3 +80,70 @@ The resulting test-set AUROC scores confirm a highly robust and functioning benc
 | **6-Month Readmission**                                 | 0.7216 | 0.740 | -0.0184 |
 | **12-Month Readmission**                                | 0.7332 | 0.728 | +0.0052 |
 | **12-Month Pulmonary Hypertension (PH)**                | 0.9291 | 0.828 | +0.1011 |
+
+**10. Comprehensive Cohort Pipeline Validation (`validate_cohort_pipeline.py`)**
+To ensure absolute data integrity and catch any potential leakage or misalignment before downstream training, a rigorous validation script (`Custom/validate_cohort_pipeline.py`) was implemented. This script independently audits the outputs of all three major pipeline stages:
+
+* **Layer 1: Master Cohort CSV (`cohort_0.2.0_master_file_anon.csv`)**
+  * Verified 22,469 total rows across 18,738 unique patients.
+  * Confirmed PE prevalence is exactly 20.1% (4,508 PE+ / 17,961 PE-).
+  * Validated patient-level split integrity to ensure no single patient appears in multiple splits (train/valid/test), preventing cross-split data leakage.
+  * Identified 12 duplicate `impression_id`s, but verified they only occur within the same split (double-counting) rather than across splits.
+  * Validated `StudyTime` bounds (2000-03-03 to 2021-09-29) with 0 ghost timestamps or implausible future dates.
+
+* **Layer 2: FEMR Labels (`labeled_patients.csv`)**
+  * Validated output from the FEMR labeling step (22,469 rows), ensuring structural correctness.
+  * Verified that the label prevalence perfectly matches the original cohort CSV at exactly 20.1% (Δ=0.0%).
+  * Confirmed the 12 duplicates present in Layer 1 cascaded identically without expanding.
+
+* **Layer 3: FEMR Features (`featurized_patients.pkl`)**
+  * Audited the generated sparse feature matrix: 22,469 samples × 74,303 features with 15,363,991 non-zero elements (0.920% density).
+  * Confirmed the absence of NaN/Inf values and exact length alignment between `patient_ids`, matrix rows, label values, and label times.
+  * Re-verified that the PE prevalence in the pickle matches the master cohort CSV at exactly 20.1% (Δ=0.0%).
+
+* **Layer 4: Cross-Pipeline Split Integrity**
+  * Performed a final end-to-end audit mapping the PIDs in the featurized output back to the original cohort CSV split assignments.
+  * Confirmed the exact split counts: **Train** = 17,981 (20.2% PE+), **Valid** = 2,289 (19.6% PE+), **Test** = 2,199 (19.1% PE+).
+  * Confirmed that absolutely no `PatientID` spans multiple splits in the final featurized output, guaranteeing a leakage-free dataset for model training.
+
+This automated validation suite confirms that the custom baseline reconstruction successfully preserved the structural and distributional integrity of the INSPECT benchmark while circumventing legacy pipeline limitations.
+
+**11. CTPA Image Vectorization Pipeline (`Custom/process_ctpa.py`)**
+To extend the baseline beyond EHR-only features, a high-throughput vectorization pipeline was developed to generate fixed-length embedding vectors from all 23,340 CTPA volumes using Stanford Shah Lab's pretrained CT image encoder.
+
+* **Model:** `StanfordShahLab/resnetv2_ct` (HuggingFace), a ResNetV2 backbone pretrained on chest CT images. The checkpoint is a PyTorch Lightning artifact from the `radfusion3` multimodal fusion framework.
+* **Architecture:** Each CT volume is treated as a sequence of 2D axial slices. Slices are encoded independently through the ResNetV2 backbone, and the resulting per-slice feature vectors are mean-pooled across the depth dimension to produce a single fixed-length embedding per study.
+* **Output:** A 6,144-dimensional float32 embedding vector per patient, saved as `{patient_id}_ctpa_vector.pt`. Total embedding space: ~574MB for 23,340 studies (a **4,000:1 compression** from the 2.3TB raw CTPA dataset).
+
+**Debugging the Weight Loading (Multiple Issues)**
+
+Several non-trivial issues were encountered during model initialization:
+
+* **Issue #1 — Architecture Mismatch (Depth):** The initial implementation instantiated `resnetv2_152` (blocks `[3, 8, 36, 3]`). Checkpoint key inspection revealed the actual architecture has blocks `[3, 4, 23, 3]`, corresponding to `resnetv2_101`. Loading the wrong depth silently left 17 entire blocks randomly initialized, causing NaN outputs throughout inference.
+
+* **Issue #2 — Key Prefix Mismatch:** The PyTorch Lightning + radfusion3 wrapping results in doubly-prefixed checkpoint keys (`model.model.stages.0...`). A single `str.replace("model.", "")` call only stripped one level, leaving residual `model.` prefixes that prevented all stage weights from loading. **Solution:** All leading `model.` segments were stripped iteratively until the key matched the bare timm module namespace.
+
+* **Issue #3 — Normalization Type Mismatch (BatchNorm vs. GroupNorm):** `timm.create_model('resnetv2_101')` defaults to BatchNorm, but the checkpoint was trained using GroupNorm (the standard BiT architecture). This caused 455 `running_mean`/`running_var` buffers to be absent from the checkpoint, and the BatchNorm layers — running with default statistics of mean=0, var=1 — corrupted all activations to NaN in eval mode. **Solution:** The registered BiT variant `resnetv2_101x3_bit.goog_in21k_ft_in1k` was used instead, which correctly instantiates GroupNorm + StdConv2d, achieving a clean 304/304 key load with zero missing weights.
+
+* **Issue #4 — GRU Dimension Mismatch:** The original sequence encoder was hardcoded to `input_size=2048`. With `width_factor=3`, the ResNetV2 feature dimension is `2048 × 3 = 6,144`, causing an immediate shape error at the first GRU forward pass.
+
+* **Issue #5 — Untrained GRU Producing NaN:** The GRU and attention aggregation layers were never pretrained — the checkpoint contains only ResNetV2 weights. Routing 448 slice vectors through 3 layers of randomly initialized GRU weights caused the hidden state to diverge to NaN. **Solution:** A `spatial_mean` aggregation mode was added that bypasses the GRU entirely, mean-pooling the pretrained ResNetV2 slice features directly. This is the correct approach for fixed-feature extraction; the GRU pathway remains available for future end-to-end fine-tuning.
+
+* **Issue #6 — MONAI MetaTensor Serialization:** MONAI's `LoadImage` transform returns `MetaTensor` objects rather than standard PyTorch tensors. Saving these directly with `torch.save` produces files that require `weights_only=False` to reload, and introduces a hard dependency on the MONAI library for all downstream consumers. **Solution:** Explicit `.as_tensor()` conversion was applied in `__getitem__` immediately after the MONAI transform pipeline.
+
+**Infrastructure & I/O Issues**
+
+* **Issue #7 — GCS Cross-Region Latency:** The raw CTPA dataset (`inspaect_imgs_raw`) was stored in `us-east1` while the only available G2 GPU instance quota was in `us-central1`. Cross-region gcsfuse reads over ~76.5MB NIfTI files resulted in ~10 seconds/scan and a projected 70-hour total runtime. The bucket was copied to `inspect-imgs-central` (`us-central1`) via `gsutil -m rsync`, reducing the estimate to ~41 hours.
+
+* **Issue #8 — gcsfuse Random Seek Failures:** After remounting the us-central1 bucket, nibabel failed to read files through the gcsfuse mount with `ImageFileError`. Local copies of the same files loaded correctly, confirming the issue was gcsfuse's handling of random seeks into gzip-compressed NIfTI files. **Solution:** Remounting with `--file-cache-cache-file-for-range-read` and `--implicit-dirs` resolved the issue.
+
+* **Issue #9 — VM Service Account OAuth Scope:** The compute VM was provisioned with read-only Cloud Storage OAuth scopes, preventing writes to the new `inspect-imgs-central` bucket. IAM role grants alone were insufficient. **Solution:** `gcloud auth application-default login` was used to authenticate with broader user credentials, bypassing the VM's restricted service account scopes for the bucket copy operation.
+
+**Current Status & Pending Validation**
+
+The pipeline is actively processing all 23,340 studies on the GCP G2 instance (L4 GPU, us-central1), with results accumulating in `~/ctpa_vectors/`. Upon completion, the embedding corpus will be synced to `gs://inspect-imgs-central/sanitized_features/` via `gcloud storage rsync`.
+
+Validation of embedding quality is pending and will include:
+* **t-SNE visualization** of the 6,144-dim embedding space to assess cluster structure by PE status and clinical subtype.
+* **Cosine similarity analysis** to verify that embeddings from the same patient are more similar to each other than to random negatives.
+* **AUROC evaluation** of a linear probe trained on the frozen embeddings against the PE ground-truth labels, to benchmark the discriminative content of the pretrained features prior to any multimodal fusion.
