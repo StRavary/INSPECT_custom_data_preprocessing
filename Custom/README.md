@@ -17,8 +17,8 @@ Script `1_INSPECT_DL_EHR.py` connects to the Redivis API to download the raw OMO
 ### 2. Manual AIMI Portal Downloads
 The INSPECT dataset is split across two portals. The ground-truth labels and imaging crosswalks are NOT hosted on Redivis and cannot be downloaded programmatically due to strict Data Use Agreements (DUA).
 * Log in to the [Stanford AIMI Portal](https://aimi.stanford.edu).
-* Manually download `labels_20250611.tsv` and `study_mapping_20250611.tsv`.
-* Place both files exactly in `DATA_RAW/LABELS/`.
+* Manually download `labels_20250611.tsv`, `study_mapping_20250611.tsv`, `splits_20250611.tsv`, and `series_metadata_20250611.tsv` (or use `download_aimi_labels.py`).
+* Place all files exactly in `DATA_RAW/LABELS/`.
 
 ### 3. The "Hidden" FEMR Compilation Step
 After downloading the raw CSVs (Step 1) and before merging the labels (Step 2), you **must** compile the longitudinal patient database using the legacy `femr` framework script provided in the original repository.
@@ -59,3 +59,5 @@ Executing the auxiliary tasks successfully required patching three major legacy 
 1. **Bypassed `CodeLabeler`:** The original script searched the OMOP `condition_occurrence` tables for precise death/readmission codes. Because Stanford scrubbed these exact codes from the public dataset to preserve patient privacy, the labeler silently failed and yielded 100% `False` labels. The script was refactored to extract the true, pre-computed outcomes directly from our merged master cohort CSV.
 2. **Fixed FEMR API Deprecation:** The `femr` v0.2.x API deprecated the `patient_ids` keyword argument in `labeler.apply()`. Passing it caused a `TypeError` that completely broke the pipeline. This argument was removed.
 3. **Corrected Case Sensitivity:** For the `12_month_PH` endpoint, the original script strictly checked `label == "True"`. Because the 2025 AIMI dataset exports this column as fully capitalized (`"TRUE"`), a simple string normalization was implemented to prevent false negatives.
+
+> **Note on New Data Drops (June 2025):** Although new `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and crosswalk files were added to the pipeline to finalize the cohort, the underlying Redivis clinical data is still heavily scrubbed. Therefore, the custom bypasses implemented in the `/ehr` scripts (skipping ghost patients missing from Redivis and avoiding the OMOP `CodeLabeler`) **must remain completely intact** and should not be reverted.

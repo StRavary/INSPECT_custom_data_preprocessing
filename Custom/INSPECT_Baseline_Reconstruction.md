@@ -25,6 +25,13 @@ Following the download of the missing `labels_20250611.tsv` and `study_mapping_2
 * **Solution:** Because the `femr` pipeline relies on timestamps to calculate patient history, these 779 ghost records were intentionally dropped to replicate the exact constraints of the original study. The resulting master file successfully processed the remaining valid timestamped records.
 * The result was a cleaned `cohort_0.2.0_master_file_anon.csv` that matches the exact restricted distribution used in the official baseline benchmark.
 
+**4.1. Integration of Canonical Splits & Metadata (June 2025 Data Drop)**
+Shortly after the initial dataset reconstruction, three supplementary files were released on the AIMI portal: `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and `image_ehr_crosswalk_20250418.csv`. 
+* **The Splits:** Previously, the exact train/valid/test patient divisions were implicit or generated dynamically. The new `splits_20250611.tsv` file provided canonical benchmark split assignments.
+* **Pipeline Updates:** `Custom/2_merge_labels.py` was explicitly refactored to ingest this TSV, carefully drop any duplicate `impression_id`s, and perform an inner join to merge the `split` column directly into `cohort_0.2.0_master_file_anon.csv`. 
+* **Model Integrity:** By having the splits directly embedded in the master cohort file, the downstream LightGBM (`ehr/3_train_gbm.py`) and sequence modeling scripts are now strictly locked into using the official canonical train/valid/test divisions, avoiding any potential cross-split leakage.
+* **Relative Path Portability:** Alongside this data update, all hardcoded absolute paths (e.g. `~/Documents/Internship_INSPECT/`) across the `Custom/` pipeline scripts were dynamically refactored to use standard relative paths (`../`), ensuring seamless repository portability.
+
 **5. Data Validation Dashboard**
 To visually inspect and sanity check the generated data (including sparse feature matrices, missing value ratios, and label distributions), a custom Streamlit web dashboard (`Custom/merged_labeled_data_viewer.py`) was constructed. This allowed for interactive filtering and statistical validation of the reconstructed cohort prior to pipeline execution.
 
@@ -42,15 +49,15 @@ The targeted script ran flawlessly, ingesting all 23,248 patients and successful
 Following feature extraction, the GBM baseline was trained and evaluated for the PE diagnostic task using `ehr/3_train_gbm.py`, which performs hyperparameter tuning via `GridSearchCV` over a predefined train/validation split and reports test-set AUROC.
 
 The reproduced GBM achieved the following metrics:
-- **Train AUROC:** 0.7799
-- **Validation AUROC:** 0.7686
-- **Test AUROC:** 0.7550
+- **Train AUROC:** 0.9185
+- **Validation AUROC:** 0.7456
+- **Test AUROC:** 0.7437
 
-This **0.7550** test AUROC is significantly higher than the **0.681** reported in the original paper — a gap of approximately 0.074.
+This **0.7437** test AUROC is significantly higher than the **0.681** reported in the original paper — a gap of approximately 0.0627.
 
 **Investigation of potential data leakage** was conducted to determine whether the inflated result was an artifact of the reconstruction process:
 
-* **Ghost patient timestamp fallback (ruled out):** An initial concern was that the 5-tier OMOP timestamp fallback in `Custom/merge_labels.py` could introduce leakage. However, the 779 affected patients were dropped entirely and the pipeline was re-run. The AUROC remained at 0.7550, ruling out the fallback strategy as a meaningful contributor.
+* **Ghost patient timestamp fallback (ruled out):** An initial concern was that the 5-tier OMOP timestamp fallback in `Custom/merge_labels.py` could introduce leakage. However, the 779 affected patients were dropped entirely and the pipeline was re-run. The AUROC remained at 0.7437, ruling out the fallback strategy as a meaningful contributor.
 * **`note_DATETIME` as fallback (minor, ruled out):** Using the radiology report timestamp as a StudyTime proxy was considered a potential source of same-day leakage. However, the `-1 day` offset applied in `2_generate_labels_and_features.py` provides sufficient buffer, and the effect on the overall cohort is negligible.
 * **CountFeaturizer preprocessing over full cohort (present in original paper):** The `featurizer_age_count.preprocess_featurizers()` call in `2_generate_labels_and_features.py` is applied to all patients prior to the train/val/test split, meaning test-set patients influence vocabulary selection. This constitutes a minor form of test-set leakage. However, the same behavior is present in the original paper's codebase, so it cannot explain the performance delta.
 
@@ -72,32 +79,32 @@ The resulting test-set AUROC scores confirm a highly robust and functioning benc
 
 | Endpoint (AUROC)                                        | Custom | INSPECT | Delta |
 |---------------------------------------------------------|--------|---------|-------|
-| **Pulmonary Embolism (PE)**                             | 0.7550 | 0.681 | +0.0740 |
-| **1-Month Mortality**                                   | 0.9103 | 0.848 | +0.0623 |
-| **6-Month Mortality**                                   | 0.9221 | 0.865 | +0.0571 |
-| **12-Month Mortality**                                  | 0.9190 | 0.855 | +0.0640 |
-| **1-Month Readmission**                                 | 0.7087 | 0.737 | -0.0283 |
-| **6-Month Readmission**                                 | 0.7216 | 0.740 | -0.0184 |
-| **12-Month Readmission**                                | 0.7332 | 0.728 | +0.0052 |
-| **12-Month Pulmonary Hypertension (PH)**                | 0.9291 | 0.828 | +0.1011 |
+| **Pulmonary Embolism (PE)**                             | 0.7437 | 0.681 | +0.0627 |
+| **1-Month Mortality**                                   | 0.9267 | 0.848 | +0.0787 |
+| **6-Month Mortality**                                   | 0.8969 | 0.865 | +0.0319 |
+| **12-Month Mortality**                                  | 0.8813 | 0.855 | +0.0263 |
+| **1-Month Readmission**                                 | 0.7745 | 0.737 | +0.0375 |
+| **6-Month Readmission**                                 | 0.7089 | 0.740 | -0.0311 |
+| **12-Month Readmission**                                | 0.7463 | 0.728 | +0.0183 |
+| **12-Month Pulmonary Hypertension (PH)**                | 0.9226 | 0.828 | +0.0946 |
 
 **10. Comprehensive Cohort Pipeline Validation (`validate_cohort_pipeline.py`)**
 To ensure absolute data integrity and catch any potential leakage or misalignment before downstream training, a rigorous validation script (`Custom/validate_cohort_pipeline.py`) was implemented. This script independently audits the outputs of all three major pipeline stages:
 
 * **Layer 1: Master Cohort CSV (`cohort_0.2.0_master_file_anon.csv`)**
-  * Verified 22,469 total rows across 18,738 unique patients.
-  * Confirmed PE prevalence is exactly 20.1% (4,508 PE+ / 17,961 PE-).
+  * Verified 22,457 total rows across 18,738 unique patients.
+  * Confirmed PE prevalence is exactly 20.1% (4,503 PE+ / 17,954 PE-).
   * Validated patient-level split integrity to ensure no single patient appears in multiple splits (train/valid/test), preventing cross-split data leakage.
-  * Identified 12 duplicate `impression_id`s, but verified they only occur within the same split (double-counting) rather than across splits.
+  * Identified 0 duplicate `impression_id`s, verifying completely clean data without fan-out.
   * Validated `StudyTime` bounds (2000-03-03 to 2021-09-29) with 0 ghost timestamps or implausible future dates.
 
 * **Layer 2: FEMR Labels (`labeled_patients.csv`)**
-  * Validated output from the FEMR labeling step (22,469 rows), ensuring structural correctness.
+  * Validated output from the FEMR labeling step (22,457 rows), ensuring structural correctness.
   * Verified that the label prevalence perfectly matches the original cohort CSV at exactly 20.1% (Δ=0.0%).
-  * Confirmed the 12 duplicates present in Layer 1 cascaded identically without expanding.
+  * Confirmed zero duplicates cascaded.
 
 * **Layer 3: FEMR Features (`featurized_patients.pkl`)**
-  * Audited the generated sparse feature matrix: 22,469 samples × 74,303 features with 15,363,991 non-zero elements (0.920% density).
+  * Audited the generated sparse feature matrix: 22,457 samples × 74,303 features with ~15M non-zero elements (0.920% density).
   * Confirmed the absence of NaN/Inf values and exact length alignment between `patient_ids`, matrix rows, label values, and label times.
   * Re-verified that the PE prevalence in the pickle matches the master cohort CSV at exactly 20.1% (Δ=0.0%).
 
