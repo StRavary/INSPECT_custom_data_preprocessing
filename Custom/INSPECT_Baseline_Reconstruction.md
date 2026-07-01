@@ -111,9 +111,18 @@ This automated validation suite confirms that the custom baseline reconstruction
 **11. CTPA Image Vectorization Pipeline (`Custom/process_ctpa.py`)**
 To extend the baseline beyond EHR-only features, a high-throughput vectorization pipeline was developed to generate fixed-length embedding vectors from all 23,340 CTPA volumes using Stanford Shah Lab's pretrained CT image encoder.
 
-* **Model:** `StanfordShahLab/resnetv2_ct` (HuggingFace), a ResNetV2 backbone pretrained on chest CT images. The checkpoint is a PyTorch Lightning artifact from the `radfusion3` multimodal fusion framework.
+* **Model:** `StanfordShahLab/resnetv2_ct` (HuggingFace), a ResNetV2 backbone pretrained on chest CT images via BigTransfer (ImageNet-21k). The checkpoint is a PyTorch Lightning artifact from the `radfusion3` multimodal fusion framework.
 * **Architecture:** Each CT volume is treated as a sequence of 2D axial slices. Slices are encoded independently through the ResNetV2 backbone, and the resulting per-slice feature vectors are mean-pooled across the depth dimension to produce a single fixed-length embedding per study.
 * **Output:** A 6,144-dimensional float32 embedding vector per patient, saved as `{patient_id}_ctpa_vector.pt`. Total embedding space: ~574MB for 23,340 studies (a **4,000:1 compression** from the 2.3TB raw CTPA dataset).
+
+> **NOTE — Pre-Fine-Tuning Baseline:** Confirmed via the official INSPECT GitHub repository (`som-shahlab/INSPECT_public`) that the `resnetv2_ct` checkpoint is **not** fine-tuned on the RSPECT PE detection dataset. The INSPECT paper's imaging pipeline requires the ResNetV2 to first be fine-tuned on RSPECT (publicly available via the AWS Open Data Registry at no egress cost) before being used as a slice encoder. The current embeddings therefore represent a **pre-fine-tuning baseline** — the ResNet encodes general chest CT anatomy but has not been explicitly trained to identify PE-specific features such as filling defects, RV/LV strain patterns, or clot burden. The full replication pipeline is:
+> 1. Fine-tune `resnetv2_ct` on RSPECT (~12,000 CTPAs, study-level and slice-level PE labels)
+> 2. Apply 3-channel windowing preprocessing (lung, PE, mediastinum windows → 224×224×3 per slice)
+> 3. Re-vectorize all 23,340 INSPECT CTPAs with the fine-tuned weights
+> 4. Train the GRU/sequence model end-to-end on INSPECT PE labels
+> 5. Late fusion with EHR-GBM and MOTOR predictions via weighted mean
+>
+> The current pre-fine-tuning embeddings are retained as an ablation baseline to quantify the discriminative signal contributed by RSPECT fine-tuning.
 
 **Debugging the Weight Loading (Multiple Issues)**
 
@@ -143,7 +152,9 @@ Several non-trivial issues were encountered during model initialization:
 
 The pipeline is actively processing all 23,340 studies on the GCP G2 instance (L4 GPU, us-central1), with results accumulating in `~/ctpa_vectors/`. Upon completion, the embedding corpus will be synced to `gs://inspect-imgs-central/sanitized_features/` via `gcloud storage rsync`.
 
-Validation of embedding quality is pending and will include:
+Validation of the pre-fine-tuning baseline embeddings is pending and will include:
 * **t-SNE visualization** of the 6,144-dim embedding space to assess cluster structure by PE status and clinical subtype.
 * **Cosine similarity analysis** to verify that embeddings from the same patient are more similar to each other than to random negatives.
-* **AUROC evaluation** of a linear probe trained on the frozen embeddings against the PE ground-truth labels, to benchmark the discriminative content of the pretrained features prior to any multimodal fusion.
+* **AUROC evaluation** of a linear probe trained on the frozen embeddings against the PE ground-truth labels, to quantify the discriminative content of the general chest CT features prior to RSPECT fine-tuning.
+
+These results will serve as an ablation baseline against which the RSPECT fine-tuned embeddings can be directly compared, isolating the contribution of PE-specific fine-tuning to downstream multimodal fusion performance.

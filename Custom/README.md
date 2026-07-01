@@ -44,7 +44,18 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 3. `2_merge_labels.py`: Reconstructs the master cohort using OMOP clinical event anchoring to recover "ghost" patients.
 4. `3_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
 5. `4_custom_sanity_checks.py`: Validates the integrity of the generated sparse feature matrices.
-6. `5_ehr_ingestion.py`: Extracts dense feature matrices via PyArrow for custom MONAI pipelines.
-7. `6_image_ingestion.py`: Lazy-loads 3D CTPA volumes via MONAI.
 
 > **Note:** For a highly detailed breakdown of the exact engineering steps and debugging taken to reconstruct the baseline (including the 5-tier OMOP fallback logic), see `INSPECT_Baseline_Reconstruction.md`.
+
+## EHR Baseline Evaluation & Auxiliary Tasks
+
+To evaluate the extracted EHR features against the pulmonary embolism (PE) endpoint and all 7 auxiliary prognostic endpoints (1, 6, 12-month mortality/readmission, and 12-month PH), an automated evaluation script was introduced.
+
+### Execution Step
+6. `run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks, extracting and saving test-set AUROC scores.
+
+### Modifications to `ehr/2_generate_labels_and_features.py`
+Executing the auxiliary tasks successfully required patching three major legacy bugs in the original `ehr/2_generate_labels_and_features.py` file:
+1. **Bypassed `CodeLabeler`:** The original script searched the OMOP `condition_occurrence` tables for precise death/readmission codes. Because Stanford scrubbed these exact codes from the public dataset to preserve patient privacy, the labeler silently failed and yielded 100% `False` labels. The script was refactored to extract the true, pre-computed outcomes directly from our merged master cohort CSV.
+2. **Fixed FEMR API Deprecation:** The `femr` v0.2.x API deprecated the `patient_ids` keyword argument in `labeler.apply()`. Passing it caused a `TypeError` that completely broke the pipeline. This argument was removed.
+3. **Corrected Case Sensitivity:** For the `12_month_PH` endpoint, the original script strictly checked `label == "True"`. Because the 2025 AIMI dataset exports this column as fully capitalized (`"TRUE"`), a simple string normalization was implemented to prevent false negatives.
