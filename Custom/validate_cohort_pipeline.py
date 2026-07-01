@@ -16,9 +16,9 @@ import numpy as np
 import pandas as pd
 import scipy.sparse
 
-COHORT_PATH    = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
-LABELS_CSV     = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/features/PE/labeled_patients.csv")
-FEATURES_PKL   = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/features/PE/featurized_patients.pkl")
+COHORT_PATH    = os.path.expanduser("../DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
+LABELS_CSV     = os.path.expanduser("../DATA_RAW/EHR_FEMR_DB/features/PE/labeled_patients.csv")
+FEATURES_PKL   = os.path.expanduser("../DATA_RAW/EHR_FEMR_DB/features/PE/featurized_patients.pkl")
 
 PASS = "\033[92m PASS\033[0m"
 FAIL = "\033[91m FAIL\033[0m"

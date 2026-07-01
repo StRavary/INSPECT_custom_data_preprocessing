@@ -13,8 +13,8 @@ TASKS = [
 ]
 
 def main():
-    base_dir = os.path.expanduser("~/Documents/Internship_INSPECT/INSPECT_custom_data_preprocessing")
-    venv_python = os.path.expanduser("~/Documents/Internship_INSPECT/.venv_legacy/bin/python")
+    base_dir = os.path.expanduser("../INSPECT_custom_data_preprocessing")
+    venv_python = os.path.expanduser("../.venv_legacy/bin/python")
     
     benchmark_script = os.path.join(base_dir, "Custom", "3_run_baseline_benchmark.py")
     train_script = os.path.join(base_dir, "ehr", "3_train_gbm.py")

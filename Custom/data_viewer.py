@@ -6,7 +6,7 @@ import streamlit as st
 st.set_page_config(page_title="INSPECT EHR Data Viewer", layout="wide")
 st.title("📊 INSPECT EHR Dataset Explorer")
 
-DATA_DIR = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR")
+DATA_DIR = os.path.expanduser("../DATA_RAW/EHR")
 
 subfolders = sorted(glob.glob(os.path.join(DATA_DIR, "*/")))
 table_options = {}

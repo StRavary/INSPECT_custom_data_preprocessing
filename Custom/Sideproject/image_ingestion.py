@@ -66,8 +66,8 @@ class CTPAImageLoader:
 
 if __name__ == "__main__":
     # WARNING: You must download the images from the Stanford Azure portal first!
-    IMAGE_DIR = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/IMAGES")
-    CROSSWALK_PATH = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/image_ehr_crosswalk_20250418.csv")
+    IMAGE_DIR = os.path.expanduser("../DATA_RAW/IMAGES")
+    CROSSWALK_PATH = os.path.expanduser("../DATA_PROCESSED/image_ehr_crosswalk_20250418.csv")
     
     loader = CTPAImageLoader(raw_image_dir=IMAGE_DIR, crosswalk_path=CROSSWALK_PATH)
     

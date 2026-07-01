@@ -122,8 +122,8 @@ class OMOPIngestionEngine:
         print(f"Saved artifacts to {self.output_dir}")
 
 if __name__ == "__main__":
-    DATA_DIR = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_CSV")
-    OUT_DIR = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/upstream_tensors")
+    DATA_DIR = os.path.expanduser("../DATA_RAW/EHR_CSV")
+    OUT_DIR = os.path.expanduser("../DATA_PROCESSED/upstream_tensors")
     
     engine = OMOPIngestionEngine(data_dir=DATA_DIR, output_dir=OUT_DIR)
     engine.run_pipeline()

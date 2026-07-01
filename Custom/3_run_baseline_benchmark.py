@@ -7,15 +7,15 @@ def run_baseline_pipeline(task):
     print(f"Starting {task} Baseline Label & Feature Generation...")
     
     # Anchor paths to the project root
-    base_dir = os.path.expanduser("~/Documents/Internship_INSPECT/INSPECT_custom_data_preprocessing")
+    base_dir = os.path.expanduser("../INSPECT_custom_data_preprocessing")
     
     # Explicitly use the python executable from inside .venv_legacy
-    venv_python = os.path.expanduser("~/Documents/Internship_INSPECT/.venv_legacy/bin/python")
+    venv_python = os.path.expanduser("../.venv_legacy/bin/python")
     target_script = os.path.join(base_dir, "ehr", "2_generate_labels_and_features.py")
     
-    cohort_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
-    db_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/extract")
-    output_dir = os.path.expanduser(f"~/Documents/Internship_INSPECT/DATA_RAW/EHR_FEMR_DB/features/{task}")
+    cohort_path = os.path.expanduser("../DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
+    db_path = os.path.expanduser("../DATA_RAW/EHR_FEMR_DB/extract")
+    output_dir = os.path.expanduser(f"../DATA_RAW/EHR_FEMR_DB/features/{task}")
     
     # Construct the command array
     command = [

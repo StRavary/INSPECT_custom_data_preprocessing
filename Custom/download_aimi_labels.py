@@ -25,10 +25,12 @@ STEP-BY-STEP USAGE
 4. Run:
    python download_aimi_labels.py \\
        --labels-url  "<paste SAS URL for labels_20250611.tsv>" \\
-       --mapping-url "<paste SAS URL for study_mapping_20250611.tsv>"
+       --mapping-url "<paste SAS URL for study_mapping_20250611.tsv>" \\
+       --splits-url  "<paste SAS URL for splits_20250611.tsv>" \\
+       --metadata-url "<paste SAS URL for series_metadata_20250611.tsv>"
 
    Optionally override the output directory (default: DATA_RAW/LABELS/):
-   python download_aimi_labels.py --labels-url "..." --mapping-url "..." \\
+   python download_aimi_labels.py --labels-url "..." --mapping-url "..." --splits-url "..." --metadata-url "..." \\
        --output-dir /path/to/custom/dir
 
 NOTE: SAS URLs are time-limited (typically 24–72 hours). If you get an
@@ -47,11 +49,13 @@ import hashlib
 # ---------------------------------------------------------------------------
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT  = os.path.dirname(SCRIPT_DIR)          # INSPECT_custom_data_preprocessing/
-DEFAULT_OUTDIR = os.path.join(PROJECT_ROOT, "DATA_RAW", "LABELS")
+DEFAULT_OUTDIR = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "DATA_RAW", "LABELS"))
 
 EXPECTED_FILES = {
     "labels_20250611.tsv":        "labels-url",
     "study_mapping_20250611.tsv": "mapping-url",
+    "splits_20250611.tsv":        "splits-url",
+    "series_metadata_20250611.tsv": "metadata-url",
 }
 
 
@@ -143,6 +147,16 @@ def main():
         help="SAS URL for study_mapping_20250611.tsv (copy from AIMI portal after login)",
     )
     parser.add_argument(
+        "--splits-url",
+        metavar="URL",
+        help="SAS URL for splits_20250611.tsv (copy from AIMI portal after login)",
+    )
+    parser.add_argument(
+        "--metadata-url",
+        metavar="URL",
+        help="SAS URL for series_metadata_20250611.tsv (copy from AIMI portal after login)",
+    )
+    parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTDIR,
         metavar="DIR",
@@ -159,6 +173,8 @@ def main():
     url_map = {
         "labels_20250611.tsv":        args.labels_url,
         "study_mapping_20250611.tsv": args.mapping_url,
+        "splits_20250611.tsv":        args.splits_url,
+        "series_metadata_20250611.tsv": args.metadata_url,
     }
 
     # Prompt interactively for any missing URLs

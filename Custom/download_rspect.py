@@ -72,7 +72,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "destination", 
         nargs="?", 
-        default=os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/RSPECT"),
+        default=os.path.expanduser("../DATA_RAW/RSPECT"),
         help="Local directory to save the dataset."
     )
     parser.add_argument(

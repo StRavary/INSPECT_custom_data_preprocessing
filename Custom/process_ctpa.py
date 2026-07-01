@@ -12,7 +12,9 @@ from monai.transforms import (
     ScaleIntensityRange,
     Resize
 )
-
+# For ablation study, we use the "spatial_mean" aggregation method.
+# This means we take the mean of the ResNet features across all slices
+# to produce a fixed-size embedding for each patient. No retraining of the encoder is performed.
 # =========================================================================
 # Stanford ResNetV2-101x3 Backbone Encoder Architecture
 # =========================================================================
@@ -24,7 +26,7 @@ from monai.transforms import (
 # =========================================================================
 
 SLICE_ENCODER_FEATURES = 6144   # resnetv2_101 × width_factor=3
-CHUNK_SIZE = 32                  # max slices per GPU forward pass (tune for VRAM)
+CHUNK_SIZE = 32                 # max slices per GPU forward pass (tune for VRAM e.g. done on 16GB L400 GPU)
 
 
 

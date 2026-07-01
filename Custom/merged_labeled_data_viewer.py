@@ -1,7 +1,7 @@
 """
 To run this data viewer, execute the following command in your terminal:
 
-~/Documents/Internship_INSPECT/.venv_legacy/bin/python -m streamlit run ~/Documents/Internship_INSPECT/INSPECT_custom_data_preprocessing/Custom/merged_labeled_data_viewer.py
+../.venv_legacy/bin/python -m streamlit run ../INSPECT_custom_data_preprocessing/Custom/merged_labeled_data_viewer.py
 """
 
 import streamlit as st

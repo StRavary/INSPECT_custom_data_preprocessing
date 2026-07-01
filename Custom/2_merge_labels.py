@@ -2,11 +2,12 @@ import pandas as pd
 import os
 
 # 1. Paths
-labels_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/LABELS/labels_20250611.tsv")
-mapping_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/LABELS/study_mapping_20250611.tsv")
-proc_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_CSV/procedure_occurrence.csv")
-visit_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_RAW/EHR_CSV/visit_occurrence.csv")
-output_path = os.path.expanduser("~/Documents/Internship_INSPECT/DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
+labels_path = os.path.expanduser("../DATA_RAW/LABELS/labels_20250611.tsv")
+mapping_path = os.path.expanduser("../DATA_RAW/LABELS/study_mapping_20250611.tsv")
+splits_path = os.path.expanduser("../DATA_RAW/LABELS/splits_20250611.tsv")
+proc_path = os.path.expanduser("../DATA_RAW/EHR_CSV/procedure_occurrence.csv")
+visit_path = os.path.expanduser("../DATA_RAW/EHR_CSV/visit_occurrence.csv")
+output_path = os.path.expanduser("../DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")
 
 print("Loading true labels...")
 df_labels = pd.read_csv(labels_path, sep='\t')
@@ -14,12 +15,17 @@ df_labels = pd.read_csv(labels_path, sep='\t')
 print("Loading official study mapping...")
 df_mapping = pd.read_csv(mapping_path, sep='\t')
 
+print("Loading split definitions...")
+df_splits = pd.read_csv(splits_path, sep='\t')
+
 # Ensure impression_id is string in both to prevent merge issues
 df_labels['impression_id'] = df_labels['impression_id'].astype(str)
 df_mapping['impression_id'] = df_mapping['impression_id'].astype(str)
+df_splits['impression_id'] = df_splits['impression_id'].astype(str)
 
 print("Merging datasets on impression_id...")
 df_master = pd.merge(df_mapping, df_labels, on='impression_id', how='inner')
+df_master = pd.merge(df_master, df_splits[['impression_id', 'split']].drop_duplicates(subset=['impression_id']), on='impression_id', how='inner')
 
 print("Loading OMOP clinical anchors...")
 # 1. Load visit start datetimes
