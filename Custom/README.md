@@ -37,13 +37,26 @@ pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai
 
 ## 📂 Execution Order
 
-Once the prerequisites are satisfied, execute the scripts in the following numbered order:
+Once the prerequisites are satisfied, execute the scripts in the following numbered order. The pipeline is separated into four logical phases:
 
-1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables.
+### Phase 1: Downloading Raw Data
+0. `0a_download_aimi_labels.py` & `0b_download_rspect.py`: Fetch standard clinical tags and RSPECT image data.
+
+### Phase 2: EHR Tabular Processing & Sanity Checks
+1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables from Redivis.
 2. *(Run legacy `ehr/1_csv_to_database.py`)*
 3. `2_merge_labels.py`: Reconstructs the master cohort using OMOP clinical event anchoring to recover "ghost" patients.
-4. `3_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
-5. `4_custom_sanity_checks.py`: Validates the integrity of the generated sparse feature matrices.
+4. `3_custom_sanity_checks.py`: Validates the integrity of the generated sparse feature matrices.
+5. `4_validate_cohort_pipeline.py`: Runs comprehensive checks on the dataset split sizes and potential target leakages.
+
+### Phase 3: 3D Image Ingestion & Vector Processing
+6. `5a_process_ctpa.py` / `5b_process_ctpa_tte.py`: Extracts 6144-dim pre-trained vectors from the raw CTPA 3D volumes.
+7. `6_analyze_vectors.py`: Performs analytical calculations on the vectors, including PCA variance explanation, cosine similarity clustering, and t-SNE mapping.
+8. `7_compress_vectors.py`: Drops the isotropic dimensionality by standard-scaling and performing PCA to retain 50 components (holding ~84.5% variance globally) to optimize PyArrow/MONAI I/O performance.
+
+### Phase 4: Datasets, ML Training & Benchmarks
+9. `8_vector_ingestion.py`: High-speed multimodal PyTorch dataset to seamlessly fuse EHR tabular PyArrow frames with the compressed 50-dim image vectors.
+10. `9a_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
 
 > **Note:** For a highly detailed breakdown of the exact engineering steps and debugging taken to reconstruct the baseline (including the 5-tier OMOP fallback logic), see `INSPECT_Baseline_Reconstruction.md`.
 
@@ -52,7 +65,7 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 To evaluate the extracted EHR features against the pulmonary embolism (PE) endpoint and all 7 auxiliary prognostic endpoints (1, 6, 12-month mortality/readmission, and 12-month PH), an automated evaluation script was introduced.
 
 ### Execution Step
-6. `run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks, extracting and saving test-set AUROC scores.
+11. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks, extracting and saving test-set AUROC scores.
 
 ### Modifications to `ehr/2_generate_labels_and_features.py`
 Executing the auxiliary tasks successfully required patching three major legacy bugs in the original `ehr/2_generate_labels_and_features.py` file:
