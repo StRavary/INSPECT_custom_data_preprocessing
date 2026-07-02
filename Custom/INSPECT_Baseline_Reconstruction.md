@@ -155,9 +155,9 @@ Several non-trivial issues were encountered during model initialization:
 
 * **Issue #9 — VM Service Account OAuth Scope:** The compute VM was provisioned with read-only Cloud Storage OAuth scopes, preventing writes to the new `inspect-imgs-central` bucket. IAM role grants alone were insufficient. **Solution:** `gcloud auth application-default login` was used to authenticate with broader user credentials, bypassing the VM's restricted service account scopes for the bucket copy operation.
 
-**Current Status & Pending Validation**
+**Current Status & Data Transfer**
 
-The pipeline is actively processing all 23,340 studies on the GCP G2 instance (L4 GPU, us-central1), with results accumulating in `~/ctpa_vectors/`. Upon completion, the embedding corpus will be synced to `gs://inspect-imgs-central/sanitized_features/` via `gcloud storage rsync`.
+The remote pipeline successfully processed the entire CTPA dataset on the GCP G2 instance. The resulting embedding corpus was synced via `gcloud storage rsync` and downloaded locally. The 23,227 raw `[6144]`-dimensional output vectors are now unzipped and stored at `DATA_PROCESSED/Ablation study ResnetV2-101x3 vectors/ctpa_vectors` for local baseline ablation studies.
 
 **12. Baseline Embedding Analysis & Compression (`6_analyze_vectors.py` & `7_compress_vectors.py`)**
 Validation of the pre-fine-tuning baseline embeddings was executed. The analysis revealed that the raw CNN feature extraction yielded an extremely highly correlated spatial embedding space:
