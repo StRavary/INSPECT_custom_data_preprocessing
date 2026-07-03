@@ -40,7 +40,7 @@ pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai
 Once the prerequisites are satisfied, execute the scripts in the following numbered order. The pipeline is separated into four logical phases:
 
 ### Phase 1: Downloading Raw Data
-0. `0a_download_aimi_labels.py` & `0b_download_rspect.py`: Fetch standard clinical tags and RSPECT image data.
+0. `0a_download_aimi_labels.py`, `0b_download_rspect.py`, & `0c_download_ctpa_images.py`: Fetch standard clinical tags, RSPECT image data, and raw CTPA scans respectively.
 
 ### Phase 2: EHR Tabular Processing & Sanity Checks
 1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables from Redivis.
