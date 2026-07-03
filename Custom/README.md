@@ -17,8 +17,8 @@ Script `1_INSPECT_DL_EHR.py` connects to the Redivis API to download the raw OMO
 ### 2. Manual AIMI Portal Downloads
 The INSPECT dataset is split across two portals. The ground-truth labels and imaging crosswalks are NOT hosted on Redivis and cannot be downloaded programmatically due to strict Data Use Agreements (DUA).
 * Log in to the [Stanford AIMI Portal](https://aimi.stanford.edu).
-* Manually download `labels_20250611.tsv`, `study_mapping_20250611.tsv`, `splits_20250611.tsv`, and `series_metadata_20250611.tsv` (or use `download_aimi_labels.py`).
-* Place all files exactly in `DATA_RAW/LABELS/`.
+* Manually download `labels_20250611.tsv`, `study_mapping_20250611.tsv`, `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and `image_ehr_crosswalk_20250418.csv` (or use `download_aimi_labels.py`).
+* Place labels, mapping, splits, and metadata files in `DATA_RAW/LABELS/`. The crosswalk file should be placed in `DATA_PROCESSED/`.
 
 ### 3. The "Hidden" FEMR Compilation Step
 After downloading the raw CSVs (Step 1) and before merging the labels (Step 2), you **must** compile the longitudinal patient database using the legacy `femr` framework script provided in the original repository.
