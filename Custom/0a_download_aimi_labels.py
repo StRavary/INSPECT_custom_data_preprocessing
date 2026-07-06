@@ -1,8 +1,9 @@
 """
 download_aimi_labels.py
 -----------------------
-Downloads labels_20250611.tsv and study_mapping_20250611.tsv from the
-Stanford AIMI Portal into DATA_RAW/LABELS/.
+Downloads labels_20250611.tsv, study_mapping_20250611.tsv, splits_20250611.tsv,
+series_metadata_20250611.tsv, and image_ehr_crosswalk_20250418.csv from the
+Stanford AIMI Portal.
 
 WHY THIS SCRIPT EXISTS
 ----------------------
@@ -22,15 +23,28 @@ STEP-BY-STEP USAGE
 3. Right-click the download button for each file → "Copy link address"
    (or click Download and capture the URL from your browser's download manager).
 
+   The required files and their corresponding AIMI/Redivis reference paths are:
+   - labels_20250611.tsv
+     → aimi.inspect_a_multimodal_dataset_for_pulmonary_embolism_diagnosis_and_prognosis:2n96:v1_0.full:q80g/labels_20250611.tsv
+   - study_mapping_20250611.tsv
+     → aimi.inspect_a_multimodal_dataset_for_pulmonary_embolism_diagnosis_and_prognosis:2n96:v1_0.full:q80g/study_mapping_20250611.tsv
+   - splits_20250611.tsv
+     → aimi.inspect_a_multimodal_dataset_for_pulmonary_embolism_diagnosis_and_prognosis:2n96:v1_0.full:q80g/splits_20250611.tsv
+   - series_metadata_20250611.tsv
+     → aimi.inspect_a_multimodal_dataset_for_pulmonary_embolism_diagnosis_and_prognosis:2n96:v1_0.full:q80g/series_metadata_20250611.tsv
+   - image_ehr_crosswalk_20250418.csv
+     → aimi.inspect_a_multimodal_dataset_for_pulmonary_embolism_diagnosis_and_prognosis:2n96:v1_0.full:q80g/image_ehr_crosswalk_20250418.csv
+
 4. Run:
-   python download_aimi_labels.py \\
-       --labels-url  "<paste SAS URL for labels_20250611.tsv>" \\
-       --mapping-url "<paste SAS URL for study_mapping_20250611.tsv>" \\
-       --splits-url  "<paste SAS URL for splits_20250611.tsv>" \\
-       --metadata-url "<paste SAS URL for series_metadata_20250611.tsv>"
+   python download_aimi_labels.py \
+       --labels-url  "<paste SAS URL for labels_20250611.tsv>" \
+       --mapping-url "<paste SAS URL for study_mapping_20250611.tsv>" \
+       --splits-url  "<paste SAS URL for splits_20250611.tsv>" \
+       --metadata-url "<paste SAS URL for series_metadata_20250611.tsv>" \
+       --crosswalk-url "<paste SAS URL for image_ehr_crosswalk_20250418.csv>"
 
    Optionally override the output directory (default: DATA_RAW/LABELS/):
-   python download_aimi_labels.py --labels-url "..." --mapping-url "..." --splits-url "..." --metadata-url "..." \\
+   python download_aimi_labels.py --labels-url "..." --mapping-url "..." --splits-url "..." --metadata-url "..." --crosswalk-url "..." \
        --output-dir /path/to/custom/dir
 
 NOTE: SAS URLs are time-limited (typically 24–72 hours). If you get an
@@ -56,6 +70,7 @@ EXPECTED_FILES = {
     "study_mapping_20250611.tsv": "mapping-url",
     "splits_20250611.tsv":        "splits-url",
     "series_metadata_20250611.tsv": "metadata-url",
+    "image_ehr_crosswalk_20250418.csv": "crosswalk-url",
 }
 
 
@@ -106,8 +121,8 @@ def md5sum(filepath: str) -> str:
     return h.hexdigest()
 
 
-def validate_tsv(filepath: str) -> None:
-    """Basic sanity checks: file is non-empty and looks like a TSV."""
+def validate_file(filepath: str) -> None:
+    """Basic sanity checks: file is non-empty and looks like a TSV or CSV."""
     size = os.path.getsize(filepath)
     if size == 0:
         raise ValueError(f"Downloaded file is empty: {filepath}")
@@ -115,14 +130,18 @@ def validate_tsv(filepath: str) -> None:
     with open(filepath, "r", encoding="utf-8") as f:
         header = f.readline().rstrip("\n")
 
-    if "\t" not in header:
+    is_csv = filepath.endswith(".csv")
+    sep = "," if is_csv else "\t"
+    sep_name = "comma" if is_csv else "tab"
+
+    if sep not in header:
         raise ValueError(
-            f"File does not appear to be tab-separated.\n"
+            f"File does not appear to be {sep_name}-separated.\n"
             f"  First line: {header[:120]!r}\n"
             f"  If this looks like an HTML error page, the SAS URL may have expired."
         )
 
-    col_count = len(header.split("\t"))
+    col_count = len(header.split(sep))
     print(f"  ✓ {os.path.basename(filepath)}  |  {size / 1024:.1f} KB  |  {col_count} columns  |  MD5: {md5sum(filepath)}")
 
 
@@ -157,6 +176,11 @@ def main():
         help="SAS URL for series_metadata_20250611.tsv (copy from AIMI portal after login)",
     )
     parser.add_argument(
+        "--crosswalk-url",
+        metavar="URL",
+        help="SAS URL for image_ehr_crosswalk_20250418.csv (copy from AIMI portal after login)",
+    )
+    parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTDIR,
         metavar="DIR",
@@ -175,6 +199,7 @@ def main():
         "study_mapping_20250611.tsv": args.mapping_url,
         "splits_20250611.tsv":        args.splits_url,
         "series_metadata_20250611.tsv": args.metadata_url,
+        "image_ehr_crosswalk_20250418.csv": args.crosswalk_url,
     }
 
     # Prompt interactively for any missing URLs
@@ -188,7 +213,7 @@ def main():
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    print(f"\nOutput directory: {args.output_dir}\n")
+    print(f"\nOutput directory for labels: {args.output_dir}\n")
 
     # Download each file
     errors = []
@@ -197,16 +222,22 @@ def main():
             print(f"WARNING: skipping {filename} — no URL provided.")
             continue
 
-        dest = os.path.join(args.output_dir, filename)
+        # If it is the crosswalk and using default output directory, place it in DATA_PROCESSED
+        if filename == "image_ehr_crosswalk_20250418.csv" and args.output_dir == DEFAULT_OUTDIR:
+            dest_dir = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "DATA_PROCESSED"))
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, filename)
+        else:
+            dest = os.path.join(args.output_dir, filename)
 
         if args.skip_existing and os.path.exists(dest):
             print(f"  Skipping {filename} (already exists, --skip-existing)")
-            validate_tsv(dest)
+            validate_file(dest)
             continue
 
         try:
             download_file(url, dest)
-            validate_tsv(dest)
+            validate_file(dest)
         except Exception as e:
             errors.append((filename, str(e)))
 
@@ -218,9 +249,15 @@ def main():
         sys.exit(1)
     else:
         print("All files downloaded and validated successfully.")
-        print(f"Place them in DATA_RAW/LABELS/ if not already there:")
-        for filename in url_map:
-            print(f"  {os.path.join(args.output_dir, filename)}")
+        print("Place/confirm files in their expected locations:")
+        for filename, url in url_map.items():
+            if not url:
+                continue
+            if filename == "image_ehr_crosswalk_20250418.csv" and args.output_dir == DEFAULT_OUTDIR:
+                dest = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "DATA_PROCESSED", filename))
+            else:
+                dest = os.path.join(args.output_dir, filename)
+            print(f"  {dest}")
 
 
 if __name__ == "__main__":
