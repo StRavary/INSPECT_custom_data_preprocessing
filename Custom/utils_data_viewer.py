@@ -1,3 +1,9 @@
+"""
+To run this data viewer, execute the following command in your terminal:
+
+../.venv_legacy/bin/python -m streamlit run ./utils_data_viewer.py
+"""
+
 import os
 import glob
 import pandas as pd
