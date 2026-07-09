@@ -7,3 +7,4 @@ DATA_RAW/
 *.parquet
 columns_manifest.txt
 .DS_Store
+DATA_PROCESSED/
