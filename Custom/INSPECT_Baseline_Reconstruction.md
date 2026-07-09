@@ -115,7 +115,7 @@ To ensure absolute data integrity and catch any potential leakage or misalignmen
 
 This automated validation suite confirms that the custom baseline reconstruction successfully preserved the structural and distributional integrity of the INSPECT benchmark while circumventing legacy pipeline limitations.
 
-**11. CTPA Image Vectorization Pipeline (`Custom/process_ctpa.py`)**
+**11. CTPA Image Vectorization Pipeline (`Custom/5_process_ctpa.py`)**
 To extend the baseline beyond EHR-only features, a high-throughput vectorization pipeline was developed to generate fixed-length embedding vectors from all 23,340 CTPA volumes using Stanford Shah Lab's pretrained CT image encoder.
 
 * **Model:** `StanfordShahLab/resnetv2_ct` (HuggingFace), a ResNetV2 backbone pretrained on chest CT images via BigTransfer (ImageNet-21k). The checkpoint is a PyTorch Lightning artifact from the `radfusion3` multimodal fusion framework.

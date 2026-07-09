@@ -16,8 +16,8 @@ Script `1_INSPECT_DL_EHR.py` connects to the Redivis API to download the raw OMO
 
 ### 2. Manual AIMI Portal Downloads
 The INSPECT dataset is split across two portals. The ground-truth labels and imaging crosswalks are NOT hosted on Redivis and cannot be downloaded programmatically due to strict Data Use Agreements (DUA).
-* Log in to the [Stanford AIMI Portal](https://aimi.stanford.edu).
-* Manually download `labels_20250611.tsv`, `study_mapping_20250611.tsv`, `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and `image_ehr_crosswalk_20250418.csv` (or use `download_aimi_labels.py`).
+* Log in to the [Stanford AIMI Portal](https://stanford.redivis.com/datasets/2n96-d71hggrbf).
+* Manually download `labels_20250611.tsv`, `study_mapping_20250611.tsv`, `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and `image_ehr_crosswalk_20250418.csv` (or use `download_aimi_labels.py` -  manal download recommended).
 * Place labels, mapping, splits, and metadata files in `DATA_RAW/LABELS/`. The crosswalk file should be placed in `DATA_PROCESSED/`.
 
 ### 3. The "Hidden" FEMR Compilation Step
@@ -31,9 +31,9 @@ After downloading the raw CSVs (Step 1) and before merging the labels (Step 2), 
 This custom pipeline requires specific libraries that may not be present in the base legacy environment (e.g., PyArrow for massive matrix processing, Streamlit for data validation).
 Ensure your active virtual environment has the following installed:
 ```bash
-pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai
+pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai timm huggingface-hub
 ```
-*(Note: `femr` must also be installed in your active virtual environment to execute the legacy portions of the pipeline).*
+*(Note: `femr==0.0.20` must also be installed in your active virtual environment to execute the legacy portions of the pipeline: `pip install femr==0.0.20`)*.
 
 ## 📂 Execution Order
 
@@ -50,7 +50,7 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 5. `4_validate_cohort_pipeline.py`: Runs comprehensive checks on the dataset split sizes and potential target leakages.
 
 ### Phase 3: 3D Image Ingestion & Vector Processing
-6. `5a_process_ctpa.py` / `5b_process_ctpa_tte.py`: Extracts 6144-dim pre-trained vectors from the raw CTPA 3D volumes.
+6. `5_process_ctpa.py`: Extracts 6144-dim pre-trained vectors from the raw CTPA 3D volumes.
 7. `6_analyze_vectors.py`: Performs analytical calculations on the vectors, including PCA variance explanation, cosine similarity clustering, and t-SNE mapping.
 8. `7_compress_vectors.py`: Drops the isotropic dimensionality by standard-scaling and performing PCA to retain 50 components (holding ~84.5% variance globally) to optimize PyArrow/MONAI I/O performance.
 
