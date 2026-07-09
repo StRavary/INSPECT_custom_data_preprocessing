@@ -16,7 +16,7 @@ def main():
     base_dir = os.path.expanduser("../INSPECT_custom_data_preprocessing")
     venv_python = os.path.expanduser("../.venv_legacy/bin/python")
     
-    benchmark_script = os.path.join(base_dir, "Custom", "3_run_baseline_benchmark.py")
+    benchmark_script = os.path.join(base_dir, "Custom", "9a_run_baseline_benchmark.py")
     train_script = os.path.join(base_dir, "ehr", "3_train_gbm.py")
     cohort_path = os.path.join(base_dir, "..", "DATA_PROCESSED", "cohort_0.2.0_master_file_anon.csv")
     db_path = os.path.join(base_dir, "..", "DATA_RAW", "EHR_FEMR_DB", "extract")
