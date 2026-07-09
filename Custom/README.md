@@ -28,12 +28,17 @@ After downloading the raw CSVs (Step 1) and before merging the labels (Step 2), 
   3. Run `Custom/2_merge_labels.py`
 
 ### 4. Python Environment Dependencies
-This custom pipeline requires specific libraries that may not be present in the base legacy environment (e.g., PyArrow for massive matrix processing, Streamlit for data validation).
-Ensure your active virtual environment has the following installed:
-```bash
-pip install pandas numpy pyarrow streamlit python-dotenv redivis torch monai timm huggingface-hub
-```
-*(Note: `femr==0.0.20` must also be installed in your active virtual environment to execute the legacy portions of the pipeline: `pip install femr==0.0.20`)*.
+To execute the legacy portions of the pipeline (like `femr` extraction and the baseline GBM models), you **must** strictly use the exact environment specifications provided by the original authors to avoid severe C-API crashes (e.g., Numpy 2.x incompatibilities) and Pandas syntax deprecations.
+
+1. **First, install the exact legacy base environment:**
+   ```bash
+   pip install -r ehr/requirements.txt
+   ```
+2. **Next, install the custom pipeline supplements:**
+   This custom pipeline relies on modern utility libraries for the new modalities (e.g., PyArrow for massive matrix processing, Streamlit for data validation, PyTorch/MONAI for image ingestion). These should be installed *after* the base requirements:
+   ```bash
+   pip install pyarrow streamlit python-dotenv redivis torch monai timm huggingface-hub
+   ```
 
 ## 📂 Execution Order
 
