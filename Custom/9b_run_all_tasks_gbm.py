@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 TASKS = [
+    "PE",
     "1_month_mortality",
     "6_month_mortality",
     "12_month_mortality",
