@@ -36,11 +36,12 @@ Shortly after the initial dataset reconstruction, three supplementary files were
 To visually inspect and sanity check the generated data (including sparse feature matrices, missing value ratios, and label distributions), a custom Streamlit web dashboard (`Custom/merged_labeled_data_viewer.py`) was constructed. This allowed for interactive filtering and statistical validation of the reconstructed cohort prior to pipeline execution.
 
 **6. Bypassing the Legacy Pipeline (`run_baseline_benchmark.py`)**
-The repository's master script (`run_all_ehr.py`) is designed to train massive deep-learning models (MOTOR/CLMBR). Two critical errors were encountered when attempting execution:
+The repository's master script (`run_all_ehr.py`) is designed to train massive deep-learning models (MOTOR/CLMBR). Three critical errors and limitations were encountered when attempting execution:
 * The legacy Python 3.10 environment had an incompatible JAX/jaxlib installation.
 * The script's hardcoded paths attempted to load the Foundation Model weights from internal `/share/pi/` servers. While the MOTOR model is actively hosted on Hugging Face (`StanfordShahLab/motor-t-base`), access requires formal approval which was pending at the time of execution.
+* **Hardcoded Extract Paths:** The original script hardcoded the database extract path to `inspect_femr_extract/extract` inside the output directory. To allow flexibility when using pre-generated multi-gigabyte databases (like the 21GB FEMR DB), `ehr/run_all_ehr.py` was directly modified to include an `--extract_path` argument. This explicitly overrides the hardcoded path, allowing the pipeline to skip the database generation step seamlessly.
 
-To bypass this dependency, a clean Python wrapper (`Custom/run_baseline_benchmark.py`) was implemented. This script manually invoked the legacy Python environment and executed only Step 2 (`2_generate_labels_and_features.py`) against the newly reconstructed master cohort.
+To bypass these dependencies, a clean Python wrapper (`Custom/run_baseline_benchmark.py`) was implemented. This script manually invoked the legacy Python environment and executed only Step 2 (`2_generate_labels_and_features.py`) against the newly reconstructed master cohort.
 
 **7. Successful Feature Extraction**
 The targeted script ran flawlessly, ingesting all 23,248 patients and successfully outputting the final, baseline clinical features to `DATA_RAW/EHR_FEMR_DB/features/PE`. This definitively validated the structural integrity of the local data environment, completing the baseline reproduction phase.

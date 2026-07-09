@@ -67,10 +67,15 @@ To evaluate the extracted EHR features against the pulmonary embolism (PE) endpo
 ### Execution Step
 11. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks, extracting and saving test-set AUROC scores.
 
-### Modifications to `ehr/2_generate_labels_and_features.py`
-Executing the auxiliary tasks successfully required patching three major legacy bugs in the original `ehr/2_generate_labels_and_features.py` file:
+### Modifications to Original `ehr/` Scripts
+Executing the auxiliary tasks and the master pipeline successfully required patching legacy bugs in the original `ehr/` files:
+
+#### `ehr/2_generate_labels_and_features.py`
 1. **Bypassed `CodeLabeler`:** The original script searched the OMOP `condition_occurrence` tables for precise death/readmission codes. Because Stanford scrubbed these exact codes from the public dataset to preserve patient privacy, the labeler silently failed and yielded 100% `False` labels. The script was refactored to extract the true, pre-computed outcomes directly from our merged master cohort CSV.
 2. **Fixed FEMR API Deprecation:** The `femr` v0.2.x API deprecated the `patient_ids` keyword argument in `labeler.apply()`. Passing it caused a `TypeError` that completely broke the pipeline. This argument was removed.
 3. **Corrected Case Sensitivity:** For the `12_month_PH` endpoint, the original script strictly checked `label == "True"`. Because the 2025 AIMI dataset exports this column as fully capitalized (`"TRUE"`), a simple string normalization was implemented to prevent false negatives.
+
+#### `ehr/run_all_ehr.py`
+1. **Added `--extract_path` Argument:** The original master script hardcoded the FEMR database location to `inspect_femr_extract/extract` within the output directory. A custom `--extract_path` argument was added. This allows the pipeline to point directly to pre-generated multi-gigabyte database extracts (like the 21GB `event_metadata` extract) located anywhere on disk, seamlessly bypassing the expensive database creation step.
 
 > **Note on New Data Drops (June 2025):** Although new `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and crosswalk files were added to the pipeline to finalize the cohort, the underlying Redivis clinical data is still heavily scrubbed. Therefore, the custom bypasses implemented in the `/ehr` scripts (skipping ghost patients missing from Redivis and avoiding the OMOP `CodeLabeler`) **must remain completely intact** and should not be reverted.

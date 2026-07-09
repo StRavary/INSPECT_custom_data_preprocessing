@@ -19,6 +19,7 @@ parser.add_argument("--path_to_data", type=str, required=True)
 parser.add_argument("--path_to_output", type=str, required=True)
 parser.add_argument("--path_to_athena", type=str, required=True)
 parser.add_argument("--path_to_motor", type=str, required=True)
+parser.add_argument("--extract_path", type=str, required=False, default=None, help="Direct path to the FEMR database extract")
 parser.add_argument(
     "--test_GBM",
     default=False,
@@ -44,7 +45,7 @@ tasks = [
 ]
 
 
-extract_path = os.path.join(database_path, "extract")
+extract_path = args.extract_path if args.extract_path else os.path.join(database_path, "extract")
 label_features_dirs = os.path.join(args.path_to_output, "labels_and_features")
 gbm_model_results = os.path.join(args.path_to_output, "gbm_model_results")
 motor_batches = os.path.join(args.path_to_output, "MOTOR_batches")
