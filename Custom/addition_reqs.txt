@@ -1,0 +1,10 @@
+# Python modules required for Custom/ scripts that are complementary to ehr/requirements.txt
+python-dotenv==1.2.2
+huggingface-hub==1.21.0
+monai==1.6.0
+redivis==0.20.10
+streamlit==1.58.0
+pyarrow==24.0.0
+timm==1.0.27
+torch==2.12.1
+torchvision==0.27.1

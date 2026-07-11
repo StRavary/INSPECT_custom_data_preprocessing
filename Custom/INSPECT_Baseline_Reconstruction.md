@@ -2,6 +2,16 @@
 
 Reconstructing the baseline dataset was a complex debugging process. Here is a formal summary of the exact steps taken to successfully overcome these blockers and generate the baseline dataset. 
 
+**0. Python Environment Setup**
+To run the scripts in the `Custom/` directory, you must first install the legacy environment dependencies followed by the custom pipeline supplements. They can be easily installed using:
+```bash
+# 1. Install the base legacy environment
+pip install -r ehr/requirements.txt
+
+# 2. Install the custom pipeline supplements
+pip install -r Custom/addition_reqs.txt
+```
+
 **1. Raw Data Download & Format Conversion**
 To conserve disk space, a Redivis downloader script (`Custom/INSPECT_DL_EHR.py`) was initially developed to download all 32+ raw OMOP tables (e.g., measurement, condition_occurrence, person) as highly compressed `.parquet` files.
 * **Issue #1:** While the `.parquet` format is highly optimized for future custom processing pipelines, it was discovered that the legacy baseline pipeline strictly required uncompressed `.csv` files.

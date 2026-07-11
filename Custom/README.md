@@ -35,9 +35,9 @@ To execute the legacy portions of the pipeline (like `femr` extraction and the b
    pip install -r ehr/requirements.txt
    ```
 2. **Next, install the custom pipeline supplements:**
-   This custom pipeline relies on modern utility libraries for the new modalities (e.g., PyArrow for massive matrix processing, Streamlit for data validation, PyTorch/MONAI for image ingestion). These should be installed *after* the base requirements:
+   This custom pipeline relies on modern utility libraries for the new modalities (e.g., PyArrow for massive matrix processing, Streamlit for data validation, PyTorch/MONAI for image ingestion). These are defined in [addition_reqs.txt](addition_reqs.txt) and should be installed *after* the base requirements:
    ```bash
-   pip install pyarrow streamlit python-dotenv redivis torch monai timm huggingface-hub
+   pip install -r Custom/addition_reqs.txt
    ```
 
 ## 📂 Execution Order
