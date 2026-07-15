@@ -87,7 +87,9 @@ During this process, three major legacy pipeline bugs were identified and patche
 
 **Solution:** Since all 7 outcomes were actually pre-computed and appended to `labels_20250611.tsv` prior to OMOP scrubbing, the script was refactored to permanently bypass `CodeLabeler` and explicitly extract the ground-truth endpoints directly from the merged cohort file.
 
-The resulting test-set AUROC scores confirm a highly robust and functioning benchmark replication:
+The resulting test-set AUROC scores under the single static split confirm a highly robust and functioning benchmark replication:
+
+### Static Train/Val/Test Split Results
 
 | Endpoint (AUROC)                                        | Custom | INSPECT | Delta |
 |---------------------------------------------------------|--------|---------|-------|
@@ -99,6 +101,23 @@ The resulting test-set AUROC scores confirm a highly robust and functioning benc
 | **6-Month Readmission**                                 | 0.7089 | 0.740 | -0.0311 |
 | **12-Month Readmission**                                | 0.7463 | 0.728 | +0.0183 |
 | **12-Month Pulmonary Hypertension (PH)**                | 0.9226 | 0.828 | +0.0946 |
+
+### 5-Fold Cross-Validation Results
+
+To align directly with the cross-validation evaluation strategy used in the publication (as verified by the fold distributions and footnote in the demographics tables), deterministic 5-fold cross-validation scripts (`Custom/3_train_gbm_cv.py` and `Custom/9c_run_all_tasks_gbm_cv.py`) were implemented. 
+
+The resulting pooled Out-of-Fold (OOF) AUROC, average test AUROC, and validation-optimized sensitivity/specificity metrics are summarized below:
+
+| Endpoint | Overall OOF AUROC | Avg Test AUROC | Avg Test Sens (optimized) | Avg Test Spec (optimized) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Pulmonary Embolism (PE)** | 0.7584 | 0.7590 ± 0.0027 | 0.6568 ± 0.0372 | 0.7290 ± 0.0420 |
+| **1-Month Mortality** | 0.9012 | 0.9049 ± 0.0142 | 0.8823 ± 0.0358 | 0.7931 ± 0.0222 |
+| **6-Month Mortality** | 0.8343 | 0.8899 ± 0.0100 | 0.8084 ± 0.0393 | 0.8063 ± 0.0400 |
+| **12-Month Mortality** | 0.8428 | 0.8808 ± 0.0049 | 0.8122 ± 0.0273 | 0.7937 ± 0.0206 |
+| **1-Month Readmission** | 0.6573 | 0.7337 ± 0.0347 | 0.7143 ± 0.0879 | 0.6148 ± 0.0571 |
+| **6-Month Readmission** | 0.6760 | 0.7342 ± 0.0287 | 0.6844 ± 0.0954 | 0.6504 ± 0.0686 |
+| **12-Month Readmission** | 0.7210 | 0.7420 ± 0.0035 | 0.6864 ± 0.0479 | 0.6597 ± 0.0366 |
+| **12-Month Pulmonary Hypertension (PH)** | 0.9153 | 0.9162 ± 0.0071 | 0.7754 ± 0.0205 | 0.8980 ± 0.0210 |
 
 **10. Comprehensive Cohort Pipeline Validation (`validate_cohort_pipeline.py`)**
 To ensure absolute data integrity and catch any potential leakage or misalignment before downstream training, a rigorous validation script (`Custom/validate_cohort_pipeline.py`) was implemented. This script independently audits the outputs of all three major pipeline stages:

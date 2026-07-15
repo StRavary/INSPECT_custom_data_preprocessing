@@ -62,15 +62,17 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 ### Phase 4: Datasets, ML Training & Benchmarks
 9. `8_vector_ingestion.py`: High-speed multimodal PyTorch dataset to seamlessly fuse EHR tabular PyArrow frames with the compressed 50-dim image vectors.
 10. `9a_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
+11. `3_train_gbm_cv.py`: Trains and evaluates the LightGBM baseline on a task using a deterministic 5-fold cross-validation scheme. It outputs fold-specific models, fold-level scores, and pooled out-of-fold (OOF) predictions.
 
 > **Note:** For a highly detailed breakdown of the exact engineering steps and debugging taken to reconstruct the baseline (including the 5-tier OMOP fallback logic), see `INSPECT_Baseline_Reconstruction.md`.
 
 ## EHR Baseline Evaluation & Auxiliary Tasks
 
-To evaluate the extracted EHR features against the pulmonary embolism (PE) endpoint and all 7 auxiliary prognostic endpoints (1, 6, 12-month mortality/readmission, and 12-month PH), an automated evaluation script was introduced.
+To evaluate the extracted EHR features against the pulmonary embolism (PE) endpoint and all 7 auxiliary prognostic endpoints (1, 6, 12-month mortality/readmission, and 12-month PH), automated evaluation wrappers were introduced.
 
-### Execution Step
-11. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks, extracting and saving test-set AUROC scores.
+### Execution Steps
+12. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks on the static train/val/test split, extracting and saving test-set AUROC scores.
+13. `9c_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
 
 ### Modifications to Original `ehr/` Scripts
 Executing the auxiliary tasks and the master pipeline successfully required patching legacy bugs in the original `ehr/` files:
