@@ -38,43 +38,6 @@ PATIENT_ID_COLUMN = "PatientID"  # "patient_id"
 TIME_COLUMN = "StudyTime"  # "procedure_time"
 
 
-def compute_sens_spec(y_true, y_proba, threshold=0.5):
-    y_pred = (y_proba >= threshold).astype(int)
-    tn, fp, fn, tp = metrics.confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    return sens, spec
-
-
-def report_metrics(y_train, y_train_proba, y_valid, y_valid_proba, y_test, y_test_proba, is_test_only=False):
-    # Metrics at default threshold 0.5
-    if not is_test_only:
-        train_sens_05, train_spec_05 = compute_sens_spec(y_train, y_train_proba, threshold=0.5)
-        val_sens_05, val_spec_05 = compute_sens_spec(y_valid, y_valid_proba, threshold=0.5)
-        logger.info(f"Train Sensitivity (threshold=0.5): {train_sens_05} | Specificity (threshold=0.5): {train_spec_05}")
-        logger.info(f"Val Sensitivity (threshold=0.5): {val_sens_05} | Specificity (threshold=0.5): {val_spec_05}")
-    
-    test_sens_05, test_spec_05 = compute_sens_spec(y_test, y_test_proba, threshold=0.5)
-    logger.info(f"Test Sensitivity (threshold=0.5): {test_sens_05} | Specificity (threshold=0.5): {test_spec_05}")
-
-    # Metrics at validation-optimized threshold (maximizing Youden's J)
-    fpr, tpr, thresholds = metrics.roc_curve(y_valid, y_valid_proba)
-    best_idx = np.argmax(tpr - fpr)
-    best_threshold = thresholds[best_idx]
-    best_threshold = max(0.0, min(1.0, float(best_threshold)))
-    
-    logger.info(f"Optimized Threshold (Youden's J based on validation): {best_threshold}")
-    
-    if not is_test_only:
-        train_sens_opt, train_spec_opt = compute_sens_spec(y_train, y_train_proba, threshold=best_threshold)
-        val_sens_opt, val_spec_opt = compute_sens_spec(y_valid, y_valid_proba, threshold=best_threshold)
-        logger.info(f"Train Sensitivity (optimized): {train_sens_opt} | Specificity (optimized): {train_spec_opt}")
-        logger.info(f"Val Sensitivity (optimized): {val_sens_opt} | Specificity (optimized): {val_spec_opt}")
-        
-    test_sens_opt, test_spec_opt = compute_sens_spec(y_test, y_test_proba, threshold=best_threshold)
-    logger.info(f"Test Sensitivity (optimized): {test_sens_opt} | Specificity (optimized): {test_spec_opt}")
-
-
 def tune_hyperparams(
     X_train, y_train, X_val, y_val, model, params, num_threads: int = 1
 ):
@@ -174,20 +137,14 @@ def main(args):
         logger.info(f"Train AUROC: {train_auroc}")
         logger.info(f"Val AUROC: {val_auroc}")
         logger.info(f"Test AUROC: {test_auroc}")
-
-        report_metrics(y_train, y_train_proba, y_valid, y_valid_proba, y_test, y_test_proba, is_test_only=False)
     else:
         with open(os.path.join(args.path_to_output_dir, "model.pkl"), "rb") as f:
             model = pickle.load(f)
 
         proba = model.predict_proba(features)[:, 1]
-        y_train_proba = proba[train_mask]
-        y_valid_proba = proba[valid_mask]
         y_test_proba = proba[test_mask]
         test_auroc = metrics.roc_auc_score(y_test, y_test_proba)
         logger.info(f"Test AUROC: {test_auroc}")
-
-        report_metrics(y_train, y_train_proba, y_valid, y_valid_proba, y_test, y_test_proba, is_test_only=True)
 
     logger.success("DONE!")
 
