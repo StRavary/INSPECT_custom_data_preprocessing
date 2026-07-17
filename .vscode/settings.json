@@ -1,5 +1,6 @@
 {
-  "python.defaultInterpreterPath": "/home/steven/Documents/Internship_INSPECT/.venv_legacy/bin/python",
-  "python.analysis.venvPath": "/home/steven/Documents/Internship_INSPECT",
-  "python.analysis.venv": ".venv_legacy"
+  "python.defaultInterpreterPath": "${workspaceFolder}/../venv_legacy/bin/python",
+  "python.analysis.venvPath": "${workspaceFolder}/..",
+  "python.analysis.venv": "venv_legacy",
+  "python.analysis.extraPaths": ["./ehr"]
 }

@@ -9,8 +9,9 @@ def run_baseline_pipeline(task):
     # Anchor paths to the project root
     base_dir = os.path.expanduser("../INSPECT_custom_data_preprocessing")
     
-    # Explicitly use the python executable from inside .venv_legacy
-    venv_python = os.path.expanduser("../.venv_legacy/bin/python")
+    # Detect the correct virtual environment folder
+    venv_dir = "../.venv_legacy" if os.path.isdir(os.path.expanduser("../.venv_legacy")) else "../venv_legacy"
+    venv_python = os.path.expanduser(f"{venv_dir}/bin/python")
     target_script = os.path.join(base_dir, "ehr", "2_generate_labels_and_features.py")
     
     cohort_path = os.path.expanduser("../DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv")

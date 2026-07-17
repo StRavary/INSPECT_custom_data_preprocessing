@@ -15,7 +15,8 @@ TASKS = [
 
 def main():
     base_dir = os.path.expanduser("../INSPECT_custom_data_preprocessing")
-    venv_python = os.path.expanduser("../.venv_legacy/bin/python")
+    venv_dir = "../.venv_legacy" if os.path.isdir(os.path.expanduser("../.venv_legacy")) else "../venv_legacy"
+    venv_python = os.path.expanduser(f"{venv_dir}/bin/python")
     
     benchmark_script = os.path.join(base_dir, "Custom", "9a_run_baseline_benchmark.py")
     train_script = os.path.join(base_dir, "Custom", "9c_train_gbm_cv.py")
