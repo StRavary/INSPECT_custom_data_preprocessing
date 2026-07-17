@@ -74,6 +74,10 @@ To evaluate the extracted EHR features against the pulmonary embolism (PE) endpo
 12. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks on the static train/val/test split, extracting and saving test-set AUROC scores.
 13. `9d_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
 
+## Custom Time-Binned Feature Generation
+To support modeling time-binned historical features, we introduced:
+* `generate_binned_features.py`: An alternative script to generate features where event counts are grouped into custom time windows (bins) relative to the prediction anchor time. Categories like vitals/labs (measurements) and diagnoses/procedures (conditions/procedures/devices) can have independent time ranges configured via CLI flags (`--vitals_labs_bins`, `--diag_proc_bins`).
+
 ### Modifications to Original `ehr/` Scripts
 Executing the auxiliary tasks and the master pipeline successfully required patching legacy bugs in the original `ehr/` files:
 
@@ -84,5 +88,7 @@ Executing the auxiliary tasks and the master pipeline successfully required patc
 
 #### `ehr/run_all_ehr.py`
 1. **Added `--extract_path` Argument:** The original master script hardcoded the FEMR database location to `inspect_femr_extract/extract` within the output directory. A custom `--extract_path` argument was added. This allows the pipeline to point directly to pre-generated multi-gigabyte database extracts (like the 21GB `event_metadata` extract) located anywhere on disk, seamlessly bypassing the expensive database creation step.
+2. **Dynamic Script Path Resolution:** Made script references resolve absolute to the parent runner script directory so it can be called from any workspace folder.
+3. **Fixed Missing CLMBR Parameter**: Patched `clmbr_train_linear_probe` system execution call by adding the missing required `--path_to_cohort` flag.
 
 > **Note on New Data Drops (June 2025):** Although new `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and crosswalk files were added to the pipeline to finalize the cohort, the underlying Redivis clinical data is still heavily scrubbed. Therefore, the custom bypasses implemented in the `/ehr` scripts (skipping ghost patients missing from Redivis and avoiding the OMOP `CodeLabeler`) **must remain completely intact** and should not be reverted.
