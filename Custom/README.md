@@ -45,7 +45,7 @@ To execute the legacy portions of the pipeline (like `femr` extraction and the b
 Once the prerequisites are satisfied, execute the scripts in the following numbered order. The pipeline is separated into four logical phases:
 
 ### Phase 1: Downloading Raw Data
-0. `0a_download_aimi_labels.py`, `0b_download_rspect.py`, `0c_download_ctpa_images.py`, & `0d_download_rspect_images.py`: Fetch standard clinical tags, RSPECT image data, raw CTPA scans, and the full RSPECT dataset from the AWS Open Data Registry respectively.
+0. `0a_download_aimi_labels.py` & `0b_download_rspect_images.py`: Fetch standard clinical tags (via Stanford AIMI Portal) and the full RSPECT dataset (from the AWS Open Data Registry) respectively.
 
 ### Phase 2: EHR Tabular Processing & Sanity Checks
 1. `1_INSPECT_DL_EHR.py`: Downloads raw OMOP tables from Redivis.
@@ -62,7 +62,7 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 ### Phase 4: Datasets, ML Training & Benchmarks
 9. `8_vector_ingestion.py`: High-speed multimodal PyTorch dataset to seamlessly fuse EHR tabular PyArrow frames with the compressed 50-dim image vectors.
 10. `9a_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
-11. `3_train_gbm_cv.py`: Trains and evaluates the LightGBM baseline on a task using a deterministic 5-fold cross-validation scheme. It outputs fold-specific models, fold-level scores, and pooled out-of-fold (OOF) predictions.
+11. `9c_train_gbm_cv.py`: Trains and evaluates the LightGBM baseline on a task using a deterministic 5-fold cross-validation scheme. It outputs fold-specific models, fold-level scores, and pooled out-of-fold (OOF) predictions.
 
 > **Note:** For a highly detailed breakdown of the exact engineering steps and debugging taken to reconstruct the baseline (including the 5-tier OMOP fallback logic), see `INSPECT_Baseline_Reconstruction.md`.
 
@@ -72,7 +72,7 @@ To evaluate the extracted EHR features against the pulmonary embolism (PE) endpo
 
 ### Execution Steps
 12. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks on the static train/val/test split, extracting and saving test-set AUROC scores.
-13. `9c_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
+13. `9d_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
 
 ### Modifications to Original `ehr/` Scripts
 Executing the auxiliary tasks and the master pipeline successfully required patching legacy bugs in the original `ehr/` files:

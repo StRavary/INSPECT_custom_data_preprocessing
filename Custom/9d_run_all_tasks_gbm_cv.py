@@ -18,7 +18,7 @@ def main():
     venv_python = os.path.expanduser("../.venv_legacy/bin/python")
     
     benchmark_script = os.path.join(base_dir, "Custom", "9a_run_baseline_benchmark.py")
-    train_script = os.path.join(base_dir, "Custom", "3_train_gbm_cv.py")
+    train_script = os.path.join(base_dir, "Custom", "9c_train_gbm_cv.py")
     cohort_path = os.path.join(base_dir, "..", "DATA_PROCESSED", "cohort_0.2.0_master_file_anon.csv")
     db_path = os.path.join(base_dir, "..", "DATA_RAW", "EHR_FEMR_DB", "extract")
     
