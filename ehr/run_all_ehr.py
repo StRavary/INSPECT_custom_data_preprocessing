@@ -29,6 +29,8 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
 source_csvs_path = os.path.join(args.path_to_data, "timelines_smallfiles")
 cohort_path = os.path.join(args.path_to_data, "cohort_0.2.0_master_file_anon.csv")
 database_path = os.path.join(args.path_to_output, "inspect_femr_extract")
@@ -67,7 +69,7 @@ for task in tasks:
     task_dir = os.path.join(label_features_dirs, task)
     if not os.path.exists(task_dir):
         os.system(
-            f"python 2_generate_labels_and_features.py --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --labeling_function {task} --num_threads 20"
+            f"python {os.path.join(script_dir, '2_generate_labels_and_features.py')} --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --labeling_function {task} --num_threads 20"
         )
     else:
         print(
@@ -82,11 +84,11 @@ for task in tasks:
     task_dir = os.path.join(gbm_model_results, task)
     if args.test_GBM:
         os.system(
-            f"python 3_train_gbm.py --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --path_to_label_features {task_labels_features_dir} --num_threads 20 --test_GBM"
+            f"python {os.path.join(script_dir, '3_train_gbm.py')} --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --path_to_label_features {task_labels_features_dir} --num_threads 20 --test_GBM"
         )
     elif not os.path.exists(task_dir) and not args.test_GBM:
         os.system(
-            f"python 3_train_gbm.py --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --path_to_label_features {task_labels_features_dir} --num_threads 20"
+            f"python {os.path.join(script_dir, '3_train_gbm.py')} --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {task_dir} --path_to_label_features {task_labels_features_dir} --num_threads 20"
         )
     else:
         print(f"Skipping GRM {task} because it already exists in {task_dir}")
@@ -113,7 +115,7 @@ for task in tasks:
     task_batches_dir = os.path.join(motor_batches, task)
     task_dir = os.path.join(motor_results, task)
     if not os.path.exists(task_dir):
-        command = f"clmbr_train_linear_probe {task_dir} --data_path {extract_path} --model_dir {args.path_to_motor}/model --batches_path {task_batches_dir} "
+        command = f"clmbr_train_linear_probe {task_dir} --data_path {extract_path} --model_dir {args.path_to_motor}/model --batches_path {task_batches_dir} --path_to_cohort {cohort_path}"
         os.system(command)
     else:
         print(
@@ -125,7 +127,7 @@ for task in tasks:
 pesi_folder = os.path.join(args.path_to_output, "simplified_pesi")
 if not os.path.exists(pesi_folder):
     os.system(
-        f"python 4_compute_pesi_score.py --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {pesi_folder} --num_threads 20"
+        f"python {os.path.join(script_dir, '4_compute_pesi_score.py')} --path_to_cohort {cohort_path} --path_to_database {extract_path} --path_to_output_dir {pesi_folder} --num_threads 20"
     )
 else:
     print(f"Skipping PESI computation because it already exists in {pesi_folder}")
