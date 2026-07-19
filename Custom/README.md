@@ -39,6 +39,18 @@ To execute the legacy portions of the pipeline (like `femr` extraction and the b
    ```bash
    pip install -r Custom/addition_reqs.txt
    ```
+3. **GPU Support for CUDA 12+ (e.g., Blackwell 50-series GPUs):**
+   The legacy environment requires JAX compiled for CUDA 11, which fails on modern GPUs with Compute Capability 12.0+ (`ptxas does not support CC 12.0`). You **cannot** upgrade JAX via pip, as it will overwrite `numpy` to 2.x and break the C-API required by `femr`. Instead, download the CUDA 12 assembler independently and inject it into the XLA pipeline at runtime:
+   ```bash
+   # Download and extract the cu12 ptxas binary without installing it
+   mkdir -p ~/cu12_ptxas && cd ~/cu12_ptxas
+   pip download nvidia-cuda-nvcc-cu12==12.1.105 --no-deps
+   unzip *.whl
+   
+   # When running training scripts (like run_all_ehr.py or clmbr_train_linear_probe), 
+   # prefix your command with these overrides to force JAX to use the modern compiler:
+   XLA_FLAGS="--xla_gpu_cuda_data_dir=$HOME/cu12_ptxas/nvidia/cuda_nvcc" PATH="$HOME/cu12_ptxas/nvidia/cuda_nvcc/bin:$PATH" <your_command>
+   ```
 
 ## 📂 Execution Order
 
