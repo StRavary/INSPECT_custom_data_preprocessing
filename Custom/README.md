@@ -99,8 +99,9 @@ Once the prerequisites are satisfied, execute the scripts in the following numbe
 
 ### Phase 4: Datasets, ML Training & Benchmarks
 9. `8_vector_ingestion.py`: High-speed multimodal PyTorch dataset to seamlessly fuse EHR tabular PyArrow frames with the compressed 50-dim image vectors.
-10. `9a_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction while bypassing hardcoded cluster weights. That is done because the scripts were developed on a system with only CPU available so we are unable to run MOTOR for baseline.
+10. `9a_run_baseline_benchmark.py`: Wrapper to execute legacy feature extraction (labels + FEMR features) for a single task. Must be run for each task before MOTOR batch creation.
 11. `9c_train_gbm_cv.py`: Trains and evaluates the LightGBM baseline on a task using a deterministic 5-fold cross-validation scheme. It outputs fold-specific models, fold-level scores, and pooled out-of-fold (OOF) predictions.
+12. `9e_run_all_tasks_motor.py`: Runs the full MOTOR/CLMBR evaluation pipeline across all 8 tasks in a single unattended run. For each task it generates MOTOR batches (if absent) and trains a linear probe, saving per-task results to timestamped folders and a summary CSV. All Blackwell GPU XLA flags are baked in — no manual `export` required.
 
 > **Note:** For a highly detailed breakdown of the exact engineering steps and debugging taken to reconstruct the baseline (including the 5-tier OMOP fallback logic), see `INSPECT_Baseline_Reconstruction.md`.
 
@@ -111,6 +112,7 @@ To evaluate the extracted EHR features against the pulmonary embolism (PE) endpo
 ### Execution Steps
 12. `9b_run_all_tasks_gbm.py`: Iteratively trains and evaluates the GBM baseline across all tasks on the static train/val/test split, extracting and saving test-set AUROC scores.
 13. `9d_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
+14. `9e_run_all_tasks_motor.py`: Runs the MOTOR foundation model linear probe across all 8 tasks. Handles `clmbr_create_batches` and `clmbr_train_linear_probe` automatically. Requires a Blackwell-compatible environment (see Step 4 above) and `labeled_patients.csv` for each task. Results are saved to timestamped per-task folders under `DATA_RAW/EHR_FEMR_DB/motor_results/` with a consolidated `motor_results.csv`.
 
 ## Custom Time-Binned Feature Generation
 To support modeling time-binned historical features, we introduced:

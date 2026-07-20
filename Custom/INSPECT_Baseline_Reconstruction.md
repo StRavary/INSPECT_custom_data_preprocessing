@@ -345,3 +345,52 @@ cat /proc/<PID>/environ | tr '\0' '\n' | grep XLA
 1. **~5–15 minutes, 0% GPU:** femr loads the patient database into RAM (high CPU usage, up to ~600%).
 2. **Brief spike, 0% GPU:** XLA traces the graph; ptxas wrapper is called, compiles with `-O0` in seconds.
 3. **VRAM fills, GPU utilization climbs:** Training begins. The `Computing reps...` log line appears.
+
+**17. MOTOR All-Tasks Automation (`9e_run_all_tasks_motor.py`)**
+
+To evaluate MOTOR across all 8 INSPECT tasks in a single unattended run, a wrapper script (`Custom/9e_run_all_tasks_motor.py`) was implemented. It handles batch creation and linear probe training end-to-end, with all Blackwell XLA flags baked in.
+
+**What it does for each task:**
+
+1. Checks whether `MOTOR_batches/<task>` exists. If not, runs `clmbr_create_batches` using the task's `labeled_patients.csv` from `DATA_RAW/EHR_FEMR_DB/features/<task>/`.
+2. Runs `clmbr_train_linear_probe`, saving results to a timestamped folder: `DATA_RAW/EHR_FEMR_DB/motor_results/<YYYYMMDD_HHMMSS>_<task>/`.
+3. Parses Train/Valid/Test AUROC and L2 Strength from stdout.
+4. After all tasks complete, prints a formatted summary table and saves a `motor_results.csv` inside the run's results directory.
+
+**Prerequisites before running:**
+
+- `femr_cuda 0.1.16` installed (see Fix 1 in Section 16)
+- CUDA 12.8 ptxas wrapper in place (see Fix 2 in Section 16)
+- `labeled_patients.csv` generated for each task (run `9a_run_baseline_benchmark.py` for each task, or use the for-loop below)
+- `motor-t-base/model/` and `motor-t-base/dictionary/` both present
+
+```bash
+# Generate labeled_patients.csv for all tasks if not already done:
+cd ~/Documents/INSPECT/INSPECT_custom_data_preprocessing
+for task in PE 1_month_mortality 6_month_mortality 12_month_mortality \
+            1_month_readmission 6_month_readmission 12_month_readmission 12_month_PH; do
+    python Custom/9a_run_baseline_benchmark.py --task $task
+done
+
+# Then run the full MOTOR evaluation:
+python Custom/9e_run_all_tasks_motor.py
+```
+
+**CLI flags:**
+
+| Flag | Effect |
+|---|---|
+| `--force-batches` | Delete and regenerate MOTOR batches even if they already exist |
+| `--force-probe` | Re-run linear probe even if results already exist |
+
+**Output structure:**
+
+```
+DATA_RAW/EHR_FEMR_DB/motor_results/
+├── 20260720_110356_PE/
+├── 20260720_110356_1_month_mortality/
+├── ...
+└── motor_results.csv      ← summary of all tasks for this run
+```
+
+> **Note:** `clmbr_train_linear_probe` requires its output directory to not exist at call time. The script removes any stale directory automatically before each probe run. The timestamp prefix on each folder ensures historical runs are never overwritten.
