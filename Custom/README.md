@@ -39,42 +39,44 @@ To execute the legacy portions of the pipeline (like `femr` extraction and the b
    ```bash
    pip install -r Custom/addition_reqs.txt
    ```
-3. **GPU Support for CUDA 12+ (e.g., Blackwell 50-series GPUs):**
-   The legacy environment uses JAX/jaxlib compiled against CUDA 11. Running MOTOR/CLMBR training on Blackwell GPUs (Compute Capability 12.0+) requires three fixes applied in the order below. Do **not** attempt to upgrade JAX or jaxlib — doing so overwrites `numpy` to 2.x and breaks the `femr` C-API.
+3. **GPU Support for Blackwell 50-series GPUs (CUDA 12+, Compute Capability 12.0):**
+   The legacy environment uses JAX/jaxlib pinned to CUDA 11. Running MOTOR/CLMBR training on Blackwell GPUs requires four fixes. Do **not** upgrade JAX or jaxlib — doing so overwrites `numpy` to 2.x and breaks the `femr` C-API.
 
-   **Step A — Patch `transformer.py` to bypass the C++ attention kernel:**
-   The femr local attention C++ kernel deadlocks on Blackwell SMs. Cast q/k/v to `float32` before the attention call to force the cuBLAS fallback:
-   ```python
-   # In: venv_legacy/lib/python3.10/site-packages/femr/models/transformer.py, line ~129
-   # Replace the local_attention call with:
-   attn_f32 = femr.jax.local_attention(
-       q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32),
-       length_mask, self.config["attention_width"]
-   )
+   **Step A — Install `femr_cuda 0.1.16` (GPU package):**
+   Earlier `femr_cuda` versions contain a CUDA C++ attention kernel that deadlocks Blackwell SMs. Version 0.1.16 replaces it with a JAX-native fallback that works on Blackwell. No `transformer.py` patching is needed.
+   ```bash
+   pip uninstall femr femr-cuda -y
+   pip install femr_cuda==0.1.16
    ```
 
-   **Step B — Create a `ptxas` wrapper script inside the venv `bin/`:**
-   The cuBLAS fallback generates a large attention graph that causes `ptxas` to hang in its `-O3` optimization loop. A wrapper intercepts the call and forces `-O0`:
+   **Step B — Inject CUDA 12.8 `ptxas` via a wrapper script:**
+   The `ptxas` bundled with jaxlib 0.4.7 predates SM_120 and cannot compile Blackwell kernels. Download CUDA 12.8's assembler and create a wrapper that forces `-O0` (prevents an infinite optimization loop on Blackwell's large register file):
    ```bash
+   mkdir -p ~/cu12_8_ptxas
+   pip download nvidia-cuda-nvcc-cu12==12.8.93 --no-deps -d ~/cu12_8_ptxas
+   cd ~/cu12_8_ptxas && unzip *.whl -d .
+
    cat > venv_legacy/bin/ptxas << 'EOF'
    #!/bin/bash
-   exec /usr/bin/ptxas -O0 "$@"
+   exec $HOME/cu12_8_ptxas/nvidia/cuda_nvcc/bin/ptxas -O0 "$@"
    EOF
    chmod +x venv_legacy/bin/ptxas
    ```
-   > Placing the wrapper inside the venv `bin/` ensures it is always on `PATH` when the venv is active. If placed elsewhere, you must manually prepend its directory to `PATH` before launching the training script.
+   > Placing the wrapper inside the venv `bin/` ensures it is always on `PATH` when the venv is active.
 
-   **Step C — Ensure `JAX_PLATFORMS` is not set to `cpu`:**
-   If `JAX_PLATFORMS=cpu` is present in your environment (it may have been set during prior debugging), JAX silently runs on CPU only, causing a hang with 0% GPU utilization and no VRAM usage.
+   **Step C — Set `XLA_FLAGS` and launch:**
+   Three XLA flags are required to disable the autotuner (hangs on Blackwell), direct XLA to the CUDA 12.8 tools, and bypass jaxlib's bundled `nvlink` (which fatally errors on SM_120):
    ```bash
+   export XLA_FLAGS="--xla_gpu_cuda_data_dir=$HOME/cu12_8_ptxas/nvidia/cuda_nvcc --xla_gpu_autotune_level=0 --xla_disable_hlo_passes=gemm_algorithm_picker,gpu_conv_algorithm_picker --xla_gpu_force_compilation_parallelism=1"
+   export XLA_PYTHON_CLIENT_PREALLOCATE=false
    unset JAX_PLATFORMS
-   # Verify GPU is detected before launching:
+   # Verify GPU is detected:
    python -c "import jax; print(jax.devices())"
-   # Expected output: [GpuDevice(id=0, process_index=0)]
+   # Expected: [GpuDevice(id=0, process_index=0)]
    ```
-   Check whether it is persisted in a shell config file: `grep -r "JAX_PLATFORMS" ~/.bashrc ~/.bash_profile ~/.profile 2>/dev/null`
+   Check whether `JAX_PLATFORMS` is persisted in a shell config: `grep -r "JAX_PLATFORMS" ~/.bashrc ~/.bash_profile ~/.profile 2>/dev/null`
 
-   > **For detailed diagnosis and a troubleshooting decision table**, see section 16 of `INSPECT_Baseline_Reconstruction.md`.
+   > **For the full diagnostic table and troubleshooting decision tree**, see section 16 of `INSPECT_Baseline_Reconstruction.md`.
 
 ## 📂 Execution Order
 
