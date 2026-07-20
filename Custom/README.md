@@ -40,17 +40,41 @@ To execute the legacy portions of the pipeline (like `femr` extraction and the b
    pip install -r Custom/addition_reqs.txt
    ```
 3. **GPU Support for CUDA 12+ (e.g., Blackwell 50-series GPUs):**
-   The legacy environment requires JAX compiled for CUDA 11, which fails on modern GPUs with Compute Capability 12.0+ (`ptxas does not support CC 12.0`). You **cannot** upgrade JAX via pip, as it will overwrite `numpy` to 2.x and break the C-API required by `femr`. Instead, download the CUDA 12 assembler independently and inject it into the XLA pipeline at runtime:
-   ```bash
-   # Download and extract the cu12 ptxas binary without installing it
-   mkdir -p ~/cu12_ptxas && cd ~/cu12_ptxas
-   pip download nvidia-cuda-nvcc-cu12==12.1.105 --no-deps
-   unzip *.whl
-   
-   # When running training scripts (like run_all_ehr.py or clmbr_train_linear_probe), 
-   # prefix your command with these overrides to force JAX to use the modern compiler:
-   XLA_FLAGS="--xla_gpu_cuda_data_dir=$HOME/cu12_ptxas/nvidia/cuda_nvcc" PATH="$HOME/cu12_ptxas/nvidia/cuda_nvcc/bin:$PATH" <your_command>
+   The legacy environment uses JAX/jaxlib compiled against CUDA 11. Running MOTOR/CLMBR training on Blackwell GPUs (Compute Capability 12.0+) requires three fixes applied in the order below. Do **not** attempt to upgrade JAX or jaxlib — doing so overwrites `numpy` to 2.x and breaks the `femr` C-API.
+
+   **Step A — Patch `transformer.py` to bypass the C++ attention kernel:**
+   The femr local attention C++ kernel deadlocks on Blackwell SMs. Cast q/k/v to `float32` before the attention call to force the cuBLAS fallback:
+   ```python
+   # In: venv_legacy/lib/python3.10/site-packages/femr/models/transformer.py, line ~129
+   # Replace the local_attention call with:
+   attn_f32 = femr.jax.local_attention(
+       q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32),
+       length_mask, self.config["attention_width"]
+   )
    ```
+
+   **Step B — Create a `ptxas` wrapper script inside the venv `bin/`:**
+   The cuBLAS fallback generates a large attention graph that causes `ptxas` to hang in its `-O3` optimization loop. A wrapper intercepts the call and forces `-O0`:
+   ```bash
+   cat > venv_legacy/bin/ptxas << 'EOF'
+   #!/bin/bash
+   exec /usr/bin/ptxas -O0 "$@"
+   EOF
+   chmod +x venv_legacy/bin/ptxas
+   ```
+   > Placing the wrapper inside the venv `bin/` ensures it is always on `PATH` when the venv is active. If placed elsewhere, you must manually prepend its directory to `PATH` before launching the training script.
+
+   **Step C — Ensure `JAX_PLATFORMS` is not set to `cpu`:**
+   If `JAX_PLATFORMS=cpu` is present in your environment (it may have been set during prior debugging), JAX silently runs on CPU only, causing a hang with 0% GPU utilization and no VRAM usage.
+   ```bash
+   unset JAX_PLATFORMS
+   # Verify GPU is detected before launching:
+   python -c "import jax; print(jax.devices())"
+   # Expected output: [GpuDevice(id=0, process_index=0)]
+   ```
+   Check whether it is persisted in a shell config file: `grep -r "JAX_PLATFORMS" ~/.bashrc ~/.bash_profile ~/.profile 2>/dev/null`
+
+   > **For detailed diagnosis and a troubleshooting decision table**, see section 16 of `INSPECT_Baseline_Reconstruction.md`.
 
 ## 📂 Execution Order
 
