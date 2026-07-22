@@ -5,7 +5,7 @@ stage: extract
 test_split: all
 
 exp:
-  base_dir: /local-scratch/nigam/datasets/PE/inspect/exp
+  base_dir: outputs
   name: all # test
 
 trainer:

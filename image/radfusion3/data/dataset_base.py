@@ -23,7 +23,15 @@ class DatasetBase(Dataset):
         self.hdf5_dataset = None
 
         path = "/share/pi/nigam/projects/zphuo/data/omop_extract_PHI/som-nero-phi-nigam-starr.frazier/dict_slice_thickness.pkl"
-        self.dict_slice_thickness = pickle.load(open(path, "rb"))
+        if os.path.exists(path):
+            self.dict_slice_thickness = pickle.load(open(path, "rb"))
+        else:
+            self.dict_slice_thickness = {}
+
+    def is_rsna(self):
+        csv_path = str(getattr(self.cfg.dataset, "csv_path", "")).lower()
+        ds_type = str(getattr(self.cfg.dataset, "type", "")).lower()
+        return "rsna" in csv_path or "rspect" in csv_path or "rsna" in ds_type
 
     def __getitem__(self, index):
         raise NotImplementedError
@@ -45,7 +53,7 @@ class DatasetBase(Dataset):
         # )
 
         # only add slice thickness to stanford data
-        if "rsna" not in self.cfg.dataset.csv_path:
+        if not self.is_rsna():
             thickness_ls = []
             for idx_th in range(arr.shape[0]):
                 try:
@@ -59,7 +67,7 @@ class DatasetBase(Dataset):
                     thickness_ls.append(0)
             thickness_ls = np.array(thickness_ls)
             arr = np.concatenate([arr, thickness_ls[:, None]], axis=1)
-        elif "rsna" in self.cfg.dataset.csv_path:
+        elif self.is_rsna():
             thickness_ls = []
             for idx_th in range(arr.shape[0]):
                 try:
@@ -79,7 +87,8 @@ class DatasetBase(Dataset):
             channels = self.cfg.dataset.transform.channels
 
         # read dicom
-        if "rsna" in self.cfg.dataset.csv_path:
+        file_path = str(file_path)
+        if self.is_rsna():
             dcm = pydicom.dcmread(file_path)
         else:
             patient_id = file_path.split("/")[-1].split("_")[0]
@@ -134,7 +143,7 @@ class DatasetBase(Dataset):
                 pixel_array = pixel_array[:, :, 0] if len(pixel_array.shape) == 3 else pixel_array[:, :, 0, 0]
         else:
             # Read DICOM
-            if "rsna" in self.cfg.dataset.csv_path:
+            if self.is_rsna():
                 dcm = pydicom.dcmread(file_path)
             else:
                 patient_id = file_path.split("/")[-1].split("_")[0]

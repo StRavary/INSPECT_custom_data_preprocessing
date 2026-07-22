@@ -15,7 +15,7 @@ class DataModule(pl.LightningDataModule):
     def train_dataloader(self):
         transform = builder.build_transformation(self.cfg, "train")
         dataset = self.dataset(self.cfg, split="train", transform=transform)
-        if self.cfg.dataset.weighted_sample:
+        if getattr(self.cfg.dataset, "weighted_sample", False):
             sampler = dataset.get_sampler()
             return DataLoader(
                 dataset,

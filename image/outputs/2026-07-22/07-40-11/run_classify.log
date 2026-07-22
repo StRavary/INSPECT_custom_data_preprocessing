@@ -1,0 +1,2 @@
+[2026-07-22 07:40:12,930][lightning_fabric.utilities.seed][INFO] - Seed set to 6
+[2026-07-22 07:40:14,874][timm.models._builder][INFO] - Loading pretrained weights from Hugging Face hub (timm/resnetv2_101x3_bit.goog_in21k)

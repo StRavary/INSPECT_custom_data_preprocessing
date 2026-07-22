@@ -78,13 +78,9 @@ class ClassificationLightningModel(LightningModule):
             prog_bar=True,
         )
 
-        self.step_outputs[split]["logit"].append(logit)
-        self.step_outputs[split]["y"].append(y)
+        self.step_outputs[split]["logit"].append(logit.detach().cpu())
+        self.step_outputs[split]["y"].append(y.detach().cpu())
         self.step_outputs[split]["ids"].append(ids)
-
-        if split in ["train", "val"]:
-            for i in ids:
-                self.not_test_cases.append(i)
 
         return loss
 

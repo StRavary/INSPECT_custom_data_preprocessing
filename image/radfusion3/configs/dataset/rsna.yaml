@@ -1,11 +1,13 @@
 type: rsna
-csv_path: '/local-scratch/nigam/datasets/RSNA_PE/rsna_train_master.csv'
+csv_path: '/home/sravar/Documents/INSPECT/RSPECT_CTPA/train.csv'
 sample_frac: 1.0
-dicom_dir: /local-scratch/nigam/datasets/RSNA_PE/train
-output_dir: /local-scratch/nigam/datasets/RSNA_PE/rsna_features
+dicom_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/train
+output_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/rsna_features
+target: 'pe_present_on_image'
+weighted_sample: true
 test_split: all
 
-batch_size: 256
+batch_size: 4
 
 transform:
     channels: repeat 

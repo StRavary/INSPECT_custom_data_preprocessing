@@ -1,0 +1,48 @@
+n_gpus: 1
+get_features: true
+stage: classify
+output_dir: outputs/wandb
+test_split: test
+ckpt: null
+lr: 0.0005
+optimizer:
+  name: AdamW
+loss:
+  loss_fn: BCEWithLogitsLoss
+monitor:
+  metric: val/mean_auroc
+  mode: max
+exp:
+  base_dir: outputs
+  name: classify
+trainer:
+  weights_summary: top
+  seed: 6
+  val_check_interval: 1.0
+  limit_val_batches: 1.0
+  precision: 16
+  max_epochs: 1
+  gradient_clip_val: 0
+  num_workers: 8
+  strategy: ddp
+  position_encoding: true
+dataset:
+  type: rsna
+  csv_path: /home/sravar/Documents/INSPECT/RSPECT_CTPA/train.csv
+  sample_frac: 1.0
+  dicom_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/train
+  output_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/rsna_features
+  target: pe_present_on_image
+  weighted_sample: true
+  test_split: all
+  batch_size: 16
+  transform:
+    channels: repeat
+    resize_size: 256
+    crop_size: 224
+    final_size: 224
+model:
+  type: model_2d
+  model_name: resnetv2_101_sup
+  pretrain_type: supervised
+  num_class: 1

@@ -75,6 +75,7 @@ def run(config):
         callbacks=callbacks,
         gradient_clip_val=config.trainer.gradient_clip_val,
         precision=config.trainer.precision,
+        accumulate_grad_batches=getattr(config.trainer, "accumulate_grad_batches", 1),
         num_sanity_val_steps=0,
     )
 

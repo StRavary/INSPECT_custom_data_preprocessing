@@ -145,9 +145,10 @@ class RSNADataset1D(DatasetBase):
         elif "rsna" in cfg.dataset.csv_path:
             if split == "test":
                 path = "/share/pi/nigam/projects/zphuo/data/PE/inspect/image_modality/anon_pe_features/rsna_hdf5_keys_testsplit.pkl"
-                with open(path, "rb") as f:
-                    keys = pickle.load(f)
-                self.df = self.df[self.df["SeriesInstanceUID"].isin(keys)]
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        keys = pickle.load(f)
+                    self.df = self.df[self.df["SeriesInstanceUID"].isin(keys)]
 
             elif split != "all":
                 self.df = self.df[self.df["Split"] == split]

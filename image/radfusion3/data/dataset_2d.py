@@ -106,15 +106,19 @@ class RSNADataset2D(DatasetBase):
         self.df = self.df[self.df.negative_exam_for_pe == 0]
 
         if self.split != "all":
-            self.df = self.df[self.df["Split"] == self.split]
+            if "Split" in self.df.columns:
+                self.df = self.df[self.df["Split"] == self.split]
+            elif "split" in self.df.columns:
+                self.df = self.df[self.df["split"] == self.split]
 
         if self.split == "train":
             if cfg.dataset.sample_frac < 1.0:
-                study = list(self.df["patient_datetime"].unique())
+                study_col = "patient_datetime" if "patient_datetime" in self.df.columns else "StudyInstanceUID"
+                study = list(self.df[study_col].unique())
                 num_study = len(study)
                 num_sample = int(num_study * cfg.dataset.sample_frac)
                 sampled_study = np.random.choice(study, num_sample, replace=False)
-                self.df = self.df[self.df["patient_datetime"].isin(sampled_study)]
+                self.df = self.df[self.df[study_col].isin(sampled_study)]
 
         print(self.df[self.label_name].value_counts())
         self.labels = self.df[self.label_name].to_list()

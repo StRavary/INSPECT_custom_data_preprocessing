@@ -131,4 +131,14 @@ Executing the auxiliary tasks and the master pipeline successfully required patc
 2. **Dynamic Script Path Resolution:** Made script references resolve absolute to the parent runner script directory so it can be called from any workspace folder.
 3. **Fixed Missing CLMBR Parameter**: Patched `clmbr_train_linear_probe` system execution call by adding the missing required `--path_to_cohort` flag.
 
+#### `image/` Configuration & RSPECT Fine-Tuning Setup
+1. **RSPECT Dataset & Model Checkpoint Paths:** The original configs contained hardcoded Stanford cluster paths (`/share/pi/nigam/...` and `/local-scratch/nigam/...`). These have been updated to point to local/relative workspace paths:
+   - **Base Model Checkpoint:** Downloaded `resnetv2_ct.ckpt` (4.58 GB) from `StanfordShahLab/resnetv2_ct` on Hugging Face into `../resnetv2_ct/resnetv2_ct.ckpt`.
+   - **`image/radfusion3/configs/model/resnetv2_ct.yaml`:** Updated `checkpoint_path` to `../resnetv2_ct/resnetv2_ct.ckpt`.
+   - **`image/radfusion3/configs/dataset/rsna.yaml` & `rsna_featurized.yaml`:** Updated `csv_path` (`train.csv`), `dicom_dir` (`train/`), `output_dir`, and `hdf5_path` to point to the local RSPECT dataset (`../RSPECT_CTPA/`).
+2. **Path Portability Guidelines (Relative vs. Absolute Paths):**
+   - **Avoid Hardcoded Absolute Paths:** Hardcoding absolute server paths (e.g. `/share/pi/...` or `/home/username/...`) causes instant pipeline failures when transferring code across environments, laptops, or cloud VMs.
+   - **Use Script-Anchored Relative Paths:** In Python scripts, resolve paths dynamically relative to the script file location using `Path(__file__).resolve().parent`.
+   - **Use Workspace-Relative Config Paths:** In YAML/Hydra configuration files, use paths relative to the project root (`../RSPECT_CTPA`, `../resnetv2_ct`) so the pipeline executes seamlessly across any developer setup without manual edit steps.
+
 > **Note on New Data Drops (June 2025):** Although new `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and crosswalk files were added to the pipeline to finalize the cohort, the underlying Redivis clinical data is still heavily scrubbed. Therefore, the custom bypasses implemented in the `/ehr` scripts (skipping ghost patients missing from Redivis and avoiding the OMOP `CodeLabeler`) **must remain completely intact** and should not be reverted.

@@ -491,3 +491,52 @@ DATA_RAW/EHR_FEMR_DB/motor_results/
 ```
 
 > **Note:** `clmbr_train_linear_probe` requires its output directory to not exist at call time. The script removes any stale directory automatically before each probe run. The timestamp prefix on each folder ensures historical runs are never overwritten.
+
+---
+
+## 17. RSPECT CTPA Slice Encoder Fine-Tuning Setup & Path Portability Strategy
+
+To execute the 2D CT slice encoder fine-tuning on the RSPECT (RSNA PE Challenge) dataset via `image/run_rsna.sh`, several configuration and infrastructure updates were completed.
+
+### RSPECT Fine-Tuning Infrastructure Setup
+
+1. **Base Model Checkpoint (`resnetv2_ct.ckpt`):**
+   - The base ResNetV2-101x3 model checkpoint (4.58 GB) was fetched from Hugging Face (`StanfordShahLab/resnetv2_ct`) and placed in a dedicated local model directory: `/home/sravar/Documents/INSPECT/resnetv2_ct/resnetv2_ct.ckpt`.
+   - The Hydra model config `image/radfusion3/configs/model/resnetv2_ct.yaml` was updated to reference this local checkpoint path instead of the inaccessible original cluster directory (`/share/pi/nigam/...`).
+
+2. **Dataset Configuration (`rsna.yaml` & `rsna_featurized.yaml`):**
+   - Updated `csv_path` (`train.csv`), `dicom_dir` (`train/`), and `output_dir` / `hdf5_path` in `image/radfusion3/configs/dataset/rsna.yaml` and `rsna_featurized.yaml` to point directly to the RSPECT dataset location (`/home/sravar/Documents/INSPECT/RSPECT_CTPA`).
+
+3. **GPU ID Configuration:**
+   - In `image/run_rsna.sh`, `CUDA_VISIBLE_DEVICES` was adjusted (e.g. `CUDA_VISIBLE_DEVICES=1`) to target active GPUs on multi-GPU workstations.
+
+---
+
+### Path Portability Strategy: Relative vs. Absolute Paths
+
+A major challenge when reproducing legacy machine learning benchmarks is the prevalence of hardcoded absolute environment paths (e.g., `/share/pi/nigam/projects/...` or `/local-scratch/...`). Hardcoded absolute paths instantly break when code is cloned onto new developer workstations, laptops, or cloud instances.
+
+To ensure long-term reproducibility and cross-platform portability, the following path architecture guidelines were adopted across all custom runner scripts and configuration files:
+
+#### 1. In Python Scripts (`Path(__file__)` Anchoring)
+Always construct absolute paths dynamically relative to the current file's parent directory:
+```python
+from pathlib import Path
+
+# Anchor to script location (e.g. Custom/)
+SCRIPT_DIR  = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+DATA_RAW    = PROJECT_DIR.parent / "DATA_RAW" / "EHR_FEMR_DB"
+```
+* **Benefit:** Allows running Python scripts from *any* working directory without failing to locate adjacent submodules or dataset directories.
+
+#### 2. In YAML / Hydra Configuration Files
+Avoid embedding machine-specific root directories (`/home/user/...`). Use workspace-relative paths (`../RSPECT_CTPA`, `../resnetv2_ct`) anchored to the repository root or project parent:
+```yaml
+# Recommended Relative / Portable Config
+csv_path: '../RSPECT_CTPA/train.csv'
+dicom_dir: '../RSPECT_CTPA/train'
+output_dir: '../RSPECT_CTPA/rsna_features'
+```
+* **Benefit:** Prevents path-resolution errors when sharing config files across team members or moving repositories across file systems.
+
