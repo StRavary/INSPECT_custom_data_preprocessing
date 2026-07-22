@@ -540,3 +540,28 @@ output_dir: '../RSPECT_CTPA/rsna_features'
 ```
 * **Benefit:** Prevents path-resolution errors when sharing config files across team members or moving repositories across file systems.
 
+---
+
+### Fine-Tuning Execution Dynamics, Memory Optimization & Autograd Leak Fix
+
+#### 1. Micro-Batching & Gradient Accumulation Dynamics (GroupNorm Immunity)
+* **VRAM Constraints:** Fine-tuning the heavy ResNetV2-101x3 backbone on 224×224 slices consumes ~13.4 GB VRAM at batch size 8. To operate comfortably within 16 GB single-GPU limits (e.g., RTX 5070 Ti) without OOM crashes, `batch_size` was set to `4` in `image/radfusion3/configs/dataset/rsna.yaml` and `accumulate_grad_batches` set to `64` in `image/radfusion3/configs/classify.yaml`.
+* **Effective Batch Size:** $4 \times 64 = 256$, matching the exact effective batch size specified in the original paper.
+* **GroupNorm vs. BatchNorm Advantage:** Unlike architectures that rely on `BatchNorm` (which degrade severely when micro-batch size drops to 4 due to noisy mini-batch statistics), `ResNetV2-101x3` employs `GroupNorm` (`GroupNorm(32, ...)`). GroupNorm calculates normalization statistics per-sample across channel groups independently of batch size. It is mathematically invariant to micro-batch size, making micro-batching with high gradient accumulation perfectly stable.
+
+#### 2. System RAM Autograd Memory Leak Diagnosis & Patch
+* **Failure Mode:** During training runs across the 72,431 steps of an epoch, host System RAM usage climbed continuously until the Linux OS OOM killer terminated the Python process and host desktop applications.
+* **Root Cause:** In `image/radfusion3/lightning/classification_lightning_model.py`, inside `shared_step()`, prediction logits and ground-truth tensors were appended directly to Python lists (`self.step_outputs[split]["logit"].append(logit)`). Because `logit` was appended without `.detach()`, PyTorch retained the full autograd computation graph in host memory for all 144,000+ step executions across the epoch.
+* **Solution:** Patched `classification_lightning_model.py` to explicitly detach tensors (`logit.detach().cpu()` and `y.detach().cpu()`) before storing, freeing autograd graph memory after every step. Additionally, `num_workers` in `classify.yaml` was tuned from `8` to `4` to prevent subprocess RAM multiplication during desktop multitasking.
+
+#### 3. Output Directory & Checkpoint Artifact Structure
+Fine-tuning results and checkpoints are automatically exported to timestamped directories under `outputs/`:
+* **Directory Format:** `outputs/classify_pe_present_on_image_<timestamp>/`
+* **Checkpoints:**
+  * `epoch=<E>-val/mean_auroc=<score>.ckpt`: Top checkpoint selected by peak validation mean AUROC.
+  * `last.ckpt`: Final epoch state checkpoint.
+* **Test Evaluation Artifacts:** Automatically generated via `trainer.test()` at the end of training:
+  * `test_preds.csv`: Tabular CSV containing `patient_id`, `procedure_time`, `label`, and model predicted probability `prob`.
+  * `config.pkl`: Serialized Python dictionary of the full training hyperparameter configuration.
+
+
