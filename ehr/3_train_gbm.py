@@ -34,7 +34,7 @@ XGB_PARAMS = {
     "num_leaves": [10, 25, 100],
 }
 
-PATIENT_ID_COLUMN = "PatientID"  # "patient_id"
+PATIENT_ID_COLUMN = "patient_id"  # "PatientID"
 TIME_COLUMN = "StudyTime"  # "procedure_time"
 
 
@@ -73,8 +73,8 @@ def main(args):
         elif args.path_to_cohort.endswith(".tsv"):
             reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
-            # pid_split_assignment[row["split"]].add(int(row["patient_id"]))
-            pid_split_assignment[row["split"]].add(int(row[PATIENT_ID_COLUMN]))
+            pid_col = PATIENT_ID_COLUMN if PATIENT_ID_COLUMN in row else ("patient_id" if "patient_id" in row else "PatientID")
+            pid_split_assignment[row["split"]].add(int(row[pid_col]))
 
     total_size = 0
     total_set = set()
