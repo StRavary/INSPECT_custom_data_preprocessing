@@ -80,7 +80,7 @@ class FeaturizeLightningModel(LightningModule):
 
         # Save features as individual files if needed
         if self.features_dir:
-            for ids, f in zip(instance_id, features.cpu().detach().numpy()):
+            for ids, f in zip(instance_id, features.cpu().detach().float().numpy()):
                 try:
                     # Clean the image_id to remove .nii.gz and get base name
                     clean_id = ids.split('@')[0]  # First get impression_id
@@ -106,10 +106,10 @@ class FeaturizeLightningModel(LightningModule):
                 _, feature_vector, instance_id = outputs
                 if isinstance(instance_id, (list, tuple)):
                     all_instance_ids.extend(instance_id)
-                    all_features.extend(feature_vector.cpu().numpy())
+                    all_features.extend(feature_vector.cpu().float().numpy())
                 else:
                     all_instance_ids.append(instance_id)
-                    all_features.append(feature_vector.cpu().numpy())
+                    all_features.append(feature_vector.cpu().float().numpy())
 
         # Convert features to numpy array
         if len(all_features) > 0:

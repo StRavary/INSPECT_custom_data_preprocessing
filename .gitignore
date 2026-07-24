@@ -8,3 +8,8 @@ DATA_RAW/
 columns_manifest.txt
 .DS_Store
 DATA_PROCESSED/
+image/outputs/
+outputs/
+metrics.csv
+*.ckpt
+*.log

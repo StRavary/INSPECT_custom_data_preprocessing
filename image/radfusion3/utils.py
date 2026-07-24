@@ -14,10 +14,10 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def get_auroc(y, prob, keys):
-    if type(y) == torch.Tensor:
-        y = y.detach().cpu().numpy()
-    if type(prob) == torch.Tensor:
-        prob = prob.detach().cpu().numpy()
+    if isinstance(y, torch.Tensor):
+        y = y.detach().cpu().float().numpy()
+    if isinstance(prob, torch.Tensor):
+        prob = prob.detach().cpu().float().numpy()
 
     if len(y.shape) == 1:
         y = np.expand_dims(y, -1)
@@ -40,10 +40,10 @@ def get_auroc(y, prob, keys):
 
 
 def get_auprc(y, prob, keys):
-    if type(y) == torch.Tensor:
-        y = y.detach().cpu().numpy()
-    if type(prob) == torch.Tensor:
-        prob = prob.detach().cpu().numpy()
+    if isinstance(y, torch.Tensor):
+        y = y.detach().cpu().float().numpy()
+    if isinstance(prob, torch.Tensor):
+        prob = prob.detach().cpu().float().numpy()
 
     if len(y.shape) == 1:
         y = np.expand_dims(y, -1)
