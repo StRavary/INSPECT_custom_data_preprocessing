@@ -1,4 +1,0 @@
-- model=resnetv2
-- dataset=rsna
-- dataset.transform.final_size=224
-- trainer.accumulate_grad_batches=64

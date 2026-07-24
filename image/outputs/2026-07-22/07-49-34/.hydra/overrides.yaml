@@ -1,4 +1,0 @@
-- model=resnetv2
-- dataset=rsna
-- dataset.transform.final_size=224
-- trainer.max_epochs=1

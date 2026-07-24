@@ -552,7 +552,7 @@ output_dir: '../RSPECT_CTPA/rsna_features'
 #### 2. System RAM Autograd Memory Leak Diagnosis & Patch
 * **Failure Mode:** During training runs across the 72,431 steps of an epoch, host System RAM usage climbed continuously until the Linux OS OOM killer terminated the Python process and host desktop applications.
 * **Root Cause:** In `image/radfusion3/lightning/classification_lightning_model.py`, inside `shared_step()`, prediction logits and ground-truth tensors were appended directly to Python lists (`self.step_outputs[split]["logit"].append(logit)`). Because `logit` was appended without `.detach()`, PyTorch retained the full autograd computation graph in host memory for all 144,000+ step executions across the epoch.
-* **Solution:** Patched `classification_lightning_model.py` to explicitly detach tensors (`logit.detach().cpu()` and `y.detach().cpu()`) before storing, freeing autograd graph memory after every step. Additionally, `num_workers` in `classify.yaml` was tuned from `8` to `4` to prevent subprocess RAM multiplication during desktop multitasking.
+* **Solution:** Patched `classification_lightning_model.py` to explicitly detach tensors (`logit.detach().cpu()` and `y.detach().cpu()`) before storing, freeing autograd graph memory after every step. Additionally, `num_workers` in `classify.yaml` was tuned from `8` to `4` to prevent subprocess RAM multiplication during desktop multitasking, and `precision` was set to `"bf16-mixed"` with `gradient_clip_val: 1.0` to eliminate numerical `NaN` loss explosions.
 
 #### 3. Output Directory & Checkpoint Artifact Structure
 Fine-tuning results and checkpoints are automatically exported to timestamped directories under `outputs/`:
@@ -563,5 +563,42 @@ Fine-tuning results and checkpoints are automatically exported to timestamped di
 * **Test Evaluation Artifacts:** Automatically generated via `trainer.test()` at the end of training:
   * `test_preds.csv`: Tabular CSV containing `patient_id`, `procedure_time`, `label`, and model predicted probability `prob`.
   * `config.pkl`: Serialized Python dictionary of the full training hyperparameter configuration.
+
+#### 4. Automatic Mixed Precision (`bfloat16` AMP) Evaluation Metric Fix
+* **Issue:** Enabling `precision: bf16-mixed` caused epoch-end metric logging (`on_validation_epoch_end`) to fail with `TypeError: Got unsupported ScalarType BFloat16`. This occurred inside `image/radfusion3/utils.py` when converting prediction logits and probabilities (`y.detach().cpu().numpy()`, `prob.detach().cpu().numpy()`) to NumPy arrays for scikit-learn metrics (`roc_auc_score`, `average_precision_score`).
+* **Root Cause:** PyTorch tensors with `dtype=torch.bfloat16` cannot be directly converted to NumPy arrays via `.numpy()` without prior dtype casting.
+* **Solution:** Patched `get_auroc` and `get_auprc` in `image/radfusion3/utils.py` (as well as feature extraction in `image/radfusion3/lightning/featurize_lightning_model.py`) to explicitly convert tensors to single-precision float32 (`.float()`) prior to calling `.numpy()`.
+
+---
+
+## 19. Label-Noise & Representation-Ceiling Hypothesis Testing (`Custom/experiment_hypothesis_tests.py`)
+
+To investigate the mechanism behind why LightGBM gained significantly more AUROC ($+0.03$ to $+0.09$) than MOTOR ($+0.006$ to $+0.03$) following baseline label updates, a suite of three hypothesis testing experiments was implemented in `Custom/experiment_hypothesis_tests.py` and evaluated on the held-out test split ($N = 3,109$ studies).
+
+### 19.1 Experiment 1 — Hedge-Language Subgroup Stratification
+
+* **What It Tests:** Asks whether LightGBM and MOTOR are differentially sensitive to label ambiguity in radiology text. A clinical regex tagger split the held-out test set into a **Hedged Group** ($N = 1,383$, reports containing phrases like *"cannot exclude"*, *"subsegmental"*, *"artifact vs. filling defect"*) and a **Clear-Cut Group** ($N = 1,726$). AUROCs were calculated separately per subgroup, and a bootstrapped interaction test (1,000 resamples) evaluated whether the performance drop from Clear-Cut to Hedged differs between models ($\Delta_{\text{interaction}} = \Delta_{\text{GBM}} - \Delta_{\text{MOTOR}}$).
+* **Results:** Both models degrade on hedged cases, as expected. LightGBM drops more ($\text{Clear-Cut } 0.772 \rightarrow \text{Hedged } 0.700$, $\Delta_{\text{GBM}} = 0.072$) than MOTOR ($\text{Clear-Cut } 0.741 \rightarrow \text{Hedged } 0.707$, $\Delta_{\text{MOTOR}} = 0.034$). The interaction estimate is $+0.038$ in the predicted direction, but the 95% CI $[-0.019, 0.093]$ crosses zero ($p = 0.096$), falling short of statistical significance at $\alpha = 0.05$.
+* **Implications:** LightGBM directionally appears more thrown off by hedged language than MOTOR, but with this sample size the gap cannot be conclusively separated from chance. This result serves as supporting context and motivation for Experiment 2.
+
+### 19.2 Experiment 2 — Prediction Confidence & Margin Analysis
+
+* **What It Tests:** Evaluates the model prediction margin $M = |p - 0.5|$ specifically restricted to misclassified hedged cases ($y \neq \hat{y}$) to measure how confident each model was when making errors on ambiguous text. A one-sided Mann-Whitney U test compared the error margin distributions.
+* **Results:** LightGBM's errors on hedged cases carry a mean margin of **0.300** (std 0.142) — meaning when it makes mistakes on ambiguous text, it tends to be wrong with high confidence. MOTOR's errors on the exact same cases average a margin of **0.244** (std 0.122), sitting closer to the uncertain region near $p = 0.50$. The difference is highly statistically significant ($U = 91,783$, $p = 4.8 \times 10^{-10}$).
+* **Implications:** This is the headline finding. The two models fail in qualitatively distinct ways: LightGBM (high capacity) learned confident, decisive rules from raw EHR features that overfit to structured noise/spurious patterns in ambiguous reports. MOTOR's errors reflect genuine uncertainty — its frozen, self-supervised embeddings lack the fine-grained features to separate borderline cases, so its mistakes cluster near the threshold ($p \approx 0.50$) rather than committing hard to a wrong answer.
+
+### 19.3 Experiment 3 — Clinical Longformer NLP Labeler Prevalence-Shift Re-Evaluation
+
+* **What It Tests:** Isolates base-rate mismatch as an alternative explanation: could performance discrepancies simply be an artifact of prevalence shift? The Clinical Longformer NLP labeler was validated on 682 reports at $33.4\%$ PE+ prevalence (Table 10 confusion matrix: $TP=221, FP=5, FN=7, TN=449$), whereas the deployment cohort runs at $\approx 20.5\%$ prevalence. Holding labeler sensitivity ($96.93\%$) and specificity ($98.90\%$) fixed, Bayes' rule was used to recalculate PPV and NPV at deployment prevalence.
+* **Results:** PPV drops modestly from $97.79\%$ (validation) to **$95.78\%$** (deployment-adjusted) — a $-2.05\%$ relative degradation. NPV rises slightly ($98.46\% \rightarrow 99.21\%$).
+* **Implications:** Prevalence shift alone accounts for only a minor drop in labeler reliability. This negative result rules out base-rate mismatch as the primary driver of performance gaps, confirming that the dominant mechanism is structured label noise in ambiguous text (supported by Experiment 2).
+
+### 19.4 Synthesis & Poster Presentation Strategy
+
+The three experiments triangulate on a clear scientific narrative:
+1. **Experiment 3 (Ruled-Out Alternative):** Base-rate prevalence shift causes only a minor $2.05\%$ PPV drop, ruling out statistical base-rate mismatch as the main driver.
+2. **Experiment 1 (Directional Context):** LightGBM degrades more on hedged text ($\Delta = 0.072$) than MOTOR ($\Delta = 0.034$, interaction $+0.038$, $p = 0.096$), providing directionally consistent context.
+3. **Experiment 2 (Headline Result):** LightGBM makes high-confidence errors ($M = 0.300$) on ambiguous text due to capacity noise-overfitting, whereas MOTOR makes low-confidence errors ($M = 0.244$, $p = 4.8 \times 10^{-10}$) due to a representation ceiling in its frozen embeddings.
+
 
 
