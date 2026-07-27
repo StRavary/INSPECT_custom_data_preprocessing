@@ -107,9 +107,30 @@ class RSNADataset2D(DatasetBase):
 
         if self.split != "all":
             if "Split" in self.df.columns:
-                self.df = self.df[self.df["Split"] == self.split]
+                split_col = "Split"
             elif "split" in self.df.columns:
-                self.df = self.df[self.df["split"] == self.split]
+                split_col = "split"
+            else:
+                # Without this guard the filter silently falls through and
+                # train/valid/test all become the full dataframe, which trains
+                # and validates on identical data. Fail loudly instead.
+                raise ValueError(
+                    f"No 'Split' or 'split' column in {cfg.dataset.csv_path}. "
+                    "The stock RSPECT train.csv does not ship with one; generate "
+                    "it with Custom/make_rspect_splits.py and point csv_path at "
+                    "the output."
+                )
+
+            available = sorted(self.df[split_col].dropna().unique())
+            self.df = self.df[self.df[split_col] == self.split]
+
+            if len(self.df) == 0:
+                raise ValueError(
+                    f"Split '{self.split}' matched 0 rows in column '{split_col}' "
+                    f"of {cfg.dataset.csv_path}. Values present: {available}. "
+                    "DataModule requests exactly 'train'/'valid'/'test' -- note "
+                    "'valid', not 'val'."
+                )
 
         if self.split == "train":
             if cfg.dataset.sample_frac < 1.0:

@@ -1,5 +1,9 @@
 type: rsna
-csv_path: '/home/sravar/Documents/INSPECT/RSPECT_CTPA/train.csv'
+# Split-annotated copy produced by Custom/make_rspect_splits.py. The stock Kaggle
+# train.csv has no Split column, which made RSNADataset2D use the full dataframe
+# for train, valid and test alike. Regenerate with:
+#   python Custom/make_rspect_splits.py
+csv_path: '/home/sravar/Documents/INSPECT/RSPECT_CTPA/train_with_splits.csv'
 sample_frac: 1.0
 dicom_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/train
 output_dir: /home/sravar/Documents/INSPECT/RSPECT_CTPA/rsna_features
