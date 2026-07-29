@@ -255,10 +255,14 @@ def extract_representations(task: str, pid_to_split: dict):
 
     model = hk.transform(model_fn)
 
-    @jax.jit
-    def compute_repr(params, rng, config, batch):
+    # `config` must be a STATIC argument. It is MOTOR's config.msgpack -- a nested
+    # dict containing strings (e.g. the pretraining batch path), which JAX cannot
+    # abstractify. Matches stock femr/models/linear_probe.py.
+    def _compute_repr(params, rng, config, batch):
         repr, _ = model.apply(params, rng, config, batch)
         return repr
+
+    compute_repr = jax.jit(_compute_repr, static_argnames=("config",))
 
     reprs_list   = []
     ages_list    = []
