@@ -433,9 +433,19 @@ def train_mlp_classifier(
     batch_size: int = 256,
     lr: float = 1e-3,
     dropout: float = 0.5,
-    hidden_dim: int = 256
+    hidden_dim: int = 256,
+    seed: int = 0
 ):
-    """Trains the 2-stage MLP classifier head on extracted MOTOR representations."""
+    """Trains the 2-stage MLP classifier head on extracted MOTOR representations.
+
+    `seed` controls weight init, dropout masks and batch order. Without it the
+    head is fully stochastic, so two runs of the same configuration differ --
+    which makes small AUROC gaps between configurations uninterpretable.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
     train_mask = split_indices == 0
     val_mask   = split_indices == 1
     test_mask  = split_indices == 2
@@ -453,7 +463,9 @@ def train_mlp_classifier(
     model = MOTOR_MLP_Head(in_dim=reprs.shape[1], hidden_dim=hidden_dim, dropout=dropout).to(device)
 
     train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    _g = torch.Generator()
+    _g.manual_seed(seed)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=_g)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -511,10 +523,68 @@ def train_mlp_classifier(
         "hidden_dim": int(hidden_dim),
         "epochs": int(epochs),
         "batch_size": int(batch_size),
-        "lr": float(lr)
+        "lr": float(lr),
+        "seed": int(seed)
     }
 
     return model, metrics, best_probs
+
+
+def train_mlp_with_repeats(
+    reprs: np.ndarray,
+    labels: np.ndarray,
+    split_indices: np.ndarray,
+    n_repeats: int = 1,
+    seed: int = 0,
+    **kwargs
+):
+    """Trains the head n_repeats times on the SAME representations, with seeds
+    seed..seed+n_repeats-1, and reports mean +/- std across seeds.
+
+    Representation extraction is the expensive, deterministic half of the
+    pipeline, so repeats are nearly free -- and they give the run-to-run spread
+    needed to judge whether a difference between two configurations is real.
+    The returned model/probs are from the best-validation seed.
+    """
+    runs = []
+    best = None
+
+    for k in range(n_repeats):
+        s = seed + k
+        if n_repeats > 1:
+            logging.info(f"--- repeat {k + 1}/{n_repeats} (seed={s}) ---")
+        model, metrics, probs = train_mlp_classifier(
+            reprs, labels, split_indices, seed=s, **kwargs)
+        runs.append(metrics)
+        if best is None or metrics["valid_auroc"] > best[1]["valid_auroc"]:
+            best = (model, metrics, probs)
+
+    model, metrics, probs = best
+    metrics = dict(metrics)
+    metrics["n_repeats"] = int(n_repeats)
+
+    if n_repeats > 1:
+        for key in ("train_auroc", "valid_auroc", "test_auroc"):
+            vals = np.array([r[key] for r in runs], dtype=float)
+            metrics[f"{key}_mean"] = float(vals.mean())
+            metrics[f"{key}_std"] = float(vals.std(ddof=1))
+            metrics[f"{key}_min"] = float(vals.min())
+            metrics[f"{key}_max"] = float(vals.max())
+        metrics["per_seed"] = runs
+
+        logging.info(
+            f"Across {n_repeats} seeds -> "
+            f"Train {metrics['train_auroc_mean']:.4f}+/-{metrics['train_auroc_std']:.4f} | "
+            f"Valid {metrics['valid_auroc_mean']:.4f}+/-{metrics['valid_auroc_std']:.4f} | "
+            f"Test {metrics['test_auroc_mean']:.4f}+/-{metrics['test_auroc_std']:.4f}"
+        )
+        logging.info(
+            "Interpretation: any AUROC gap between configurations smaller than "
+            f"~{2 * metrics['test_auroc_std']:.4f} (2 std) is not distinguishable "
+            "from seed noise."
+        )
+
+    return model, metrics, probs
 
 
 # ---------------------------------------------------------------------------
@@ -552,16 +622,19 @@ def run_task(task: str, args) -> dict:
         return {"task": task, "status": "failed (extraction)"}
 
     # Step 3: Train 2-Stage MLP Head
-    model, metrics, probabilities = train_mlp_classifier(
+    model, metrics, probabilities = train_mlp_with_repeats(
         reprs,
         labels,
         split_indices,
+        n_repeats=getattr(args, "n_repeats", 1),
+        seed=getattr(args, "seed", 0),
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         dropout=args.dropout,
         hidden_dim=args.hidden_dim
     )
+    metrics["split_source"] = split_source
 
     # Step 4: Save Predictions and Metrics
     prediction_dates = []
@@ -606,6 +679,17 @@ def main():
         "--cohort-file", type=str, default=None,
         help="Path to cohort CSV/TSV with a 'split' column (train/valid/test). "
              "Auto-detected from standard DATA_PROCESSED locations if not given."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Seed for MLP head weight init, dropout masks and batch order "
+             "(default: 0). Representation extraction is deterministic already."
+    )
+    parser.add_argument(
+        "--n-repeats", type=int, default=1,
+        help="Retrain the head this many times on the SAME representations with "
+             "seeds seed..seed+n-1, reporting mean +/- std. Use >=5 to measure "
+             "run-to-run spread; repeats are cheap since extraction is not redone."
     )
     parser.add_argument(
         "--split-source", choices=("cohort", "hash"), default="cohort",
