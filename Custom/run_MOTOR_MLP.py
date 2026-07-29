@@ -81,6 +81,15 @@ MOTOR_ROOT = next((p for p in _motor_candidates if p.is_dir()), _motor_candidate
 MODEL_DIR      = MOTOR_ROOT / "model"
 DICTIONARY_DIR = MOTOR_ROOT / "dictionary"
 
+# Cohort file candidates (provides the authoritative train/valid/test split column)
+_cohort_candidates = [
+    PROJECT_DIR.parent / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "Documents" / "Internship_INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "Documents" / "INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "sravar" / "Documents" / "INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+]
+COHORT_FILE = next((p for p in _cohort_candidates if p.is_file()), None)
+
 # Virtual environment candidates
 _venv_candidates = [
     PROJECT_DIR.parent / ".venv_legacy",
@@ -107,6 +116,16 @@ os.environ["XLA_FLAGS"] = XLA_FLAGS
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["JAX_NUMPY_RANK_PROMOTION"] = "raise"
 os.environ.pop("JAX_PLATFORMS", None)
+
+
+def build_env() -> dict:
+    """Return a copy of os.environ with XLA/JAX flags applied, for subprocess calls."""
+    env = os.environ.copy()
+    env["XLA_FLAGS"] = XLA_FLAGS
+    env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    env["JAX_NUMPY_RANK_PROMOTION"] = "raise"
+    env.pop("JAX_PLATFORMS", None)
+    return env
 
 # Torch for PyTorch 2-Stage MLP Head
 import torch
@@ -209,8 +228,30 @@ def ensure_batches(task: str, force: bool = False) -> bool:
 # Representation Extraction using FEMR
 # ---------------------------------------------------------------------------
 
-def extract_representations(task: str):
-    """Loads MOTOR-t-base model, extracts patient representations for train, dev, and test splits."""
+def load_cohort_splits(cohort_file: Path) -> dict:
+    """
+    Read the 'split' column from the cohort CSV/TSV and return a
+    {patient_id (int) -> split_idx (0=train, 1=valid, 2=test)} mapping.
+    """
+    split_map = {"train": 0, "valid": 1, "test": 2}
+    pid_to_split = {}
+    with open(cohort_file) as f:
+        reader = csv.DictReader(f, delimiter="\t" if cohort_file.suffix == ".tsv" else ",")
+        for row in reader:
+            pid_col = next((c for c in ("PatientID", "patient_id") if c in row), None)
+            if pid_col is None or "split" not in row:
+                raise ValueError(f"Cohort file missing 'PatientID'/'patient_id' or 'split' column: {cohort_file}")
+            pid = int(row[pid_col])
+            s   = row["split"].strip().lower()
+            if s in split_map:
+                pid_to_split[pid] = split_map[s]
+    logging.info(f"Loaded {len(pid_to_split)} patient splits from {cohort_file}")
+    return pid_to_split
+
+
+def extract_representations(task: str, cohort_file: Path):
+    """Loads MOTOR-t-base model, extracts patient representations and assigns
+    train/valid/test splits from the authoritative cohort file."""
     import femr.datasets
     import femr.extension.dataloader
     import femr.models.transformer
@@ -249,6 +290,9 @@ def extract_representations(task: str):
     def compute_repr(params, rng, config, batch):
         repr, _ = model.apply(params, rng, config, batch)
         return repr
+
+    # Load authoritative splits from the cohort file
+    pid_to_split = load_cohort_splits(cohort_file)
 
     reprs_list = []
     ages_list = []
@@ -311,17 +355,13 @@ def extract_representations(task: str):
 
         assert repr_pids[j_idx] == l_pid
         assert repr_ages[j_idx] <= l_age
-        
-        # Split assignment (Train: < 80, Dev: 80..90, Test: >= 90 based on patient_id split)
-        pid_hash = database.compute_split(97, l_pid)
-        if pid_hash < 80:
-            split_idx = 0  # train
-        elif pid_hash < 90:
-            split_idx = 1  # dev/val
-        else:
-            split_idx = 2  # test
 
-        split_indices.append(split_idx)
+        # Assign split from the authoritative cohort file; skip patients not in the cohort
+        s = pid_to_split.get(int(l_pid))
+        if s is None:
+            logging.warning(f"Patient {l_pid} not found in cohort file — skipping.")
+            continue
+        split_indices.append(s)
         matching_indices.append(j_idx)
 
     matched_reprs = reprs[sort_indices_repr[matching_indices], :]
@@ -448,8 +488,12 @@ def run_task(task: str, args) -> dict:
         return {"task": task, "status": "failed (batches)"}
 
     # Step 2: Extract representations using MOTOR
+    cohort_file = Path(args.cohort_file) if args.cohort_file else COHORT_FILE
+    if cohort_file is None or not cohort_file.is_file():
+        return {"task": task, "status": "failed (cohort file not found — use --cohort-file)"}
+
     try:
-        reprs, labels, pids, ages, split_indices, database = extract_representations(task)
+        reprs, labels, pids, ages, split_indices, database = extract_representations(task, cohort_file)
     except Exception as e:
         logging.error(f"Representation extraction failed for {task}: {e}", exc_info=True)
         return {"task": task, "status": "failed (extraction)"}
@@ -505,6 +549,11 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for AdamW optimizer (default: 1e-3).")
     parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate for 2-stage MLP head (default: 0.5).")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for MLP stage 1 (default: 256).")
+    parser.add_argument(
+        "--cohort-file", type=str, default=None,
+        help="Path to cohort CSV/TSV with a 'split' column (train/valid/test). "
+             "Auto-detected from standard DATA_PROCESSED locations if not given."
+    )
 
     args = parser.parse_args()
 

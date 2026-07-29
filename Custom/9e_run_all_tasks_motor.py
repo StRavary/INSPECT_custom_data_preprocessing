@@ -1,41 +1,50 @@
 """
 9e_run_all_tasks_motor.py
 
-Runs clmbr_create_batches + clmbr_train_linear_probe (MOTOR foundation model)
-across all 8 INSPECT tasks on Blackwell GPUs, captures Train/Valid/Test AUROC
-and L2 Strength per task, and writes a results CSV + printed summary table.
+Runs clmbr_create_batches + a Python-based L2-regularised logistic-regression
+linear probe (MOTOR foundation model) across all 8 INSPECT tasks.
+
+Splits are assigned from the authoritative cohort file ('split' column:
+train / valid / test), matching every other INSPECT baseline (GBM, etc.).
+
+Train/Valid/Test AUROC and best L2 strength are written to a results CSV and
+printed in a summary table.
 
 Prerequisites
 -------------
 - femr_cuda 0.1.16 installed in the venv
-- CUDA 12.8 ptxas downloaded to ~/cu12_8_ptxas/ (see README.md Step B)
+- CUDA 12.8 ptxas downloaded to ~/cu12_8_ptxas/  (see README.md Step B)
 - Labeled patients CSVs generated for each task under:
     DATA_RAW/EHR_FEMR_DB/features/<task>/labeled_patients.csv
-  (produced by 9a_run_baseline_benchmark.py or ehr/2_generate_labels_and_features.py)
+  (produced by 9a_run_baseline_benchmark.py)
 - motor-t-base model + dictionary at ~/Documents/INSPECT/motor-t-base/
-  (model/ and dictionary/ subdirs must both be present)
+- cohort_0.2.0_master_file_anon.csv in DATA_PROCESSED/ (standard location)
 
 Usage
 -----
-    # Activate venv first, then from the project root:
     python Custom/9e_run_all_tasks_motor.py
 
-    # To force-recreate batches even if they already exist:
+    # Force-recreate batches even if they already exist:
     python Custom/9e_run_all_tasks_motor.py --force-batches
 
-    # To force-retrain probes even if output dirs already exist:
-    python Custom/9e_run_all_tasks_motor.py --force-probe
+    # Override cohort file location:
+    python Custom/9e_run_all_tasks_motor.py --cohort-file /path/to/cohort.csv
 """
 
 import argparse
 import csv
-from datetime import datetime
+import logging
 import os
-import re
+import pickle
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+
+import numpy as np
+import sklearn.metrics
+from sklearn.linear_model import LogisticRegression
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,26 +61,43 @@ TASKS = [
     "12_month_PH",
 ]
 
-# Paths — all resolved relative to this script's location so the script can be
-# called from any working directory.
-SCRIPT_DIR  = Path(__file__).resolve().parent          # Custom/
-PROJECT_DIR = SCRIPT_DIR.parent                         # INSPECT_custom_data_preprocessing/
+SCRIPT_DIR  = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
 DATA_RAW    = PROJECT_DIR.parent / "DATA_RAW" / "EHR_FEMR_DB"
 
 RUN_TIMESTAMP  = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 EXTRACT_PATH   = DATA_RAW / "extract"
-FEATURES_ROOT  = DATA_RAW / "features"       # labeled_patients.csv lives here per task
+FEATURES_ROOT  = DATA_RAW / "features"
 BATCHES_ROOT   = DATA_RAW / "MOTOR_batches"
 RESULTS_ROOT   = DATA_RAW / "motor_results"
-MOTOR_ROOT     = Path.home() / "Documents" / "INSPECT" / "motor-t-base"
+
+_motor_candidates = [
+    Path.home() / "Documents" / "INSPECT" / "motor-t-base",
+    Path.home() / "Documents" / "Internship_INSPECT" / "motor-t-base",
+    PROJECT_DIR.parent / "motor-t-base",
+    PROJECT_DIR / "motor-t-base",
+]
+MOTOR_ROOT     = next((p for p in _motor_candidates if p.is_dir()), _motor_candidates[0])
 MODEL_DIR      = MOTOR_ROOT / "model"
 DICTIONARY_DIR = MOTOR_ROOT / "dictionary"
 
-# Virtual environment — supports both hidden (.venv_legacy) and standard name
-_venv_candidates = [PROJECT_DIR / ".venv_legacy", PROJECT_DIR / "venv_legacy",
-                    Path.home() / "Documents" / "INSPECT" / "venv_legacy"]
+_venv_candidates = [
+    PROJECT_DIR.parent / ".venv_legacy",
+    PROJECT_DIR / ".venv_legacy",
+    PROJECT_DIR / "venv_legacy",
+    Path.home() / "Documents" / "INSPECT" / "venv_legacy",
+]
 VENV_DIR = next((p for p in _venv_candidates if p.is_dir()), None)
+
+# Cohort file — authoritative train/valid/test split column
+_cohort_candidates = [
+    PROJECT_DIR.parent / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "Documents" / "Internship_INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "Documents" / "INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+    Path.home() / "sravar" / "Documents" / "INSPECT" / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv",
+]
+COHORT_FILE = next((p for p in _cohort_candidates if p.is_file()), None)
 
 # ---------------------------------------------------------------------------
 # XLA / JAX environment for Blackwell GPUs (CC 12.0 / SM_120)
@@ -86,34 +112,47 @@ XLA_FLAGS = " ".join([
     "--xla_gpu_force_compilation_parallelism=1",
 ])
 
+os.environ["XLA_FLAGS"] = XLA_FLAGS
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["JAX_NUMPY_RANK_PROMOTION"] = "raise"
+os.environ.pop("JAX_PLATFORMS", None)
+
 
 def build_env() -> dict:
+    """Return a copy of os.environ with XLA/JAX flags applied, for subprocess calls."""
     env = os.environ.copy()
     env["XLA_FLAGS"] = XLA_FLAGS
     env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    env.pop("JAX_PLATFORMS", None)   # must not be set to 'cpu'
+    env["JAX_NUMPY_RANK_PROMOTION"] = "raise"
+    env.pop("JAX_PLATFORMS", None)
     return env
 
 
 # ---------------------------------------------------------------------------
-# Output parsing
+# Cohort split loading
 # ---------------------------------------------------------------------------
 
-AUROC_RE = re.compile(
-    r"\[?(INFO|WARNING)\]?\s+(Train|Valid|Test) AUROC\s+([\d.]+)", re.IGNORECASE
-)
-L2_RE = re.compile(r"\[?(INFO|WARNING)\]?\s+L2 Strength\s+([\d.eE+\-]+)", re.IGNORECASE)
-
-
-def parse_metrics(output: str) -> dict:
-    metrics = {"train_auroc": None, "valid_auroc": None, "test_auroc": None, "l2_strength": None}
-    for match in AUROC_RE.finditer(output):
-        split = match.group(2).lower()
-        metrics[f"{split}_auroc"] = float(match.group(3))
-    l2 = L2_RE.search(output)
-    if l2:
-        metrics["l2_strength"] = float(l2.group(2))
-    return metrics
+def load_cohort_splits(cohort_file: Path) -> dict:
+    """
+    Read the 'split' column from the cohort CSV/TSV.
+    Returns {patient_id (int) -> split_idx (0=train, 1=valid, 2=test)}.
+    """
+    split_map = {"train": 0, "valid": 1, "test": 2}
+    pid_to_split = {}
+    with open(cohort_file) as f:
+        reader = csv.DictReader(f, delimiter="\t" if cohort_file.suffix == ".tsv" else ",")
+        for row in reader:
+            pid_col = next((c for c in ("PatientID", "patient_id") if c in row), None)
+            if pid_col is None or "split" not in row:
+                raise ValueError(
+                    f"Cohort file missing 'PatientID'/'patient_id' or 'split' column: {cohort_file}"
+                )
+            pid = int(row[pid_col])
+            s   = row["split"].strip().lower()
+            if s in split_map:
+                pid_to_split[pid] = split_map[s]
+    logging.info(f"Loaded {len(pid_to_split)} patient splits from {cohort_file}")
+    return pid_to_split
 
 
 # ---------------------------------------------------------------------------
@@ -126,30 +165,30 @@ def create_batches(task: str, clmbr_create_bin: Path, force: bool) -> bool:
     labeled_patients = FEATURES_ROOT / task / "labeled_patients.csv"
 
     if not labeled_patients.exists():
-        print(f"  [ERROR] labeled_patients.csv not found for {task}: {labeled_patients}")
-        print(f"          Run 9a_run_baseline_benchmark.py --task {task} first.")
+        logging.error(f"labeled_patients.csv not found for {task}: {labeled_patients}")
+        logging.error(f"Run 9a_run_baseline_benchmark.py --task {task} first.")
         return False
 
     if batches_dir.exists():
         if force:
-            print(f"  [INFO] Removing existing batches for {task} (--force-batches).")
+            logging.info(f"Removing existing batches for {task} (--force-batches).")
             shutil.rmtree(batches_dir)
         else:
-            print(f"  [INFO] Batches already exist for {task}, skipping creation.")
+            logging.info(f"Batches already exist for {task}, skipping creation.")
             return True
 
     cmd = [
         str(clmbr_create_bin),
         str(batches_dir),
-        "--data_path",            str(EXTRACT_PATH),
-        "--task",                 "labeled_patients",
+        "--data_path",             str(EXTRACT_PATH),
+        "--task",                  "labeled_patients",
         "--labeled_patients_path", str(labeled_patients),
-        "--val_start",            "80",
-        "--dictionary_path",      str(DICTIONARY_DIR),
+        "--val_start",             "80",
+        "--dictionary_path",       str(DICTIONARY_DIR),
         "--is_hierarchical",
     ]
 
-    print(f"  Creating batches: {' '.join(cmd)}")
+    logging.info(f"Creating batches: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, env=build_env())
     for line in proc.stdout:
@@ -157,56 +196,283 @@ def create_batches(task: str, clmbr_create_bin: Path, force: bool) -> bool:
     proc.wait()
 
     if proc.returncode != 0:
-        print(f"  [ERROR] clmbr_create_batches failed for {task} (exit {proc.returncode})")
+        logging.error(f"clmbr_create_batches failed for {task} (exit {proc.returncode})")
         return False
 
-    print(f"  [OK] Batches created at {batches_dir}")
+    logging.info(f"Batches created at {batches_dir}")
     return True
 
 
 # ---------------------------------------------------------------------------
-# Linear probe
+# Representation extraction
 # ---------------------------------------------------------------------------
 
-def run_probe(task: str, clmbr_probe_bin: Path, force: bool) -> dict:
-    batches_dir = BATCHES_ROOT / task
-    output_dir  = RESULTS_ROOT / f"{RUN_TIMESTAMP}_{task}"
+def extract_representations(task: str, pid_to_split: dict):
+    """
+    Load MOTOR-t-base, extract per-patient representations from all batches,
+    and assign train/valid/test splits from the cohort file mapping.
 
-    if not batches_dir.exists():
-        return {"task": task, "status": "failed (no batches)",
+    Returns (reprs, labels, pids, ages, split_indices).
+    """
+    import haiku as hk
+    import jax
+    import jax.numpy as jnp
+    import msgpack
+    import femr.datasets
+    import femr.extension.dataloader
+    import femr.models.transformer
+
+    batches_path    = BATCHES_ROOT / task
+    batch_info_path = batches_path / "batch_info.msgpack"
+
+    logging.info(f"Loading database extract from {EXTRACT_PATH}")
+    database = femr.datasets.PatientDatabase(str(EXTRACT_PATH))
+
+    logging.info(f"Loading MOTOR model weights from {MODEL_DIR}")
+    with open(MODEL_DIR / "best", "rb") as f:
+        params = pickle.load(f)
+    params = femr.models.transformer.convert_params(params, dtype=jnp.float16)
+
+    with open(batch_info_path, "rb") as f:
+        batch_info = msgpack.load(f, use_list=False)
+
+    with open(MODEL_DIR / "config.msgpack", "rb") as f:
+        config = msgpack.load(f, use_list=False)
+    config = hk.data_structures.to_immutable_dict(config)
+
+    rng = jax.random.PRNGKey(config.get("seed", 42))
+
+    loader = femr.extension.dataloader.BatchLoader(str(EXTRACT_PATH), str(batch_info_path))
+    logging.info(
+        f"Loaded batches: Train={loader.get_number_of_batches('train')}, "
+        f"Dev={loader.get_number_of_batches('dev')}, "
+        f"Test={loader.get_number_of_batches('test')}"
+    )
+
+    def model_fn(config, batch):
+        model = femr.models.transformer.EHRTransformer(config)(batch, no_task=True)
+        return model
+
+    model = hk.transform(model_fn)
+
+    @jax.jit
+    def compute_repr(params, rng, config, batch):
+        repr, _ = model.apply(params, rng, config, batch)
+        return repr
+
+    reprs_list   = []
+    ages_list    = []
+    pids_list    = []
+    offsets_list = []
+
+    for split in ("train", "dev", "test"):
+        num_batches = loader.get_number_of_batches(split)
+        logging.info(f"Processing {split} split ({num_batches} batches)...")
+        for j in range(num_batches):
+            raw_batch = loader.get_batch(split, j)
+            batch = jax.tree_map(
+                lambda a: jax.device_put(a, device=jax.devices("gpu")[0]), raw_batch
+            )
+            repr = compute_repr(params, rng, config, batch)
+
+            num_indices = batch["num_indices"]
+            p_index = (
+                batch["transformer"]["label_indices"] // batch["transformer"]["length"]
+            )[:num_indices]
+
+            reprs_list.append(np.array(repr[:num_indices]))
+            ages_list.append(np.array(raw_batch["transformer"]["integer_ages"][:num_indices]))
+            pids_list.append(np.array(raw_batch["patient_ids"][p_index]))
+            offsets_list.append(np.array(raw_batch["offsets"][p_index]))
+
+    reprs       = np.concatenate(reprs_list,   axis=0)
+    repr_ages   = np.concatenate(ages_list,    axis=0)
+    repr_pids   = np.concatenate(pids_list,    axis=0)
+    repr_offsets = np.concatenate(offsets_list, axis=0).astype(np.int32)
+
+    # Label alignment (same logic as clmbr_train_linear_probe)
+    task_labels  = batch_info["config"]["task"]["labels"]
+    label_pids   = np.array([v[0] for v in task_labels], dtype=np.uint64)
+    label_ages   = np.array([v[1] for v in task_labels], dtype=np.uint32)
+    label_values = np.array([v[2] for v in task_labels], dtype=np.float32)
+
+    sort_idx_label = np.lexsort((label_ages, label_pids))
+    label_pids   = label_pids[sort_idx_label]
+    label_ages   = label_ages[sort_idx_label]
+    label_values = label_values[sort_idx_label]
+
+    sort_idx_repr = np.lexsort((-repr_offsets, repr_ages, repr_pids))
+    repr_offsets  = repr_offsets[sort_idx_repr]
+    repr_ages     = repr_ages[sort_idx_repr]
+    repr_pids     = repr_pids[sort_idx_repr]
+    reprs_sorted  = reprs[sort_idx_repr]
+
+    matching_indices = []
+    split_indices    = []
+
+    j = 0
+    for l_pid, l_age in zip(label_pids, label_ages):
+        while True:
+            if j + 1 == len(repr_pids):
+                break
+            elif repr_pids[j] < l_pid:
+                pass
+            else:
+                if repr_pids[j + 1] != l_pid or repr_ages[j + 1] > l_age:
+                    break
+            j += 1
+
+        assert repr_pids[j] == l_pid
+        assert repr_ages[j] <= l_age
+
+        # Assign split from the authoritative cohort file
+        s = pid_to_split.get(int(l_pid))
+        if s is None:
+            logging.warning(f"Patient {l_pid} not in cohort file — skipping.")
+            continue
+        split_indices.append(s)
+        matching_indices.append(j)
+
+    matched_reprs = reprs_sorted[matching_indices, :]
+    label_values  = label_values[matching_indices] if matching_indices else label_values
+    label_pids    = label_pids[matching_indices]   if matching_indices else label_pids
+    label_ages    = label_ages[matching_indices]   if matching_indices else label_ages
+    split_indices = np.array(split_indices)
+
+    logging.info(
+        f"Split counts → Train: {(split_indices==0).sum()} | "
+        f"Valid: {(split_indices==1).sum()} | Test: {(split_indices==2).sum()}"
+    )
+
+    return matched_reprs, label_values, label_pids, label_ages, split_indices, database
+
+
+# ---------------------------------------------------------------------------
+# Linear probe (L2-regularised logistic regression, sklearn)
+# ---------------------------------------------------------------------------
+
+def run_linear_probe(reprs: np.ndarray, labels: np.ndarray, split_indices: np.ndarray) -> dict:
+    """
+    Train an L2-regularised logistic regression probe on MOTOR representations,
+    sweeping 20 regularisation strengths (matching clmbr_train_linear_probe range)
+    and selecting the best model by validation AUROC.
+
+    Returns a metrics dict with train/valid/test AUROC and best L2 strength.
+    """
+    train_mask = split_indices == 0
+    val_mask   = split_indices == 1
+    test_mask  = split_indices == 2
+
+    X = reprs.astype(np.float32)
+    X_train, y_train = X[train_mask], labels[train_mask]
+    X_val,   y_val   = X[val_mask],   labels[val_mask]
+    X_test,  y_test  = X[test_mask],  labels[test_mask]
+
+    logging.info(
+        f"Linear probe split counts — Train: {len(X_train)} | "
+        f"Valid: {len(X_val)} | Test: {len(X_test)}"
+    )
+    logging.info(
+        f"Prevalence — Train: {y_train.mean():.4f} | "
+        f"Valid: {y_val.mean():.4f} | Test: {y_test.mean():.4f}"
+    )
+
+    # Sweep L2 strengths from 10^1 down to 10^-5 (same range as clmbr_train_linear_probe),
+    # then l2=0 (no regularisation).  sklearn's C = 1 / l2.
+    l2_values = list(10 ** e for e in np.linspace(1, -5, 20)) + [0.0]
+
+    best_val_auroc   = -1.0
+    best_train_auroc = None
+    best_test_auroc  = None
+    best_l2          = None
+
+    for l2 in l2_values:
+        C = 1.0 / l2 if l2 > 0 else 1e12
+        clf = LogisticRegression(
+            C=C, solver="lbfgs", max_iter=1000,
+            fit_intercept=True, tol=1e-4
+        )
+        clf.fit(X_train, y_train)
+
+        train_auroc = sklearn.metrics.roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1])
+        val_auroc   = sklearn.metrics.roc_auc_score(y_val,   clf.predict_proba(X_val)[:, 1])
+        test_auroc  = sklearn.metrics.roc_auc_score(y_test,  clf.predict_proba(X_test)[:, 1])
+
+        logging.info(f"  L2={l2:.2e}  C={C:.2e} | Train: {train_auroc:.4f} | Valid: {val_auroc:.4f} | Test: {test_auroc:.4f}")
+
+        if val_auroc > best_val_auroc:
+            best_val_auroc   = val_auroc
+            best_train_auroc = train_auroc
+            best_test_auroc  = test_auroc
+            best_l2          = l2
+
+    logging.info(
+        f"Best L2={best_l2:.2e} → Train: {best_train_auroc:.4f} | "
+        f"Valid: {best_val_auroc:.4f} | Test: {best_test_auroc:.4f}"
+    )
+
+    return {
+        "train_auroc": float(best_train_auroc),
+        "valid_auroc": float(best_val_auroc),
+        "test_auroc":  float(best_test_auroc),
+        "l2_strength": float(best_l2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-task pipeline
+# ---------------------------------------------------------------------------
+
+def run_task(task: str, pid_to_split: dict) -> dict:
+    logging.info(f"\n{'='*70}\nStarting MOTOR linear probe for task: {task}\n{'='*70}")
+
+    # Step 1: extract representations
+    try:
+        reprs, labels, pids, ages, split_indices, database = extract_representations(
+            task, pid_to_split
+        )
+    except Exception as e:
+        logging.error(f"Representation extraction failed for {task}: {e}", exc_info=True)
+        return {"task": task, "status": "failed (extraction)",
                 **{k: None for k in ["train_auroc", "valid_auroc", "test_auroc", "l2_strength"]}}
 
-    if output_dir.exists():
-        print(f"  [INFO] Removing existing results for {task} to allow fresh run.")
-        shutil.rmtree(output_dir)
-
-    # Do NOT pre-create output_dir — clmbr_train_linear_probe must create it itself
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        str(clmbr_probe_bin),
-        str(output_dir),
-        "--data_path",    str(EXTRACT_PATH),
-        "--model_dir",    str(MODEL_DIR),
-        "--batches_path", str(batches_dir),
-    ]
-
-    print(f"  Running probe: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, env=build_env())
-    captured = []
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-        captured.append(line)
-    proc.wait()
-
-    full_output = "".join(captured)
-
-    if proc.returncode != 0:
-        return {"task": task, "status": "failed",
+    # Step 2: train linear probe
+    try:
+        metrics = run_linear_probe(reprs, labels, split_indices)
+    except Exception as e:
+        logging.error(f"Linear probe failed for {task}: {e}", exc_info=True)
+        return {"task": task, "status": "failed (probe)",
                 **{k: None for k in ["train_auroc", "valid_auroc", "test_auroc", "l2_strength"]}}
 
-    metrics = parse_metrics(full_output)
+    # Step 3: save predictions
+    output_dir = RESULTS_ROOT / f"{RUN_TIMESTAMP}_{task}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import datetime as dt
+    from sklearn.linear_model import LogisticRegression as _LR
+
+    # Re-fit best model to save predictions
+    best_C = 1.0 / metrics["l2_strength"] if metrics["l2_strength"] > 0 else 1e12
+    clf = _LR(C=best_C, solver="lbfgs", max_iter=1000, fit_intercept=True, tol=1e-4)
+    train_mask = split_indices == 0
+    clf.fit(reprs.astype(np.float32)[train_mask], labels[train_mask])
+    all_probs = clf.predict_proba(reprs.astype(np.float32))[:, 1]
+
+    prediction_dates = []
+    for pid, age in zip(pids, ages):
+        birth = dt.datetime.combine(database.get_patient_birth_date(pid), dt.time.min)
+        prediction_dates.append(birth + dt.timedelta(minutes=int(age)))
+
+    with open(output_dir / "predictions.pkl", "wb") as f:
+        pickle.dump([all_probs, pids, labels, prediction_dates], f)
+
+    logging.info(
+        f"[{task}] SUMMARY → Train: {metrics['train_auroc']:.4f} | "
+        f"Valid: {metrics['valid_auroc']:.4f} | Test: {metrics['test_auroc']:.4f} | "
+        f"L2: {metrics['l2_strength']:.2e}"
+    )
+    logging.info(f"Results saved to {output_dir}")
+
     return {"task": task, "status": "ok", **metrics}
 
 
@@ -216,94 +482,101 @@ def run_probe(task: str, clmbr_probe_bin: Path, force: bool) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run MOTOR linear probe across all INSPECT tasks"
+        description="Run MOTOR linear probe across all INSPECT tasks (cohort-file splits)"
     )
     parser.add_argument("--force-batches", action="store_true",
                         help="Re-create MOTOR batches even if they already exist")
-    parser.add_argument("--force-probe", action="store_true",
-                        help="Re-run linear probe even if results already exist")
+    parser.add_argument(
+        "--cohort-file", type=str, default=None,
+        help="Path to cohort CSV/TSV with 'split' column. Auto-detected if not given."
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
 
     if VENV_DIR is None:
         sys.exit("[ERROR] Could not locate venv.")
 
     clmbr_create_bin = VENV_DIR / "bin" / "clmbr_create_batches"
-    clmbr_probe_bin  = VENV_DIR / "bin" / "clmbr_train_linear_probe"
-
-    for bin_path in (clmbr_create_bin, clmbr_probe_bin):
-        if not bin_path.exists():
-            sys.exit(f"[ERROR] {bin_path.name} not found. Is femr_cuda 0.1.16 installed?")
+    if not clmbr_create_bin.exists():
+        sys.exit(f"[ERROR] {clmbr_create_bin} not found. Is femr_cuda 0.1.16 installed?")
 
     if not MODEL_DIR.exists():
         sys.exit(f"[ERROR] Model directory not found: {MODEL_DIR}")
-
     if not DICTIONARY_DIR.exists():
-        sys.exit(f"[ERROR] Dictionary directory not found: {DICTIONARY_DIR}\n"
-                 "        motor-t-base must contain both model/ and dictionary/ subdirs.")
+        sys.exit(f"[ERROR] Dictionary directory not found: {DICTIONARY_DIR}")
 
-    print(f"femr venv   : {VENV_DIR}")
-    print(f"model dir   : {MODEL_DIR}")
-    print(f"dictionary  : {DICTIONARY_DIR}")
-    print(f"extract     : {EXTRACT_PATH}")
-    print(f"features    : {FEATURES_ROOT}")
-    print(f"batches     : {BATCHES_ROOT}")
-    print(f"results     : {RESULTS_ROOT}")
-    print(f"XLA_FLAGS   : {XLA_FLAGS}\n")
+    cohort_file = Path(args.cohort_file) if args.cohort_file else COHORT_FILE
+    if cohort_file is None or not cohort_file.is_file():
+        sys.exit(
+            "[ERROR] Cohort file not found. Use --cohort-file /path/to/cohort_0.2.0_master_file_anon.csv"
+        )
+
+    pid_to_split = load_cohort_splits(cohort_file)
+
+    logging.info(f"femr venv   : {VENV_DIR}")
+    logging.info(f"model dir   : {MODEL_DIR}")
+    logging.info(f"dictionary  : {DICTIONARY_DIR}")
+    logging.info(f"extract     : {EXTRACT_PATH}")
+    logging.info(f"batches     : {BATCHES_ROOT}")
+    logging.info(f"results     : {RESULTS_ROOT}")
+    logging.info(f"cohort file : {cohort_file}")
+    logging.info(f"XLA_FLAGS   : {XLA_FLAGS}\n")
 
     all_results = []
 
     for task in TASKS:
-        print(f"\n{'='*70}")
-        print(f"  Task: {task}")
-        print(f"{'='*70}")
+        logging.info(f"\n{'='*70}\n  Task: {task}\n{'='*70}")
 
         # Step 1: ensure batches exist
-        batches_ok = create_batches(task, clmbr_create_bin, args.force_batches)
-        if not batches_ok:
+        if not create_batches(task, clmbr_create_bin, args.force_batches):
             all_results.append({
                 "task": task, "status": "failed (batch creation)",
                 **{k: None for k in ["train_auroc", "valid_auroc", "test_auroc", "l2_strength"]}
             })
             continue
 
-        # Step 2: train linear probe
-        result = run_probe(task, clmbr_probe_bin, args.force_probe)
+        # Step 2: extract representations + run linear probe
+        result = run_task(task, pid_to_split)
         all_results.append(result)
 
-    # ------------------------------------------------------------------
     # Write CSV
-    # ------------------------------------------------------------------
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     csv_path = RESULTS_ROOT / "motor_results.csv"
-
     fieldnames = ["task", "status", "train_auroc", "valid_auroc", "test_auroc", "l2_strength"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_results)
 
-    # ------------------------------------------------------------------
     # Print summary table
-    # ------------------------------------------------------------------
     col = {"task": 25, "status": 22, "train": 12, "valid": 12, "test": 12, "l2": 14}
-
-    header = (f"{'Task':<{col['task']}} {'Status':<{col['status']}} "
-              f"{'Train AUROC':>{col['train']}} {'Valid AUROC':>{col['valid']}} "
-              f"{'Test AUROC':>{col['test']}} {'L2 Strength':>{col['l2']}}")
+    header = (
+        f"{'Task':<{col['task']}} {'Status':<{col['status']}} "
+        f"{'Train AUROC':>{col['train']}} {'Valid AUROC':>{col['valid']}} "
+        f"{'Test AUROC':>{col['test']}} {'L2 Strength':>{col['l2']}}"
+    )
 
     print(f"\n\n{'='*85}")
-    print("  MOTOR LINEAR PROBE — ALL TASKS")
+    print("  MOTOR LINEAR PROBE — ALL TASKS  (cohort-file splits)")
     print(f"{'='*85}")
     print(header)
     print("-" * 85)
 
     for r in all_results:
         fmt = lambda v: f"{v:.4f}" if v is not None else "—"
-        print(f"{r['task']:<{col['task']}} {r['status']:<{col['status']}} "
-              f"{fmt(r['train_auroc']):>{col['train']}} "
-              f"{fmt(r['valid_auroc']):>{col['valid']}} "
-              f"{fmt(r['test_auroc']):>{col['test']}} "
-              f"{fmt(r['l2_strength']):>{col['l2']}}")
+        fmt_l2 = lambda v: f"{v:.2e}" if v is not None else "—"
+        print(
+            f"{r['task']:<{col['task']}} {r['status']:<{col['status']}} "
+            f"{fmt(r['train_auroc']):>{col['train']}} "
+            f"{fmt(r['valid_auroc']):>{col['valid']}} "
+            f"{fmt(r['test_auroc']):>{col['test']}} "
+            f"{fmt_l2(r['l2_strength']):>{col['l2']}}"
+        )
 
     print(f"\nResults saved to: {csv_path}")
 
