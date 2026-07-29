@@ -249,9 +249,20 @@ def load_cohort_splits(cohort_file: Path) -> dict:
     return pid_to_split
 
 
-def extract_representations(task: str, cohort_file: Path):
+def extract_representations(task: str, cohort_file: Path, split_source: str = "cohort"):
     """Loads MOTOR-t-base model, extracts patient representations and assigns
-    train/valid/test splits from the authoritative cohort file."""
+    train/valid/test splits.
+
+    split_source:
+      "cohort" (default) -- patient-level assignment from the cohort file's
+          'split' column, matching every other INSPECT baseline (GBM, imaging).
+      "hash"             -- CLMBR's own partition from clmbr_create_batches
+          (--val_start/--test_start percentile hashing, seed 97). This is what
+          stock femr/models/linear_probe.py evaluates on. Provided so the two
+          split sources can be compared directly on identical representations.
+    """
+    if split_source not in ("cohort", "hash"):
+        raise ValueError(f"split_source must be 'cohort' or 'hash', got {split_source!r}")
     import femr.datasets
     import femr.extension.dataloader
     import femr.models.transformer
@@ -296,14 +307,16 @@ def extract_representations(task: str, cohort_file: Path):
     compute_repr = jax.jit(_compute_repr, static_argnames=("config",))
 
     # Load authoritative splits from the cohort file
-    pid_to_split = load_cohort_splits(cohort_file)
+    pid_to_split = load_cohort_splits(cohort_file) if split_source == "cohort" else {}
+    logging.info(f"Split source: {split_source}")
 
     reprs_list = []
     ages_list = []
     pids_list = []
     offsets_list = []
+    hash_split_list = []
 
-    for split in ("train", "dev", "test"):
+    for split_idx, split in enumerate(("train", "dev", "test")):
         num_batches = loader.get_number_of_batches(split)
         logging.info(f"Processing {split} split ({num_batches} batches)...")
         for j in range(num_batches):
@@ -323,11 +336,16 @@ def extract_representations(task: str, cohort_file: Path):
             ages_list.append(np.asarray(raw_batch["transformer"]["integer_ages"])[li])
             pids_list.append(np.array(raw_batch["patient_ids"][p_index]))
             offsets_list.append(np.array(raw_batch["offsets"][p_index]))
+            # CLMBR's own partition index (0=train, 1=dev, 2=test), from
+            # clmbr_create_batches --val_start/--test_start percentile hashing.
+            # Only used when split_source == "hash".
+            hash_split_list.append(np.full(int(num_indices), split_idx, dtype=np.int64))
 
     reprs = np.concatenate(reprs_list, axis=0)
     repr_ages = np.concatenate(ages_list, axis=0)
     repr_pids = np.concatenate(pids_list, axis=0)
     repr_offsets = np.concatenate(offsets_list, axis=0).astype(np.int32)
+    repr_hash_split = np.concatenate(hash_split_list, axis=0)
 
     # Label alignment
     task_labels = batch_info['config']['task']['labels']
@@ -344,6 +362,7 @@ def extract_representations(task: str, cohort_file: Path):
     repr_offsets = repr_offsets[sort_indices_repr]
     repr_ages = repr_ages[sort_indices_repr]
     repr_pids = repr_pids[sort_indices_repr]
+    repr_hash_split = repr_hash_split[sort_indices_repr]
 
     matching_indices = []
     split_indices = []
@@ -366,11 +385,15 @@ def extract_representations(task: str, cohort_file: Path):
         assert repr_pids[j_idx] == l_pid
         assert repr_ages[j_idx] <= l_age
 
-        # Assign split from the authoritative cohort file; skip patients not in the cohort
-        s = pid_to_split.get(int(l_pid))
-        if s is None:
-            logging.warning(f"Patient {l_pid} not found in cohort file — skipping.")
-            continue
+        if split_source == "hash":
+            # CLMBR's own partition, carried on the matched representation.
+            s = int(repr_hash_split[j_idx])
+        else:
+            # Assign split from the authoritative cohort file; skip patients not in the cohort
+            s = pid_to_split.get(int(l_pid))
+            if s is None:
+                logging.warning(f"Patient {l_pid} not found in cohort file — skipping.")
+                continue
         split_indices.append(s)
         matching_indices.append(j_idx)
         kept_label_idx.append(i_lab)
@@ -516,12 +539,14 @@ def run_task(task: str, args) -> dict:
         return {"task": task, "status": "failed (batches)"}
 
     # Step 2: Extract representations using MOTOR
+    split_source = getattr(args, "split_source", "cohort")
     cohort_file = Path(args.cohort_file) if args.cohort_file else COHORT_FILE
-    if cohort_file is None or not cohort_file.is_file():
+    if split_source == "cohort" and (cohort_file is None or not cohort_file.is_file()):
         return {"task": task, "status": "failed (cohort file not found — use --cohort-file)"}
 
     try:
-        reprs, labels, pids, ages, split_indices, database = extract_representations(task, cohort_file)
+        reprs, labels, pids, ages, split_indices, database = extract_representations(
+            task, cohort_file, split_source=split_source)
     except Exception as e:
         logging.error(f"Representation extraction failed for {task}: {e}", exc_info=True)
         return {"task": task, "status": "failed (extraction)"}
@@ -581,6 +606,14 @@ def main():
         "--cohort-file", type=str, default=None,
         help="Path to cohort CSV/TSV with a 'split' column (train/valid/test). "
              "Auto-detected from standard DATA_PROCESSED locations if not given."
+    )
+    parser.add_argument(
+        "--split-source", choices=("cohort", "hash"), default="cohort",
+        help="Where train/valid/test comes from. 'cohort' (default) uses the "
+             "patient-level split column, matching the other INSPECT baselines. "
+             "'hash' uses CLMBR's own percentile partition from "
+             "clmbr_create_batches, which is what stock femr linear_probe.py "
+             "evaluates on. Use 'hash' to quantify the effect of the split source."
     )
 
     args = parser.parse_args()
