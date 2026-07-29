@@ -314,8 +314,13 @@ def extract_representations(task: str, cohort_file: Path):
             num_indices = batch["num_indices"]
             p_index = (batch["transformer"]["label_indices"] // batch["transformer"]["length"])[:num_indices]
 
+            # integer_ages is per TOKEN across the flattened batch; label_indices
+            # gives the token positions where labels sit. Must fancy-index by those
+            # positions, not take the first num_indices entries.
+            li = np.asarray(raw_batch["transformer"]["label_indices"])[:num_indices]
+
             reprs_list.append(np.array(repr[:num_indices]))
-            ages_list.append(np.array(raw_batch["transformer"]["integer_ages"][:num_indices]))
+            ages_list.append(np.asarray(raw_batch["transformer"]["integer_ages"])[li])
             pids_list.append(np.array(raw_batch["patient_ids"][p_index]))
             offsets_list.append(np.array(raw_batch["offsets"][p_index]))
 
@@ -342,9 +347,10 @@ def extract_representations(task: str, cohort_file: Path):
 
     matching_indices = []
     split_indices = []
+    kept_label_idx = []   # which LABELS survived; keeps labels aligned with reprs
 
     j_idx = 0
-    for l_pid, l_age in zip(label_pids, label_ages):
+    for i_lab, (l_pid, l_age) in enumerate(zip(label_pids, label_ages)):
         while True:
             if j_idx + 1 == len(repr_pids):
                 break
@@ -367,9 +373,27 @@ def extract_representations(task: str, cohort_file: Path):
             continue
         split_indices.append(s)
         matching_indices.append(j_idx)
+        kept_label_idx.append(i_lab)
 
+    kept_label_idx = np.array(kept_label_idx, dtype=np.int64)
     matched_reprs = reprs[sort_indices_repr[matching_indices], :]
     split_indices = np.array(split_indices)
+
+    # Labels must be filtered by LABEL index, not representation index, or they
+    # desynchronise from matched_reprs/split_indices whenever a patient is skipped.
+    label_values = label_values[kept_label_idx]
+    label_pids = label_pids[kept_label_idx]
+    label_ages = label_ages[kept_label_idx]
+
+    assert len(matched_reprs) == len(label_values) == len(split_indices), (
+        f"alignment mismatch: reprs={len(matched_reprs)} "
+        f"labels={len(label_values)} splits={len(split_indices)}"
+    )
+    logging.info(
+        f"Aligned {len(matched_reprs):,} labels to representations "
+        f"(Train={(split_indices==0).sum():,} Valid={(split_indices==1).sum():,} "
+        f"Test={(split_indices==2).sum():,})"
+    )
 
     return matched_reprs, label_values, label_pids, label_ages, split_indices, database
 
