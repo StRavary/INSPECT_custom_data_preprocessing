@@ -114,6 +114,58 @@ To evaluate the extracted EHR features against the pulmonary embolism (PE) endpo
 13. `9d_run_all_tasks_gbm_cv.py`: Iteratively trains and evaluates the GBM baseline using **5-Fold Cross-Validation** across all tasks, extracting and tabulating pooled OOF AUROCs and average test metrics (AUROC, Sensitivity, and Specificity with Youden's J threshold optimization).
 14. `9e_run_all_tasks_motor.py`: Runs the MOTOR foundation model linear probe across all 8 tasks. Handles `clmbr_create_batches` and `clmbr_train_linear_probe` automatically. Requires a Blackwell-compatible environment (see Step 4 above) and `labeled_patients.csv` for each task. Results are saved to timestamped per-task folders under `DATA_RAW/EHR_FEMR_DB/motor_results/` with a consolidated `motor_results.csv`.
 
+## MOTOR Foundation-Model Evaluation
+
+Three entry points share one implementation. `run_MOTOR_MLP.py` holds all the logic; the other two are a thin wrapper and an all-tasks driver, so fixes cannot drift between them.
+
+| Script | Head | Split source | Tasks |
+|---|---|---|---|
+| `9e_run_all_tasks_motor.py` | sklearn `LogisticRegression` (L2 sweep) | cohort file | all 8 |
+| `run_MOTOR_MLP.py` | PyTorch 2-stage MLP | cohort file (default) | `--task <name>` or `all` |
+| `run_MOTOR_MLP_Hashed.py` | PyTorch 2-stage MLP | CLMBR hash partition | `--task <name>` or `all` |
+
+**Split handling.** All three call `clmbr_create_batches --val_start 80` to build batches, then discard CLMBR's own 80/5/15 hash partition and reassign train/valid/test **per patient** from the cohort file's `split` column — matching the GBM and imaging arms. `run_MOTOR_MLP_Hashed.py` (equivalently `--split-source hash`) keeps the hash partition instead, so the two can be compared on identical representations. Measured difference across 8 tasks: mean +0.005, p = 0.45 — see §25.3 of `INSPECT_Baseline_Reconstruction.md`.
+
+**Prerequisites.** Each task needs `labeled_patients.csv` under `DATA_RAW/EHR_FEMR_DB/features/<task>/`, produced by `9a_run_baseline_benchmark.py`. The cohort file supplies the *split*; the labels reaching MOTOR come from that FEMR artefact, which additionally carries prediction times and drops patients absent from the FEMR extract. Generate any missing ones first:
+
+```bash
+cd <repo root>          # NOT Custom/ — 9a builds paths with bare ../
+for t in PE 1_month_mortality 6_month_mortality 12_month_mortality \
+         1_month_readmission 6_month_readmission 12_month_readmission 12_month_PH; do
+  [ -f ../DATA_RAW/EHR_FEMR_DB/features/$t/labeled_patients.csv ] \
+    || python Custom/9a_run_baseline_benchmark.py --task $t
+done
+```
+
+**Running.** These are multi-hour GPU jobs; use `tmux` and tee the output. Do **not** run two in parallel — JAX preallocates most of VRAM and the second process will fail to allocate.
+
+```bash
+tmux new -s motor
+python Custom/run_MOTOR_MLP.py --task 12_month_PH --n-repeats 5 \
+  2>&1 | tee ~/logs/motor_ph_$(date +%Y%m%d_%H%M%S).log
+# detach: Ctrl-b then d      reattach: tmux attach -t motor
+```
+
+**`run_MOTOR_MLP.py` flags:** `--task` (required), `--seed`, `--n-repeats`, `--split-source {cohort,hash}`, `--epochs`, `--batch-size`, `--lr`, `--dropout`, `--hidden-dim`, `--force-batches`, `--motor-dir`, `--cohort-file`.
+
+**L2 conversion (fixed 2026-07-30).** Stock FEMR minimises `mean(BCE) + 0.5·l2·‖β‖²` while sklearn minimises `0.5·‖w‖² + C·Σ loss`, so the equivalence is `C = 1/(l2·n_train)`, not `C = 1/l2`. The earlier conversion omitted `n`, making the effective penalty ~4 decades too weak and pushing L2 selection to the top of the grid on all 8 tasks. Corrected in both the sweep and the final re-fit, with a warning logged if selection lands at either grid boundary. **Results produced before this fix are under-regularised and need regenerating** — see §25.1.1 of `INSPECT_Baseline_Reconstruction.md`.
+
+**Reproducibility.** `9e` is deterministic — `lbfgs` on a strictly convex objective, no shuffling, `random_state` ignored — so it needs no seed. The MLP head *is* stochastic; `--seed` fixes it and `--n-repeats N` retrains N times on the same (deterministic, ~11 min) representations to report mean ± std. Use repeats before claiming any small AUROC difference is real.
+
+## Split Diagnostics
+
+| Script | Purpose |
+|---|---|
+| `check_rsna_splits.py` | Replays `RSNADataset2D`'s filtering on the RSPECT CSV. Reports whether a split column exists, whether values match the literal `train`/`valid`/`test` the DataModule requests, per-split row counts and class balance, study-level overlap, and validation cost. Resolves the CSV from `rsna.yaml` and warns if it differs from the file being inspected. |
+| `make_rspect_splits.py` | Adds a study-level, PE-status-stratified `Split` column to the RSPECT CSV, grouped by `StudyInstanceUID` so no study or series spans splits. Writes a **new** file (`train_with_splits.csv`); refuses to overwrite the input. Deterministic under `--seed`; defaults 70/15/15. |
+| `check_inspect_splits.py` | Replays `Dataset1D`'s preprocessing for the INSPECT/Stanford path — the `image_id` → `patient_datetime` derivation, dedup, and both merges — then checks merge key coverage, whether the lowercase `split` column exists so the filter actually fires, and **patient-level** (not just exam-level) integrity, since some INSPECT patients have more than one CTPA. |
+
+The RSPECT diagnostics exist because the public Kaggle release ships no split column and a local refactor removed the guard that would have failed loudly. See §21 of `INSPECT_Baseline_Reconstruction.md`.
+
+## Figures
+
+`figures/make_split_delta_plot.py` generates `motor_split_delta.png` / `.svg` — the paired per-task delta of MOTOR test AUROC between the two split sources, with the 95% CI of the mean. Regenerate after updating the numbers at the top of the script.
+
 ## Custom Time-Binned Feature Generation
 To support modeling time-binned historical features, we introduced:
 * `generate_binned_features.py`: An alternative script to generate features where event counts are grouped into custom time windows (bins) relative to the prediction anchor time. Categories like vitals/labs (measurements) and diagnoses/procedures (conditions/procedures/devices) can have independent time ranges configured via CLI flags (`--vitals_labs_bins`, `--diag_proc_bins`).
@@ -146,6 +198,20 @@ Executing the auxiliary tasks and the master pipeline successfully required patc
 6. **BFloat16 AMP Evaluation Metric Fix (`TypeError: Got unsupported ScalarType BFloat16`):**
    - **Issue:** When training with Automatic Mixed Precision (`precision: bf16-mixed`), output prediction tensors are saved as `torch.bfloat16`. Calling `.numpy()` directly on these tensors inside evaluation metrics (`utils.get_auroc` and `utils.get_auprc`) raised `TypeError: Got unsupported ScalarType BFloat16` at epoch end because NumPy cannot directly wrap PyTorch `bfloat16` tensors.
    - **Fix:** Patched `image/radfusion3/utils.py` (`get_auroc`, `get_auprc`) and `image/radfusion3/lightning/featurize_lightning_model.py` to explicitly cast PyTorch tensors to single-precision float32 (`.float()`) prior to calling `.numpy()`.
+
+#### `image/radfusion3/data/dataset_2d.py` — restored loud failure on missing splits
+The original `RSNADataset2D` filtered unconditionally (`self.df[self.df['Split'] == self.split]`), which raises `KeyError` on a CSV without that column. A later refactor made it tolerant of either capitalisation but omitted the `else`, so a CSV with **neither** column silently skipped the filter and made train, valid and test the full dataframe. Restored:
+1. **`else: raise ValueError`** naming the CSV and pointing at `make_rspect_splits.py`.
+2. **Zero-row guard** raising when a split matches nothing, listing the values actually present — this catches `"val"` vs the `"valid"` the DataModule requests.
+
+#### `image/radfusion3/configs/dataset/rsna.yaml`
+`csv_path` repointed at the split-annotated CSV produced by `make_rspect_splits.py`.
+
+#### `Custom/run_MOTOR_MLP.py` & `Custom/9e_run_all_tasks_motor.py` — MOTOR extraction fixes
+Three defects, both files (details in §24 of `INSPECT_Baseline_Reconstruction.md`):
+1. **`config` not static for `jax.jit`** — MOTOR's `config.msgpack` contains strings, so JAX refused to trace it (`TypeError: ... is not a valid JAX type`). Now bound as `jax.jit(fn, static_argnames=("config",))`, matching stock FEMR.
+2. **`integer_ages` indexed by position** rather than by `label_indices` — `integer_ages` is per *token* across the flattened batch, so the ages were unrelated to the label times and the alignment walk failed its assertion.
+3. **Label/representation desynchronisation** when a patient is skipped for being absent from the cohort. `run_MOTOR_MLP.py` returned labels unfiltered; `9e` indexed labels by *representation* positions, which would not have crashed but would have paired each representation with the wrong patient's label. Both now track `kept_label_idx` and assert equal lengths.
 
 > **Note on New Data Drops (June 2025):** Although new `splits_20250611.tsv`, `series_metadata_20250611.tsv`, and crosswalk files were added to the pipeline to finalize the cohort, the underlying Redivis clinical data is still heavily scrubbed. Therefore, the custom bypasses implemented in the `/ehr` scripts (skipping ghost patients missing from Redivis and avoiding the OMOP `CodeLabeler`) **must remain completely intact** and should not be reverted.
 

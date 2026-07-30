@@ -398,9 +398,20 @@ def run_linear_probe(reprs: np.ndarray, labels: np.ndarray, split_indices: np.nd
         f"Valid: {y_val.mean():.4f} | Test: {y_test.mean():.4f}"
     )
 
-    # Sweep L2 strengths from 10^1 down to 10^-5 (same range as clmbr_train_linear_probe),
-    # then l2=0 (no regularisation).  sklearn's C = 1 / l2.
+    # Sweep L2 strengths from 10^1 down to 10^-5, matching clmbr_train_linear_probe.
     l2_values = list(10 ** e for e in np.linspace(1, -5, 20)) + [0.0]
+
+    # --- C conversion -------------------------------------------------------
+    # Stock FEMR minimises      mean(BCE) + 0.5 * l2 * ||beta||^2
+    # sklearn minimises         0.5 * ||w||^2 + C * SUM(loss)
+    #                         = n*C * [ mean(loss) + 0.5/(C*n) * ||w||^2 ]
+    # Matching the penalty coefficients gives  l2 = 1/(C*n)  ->  C = 1/(l2*n).
+    #
+    # The earlier `C = 1/l2` omitted n, making the effective penalty l2/n --
+    # about four decades too weak at n~13k. Every task then selected the top of
+    # the grid because the optimum lay above the reachable ceiling. See
+    # INSPECT_Baseline_Reconstruction.md section 25.1.
+    n_train = len(X_train)
 
     best_val_auroc   = -1.0
     best_train_auroc = None
@@ -408,7 +419,7 @@ def run_linear_probe(reprs: np.ndarray, labels: np.ndarray, split_indices: np.nd
     best_l2          = None
 
     for l2 in l2_values:
-        C = 1.0 / l2 if l2 > 0 else 1e12
+        C = 1.0 / (l2 * n_train) if l2 > 0 else 1e12
         clf = LogisticRegression(
             C=C, solver="lbfgs", max_iter=1000,
             fit_intercept=True, tol=1e-4
@@ -419,7 +430,7 @@ def run_linear_probe(reprs: np.ndarray, labels: np.ndarray, split_indices: np.nd
         val_auroc   = sklearn.metrics.roc_auc_score(y_val,   clf.predict_proba(X_val)[:, 1])
         test_auroc  = sklearn.metrics.roc_auc_score(y_test,  clf.predict_proba(X_test)[:, 1])
 
-        logging.info(f"  L2={l2:.2e}  C={C:.2e} | Train: {train_auroc:.4f} | Valid: {val_auroc:.4f} | Test: {test_auroc:.4f}")
+        logging.info(f"  L2={l2:.2e}  C={C:.2e} (n={n_train}) | Train: {train_auroc:.4f} | Valid: {val_auroc:.4f} | Test: {test_auroc:.4f}")
 
         if val_auroc > best_val_auroc:
             best_val_auroc   = val_auroc
@@ -431,6 +442,21 @@ def run_linear_probe(reprs: np.ndarray, labels: np.ndarray, split_indices: np.nd
         f"Best L2={best_l2:.2e} → Train: {best_train_auroc:.4f} | "
         f"Valid: {best_val_auroc:.4f} | Test: {best_test_auroc:.4f}"
     )
+
+    # Selection at either end of the grid means the optimum lies outside it and
+    # the chosen value is censored, not optimal. This is how the C-conversion
+    # bug originally surfaced -- keep the warning so it cannot happen silently.
+    nonzero = [v for v in l2_values if v > 0]
+    if best_l2 >= max(nonzero) / 1.05:
+        logging.warning(
+            f"L2 selected at the TOP of the grid ({best_l2:.2e}). The optimum is "
+            "likely stronger than the grid allows -- model is under-regularised."
+        )
+    elif 0 < best_l2 <= min(nonzero) * 1.05:
+        logging.warning(
+            f"L2 selected at the BOTTOM of the grid ({best_l2:.2e}). The optimum "
+            "is likely weaker than the grid allows."
+        )
 
     return {
         "train_auroc": float(best_train_auroc),
@@ -472,10 +498,15 @@ def run_task(task: str, pid_to_split: dict) -> dict:
     import datetime as dt
     from sklearn.linear_model import LogisticRegression as _LR
 
-    # Re-fit best model to save predictions
-    best_C = 1.0 / metrics["l2_strength"] if metrics["l2_strength"] > 0 else 1e12
-    clf = _LR(C=best_C, solver="lbfgs", max_iter=1000, fit_intercept=True, tol=1e-4)
+    # Re-fit best model to save predictions.
+    # Must use the SAME C conversion as the sweep (C = 1/(l2*n)), or the saved
+    # predictions come from a differently-regularised model than the reported
+    # metrics.
     train_mask = split_indices == 0
+    _n_train = int(train_mask.sum())
+    best_C = (1.0 / (metrics["l2_strength"] * _n_train)
+              if metrics["l2_strength"] > 0 else 1e12)
+    clf = _LR(C=best_C, solver="lbfgs", max_iter=1000, fit_intercept=True, tol=1e-4)
     clf.fit(reprs.astype(np.float32)[train_mask], labels[train_mask])
     all_probs = clf.predict_proba(reprs.astype(np.float32))[:, 1]
 

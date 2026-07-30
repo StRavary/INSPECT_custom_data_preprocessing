@@ -602,3 +602,552 @@ The three experiments triangulate on a clear scientific narrative:
 
 
 
+
+---
+
+## 20. RSPECT Slice-Encoder Fine-Tuning — FP16 NaN Root Cause & BF16 Resolution
+
+### 20.1 Symptom
+
+The first fine-tuning run of `resnetv2_101x3` on RSPECT (2026-07-22, `precision: 16-mixed`, no gradient clipping) produced NaN loss from the first epoch. The run wrote a single checkpoint, `epoch=0-val/mean_auroc=0.000.ckpt`, and made no further progress.
+
+### 20.2 Root Cause
+
+The BiT ResNetV2 backbone uses **weight-standardised convolutions** (`timm`'s `StdConv2d`). Every forward pass normalises each filter by `(w - mean) / sqrt(var + eps)` with `eps = 1e-6`.
+
+FP16 has 5 exponent bits: its smallest *normal* value is `2^-14 ≈ 6.10e-5` and its smallest subnormal is `2^-24 ≈ 5.96e-8`. `1e-6` therefore lands in subnormal range, and under the flush-to-zero behaviour typical of CUDA kernels it collapses to zero. When a filter's variance is also subnormal, the expression degenerates to `0/0` → NaN.
+
+Two corollaries that matter for the write-up:
+
+* **The failure is in the forward pass, not the gradients.** `16-mixed` wraps the step in a `GradScaler`, which detects inf/NaN gradients and *skips the optimizer step*. Gradient overflow therefore cannot corrupt the weights. A deterministic forward-pass NaN, by contrast, causes every step to be skipped, so the model never leaves initialisation — precisely the observed behaviour.
+* **Gradient clipping was not the operative fix.** It was added at the same time as BF16 and is harmless, but it cannot address a forward-pass instability.
+
+### 20.3 Resolution
+
+`precision: bf16-mixed`. BF16 keeps FP32's 8 exponent bits, so `1e-6` is an ordinary normal number with ~32 orders of magnitude of headroom. Verified stable across all 30 epochs of the 2026-07-24 run.
+
+### 20.4 The Metric Clamp That Masked It
+
+`image/radfusion3/utils.py::get_auroc` returns a hardcoded `0.0` when the probability vector contains NaN or when the label vector is single-class:
+
+```python
+if np.isnan(prob_cls).any():   auroc_dict[k] = 0.0
+elif len(set(y_cls)) == 1:     auroc_dict[k] = 0.0
+```
+
+The reported metric was therefore **never NaN** — it was silently floored to `0.000`. A diverged run is indistinguishable from a single-class validation set, and `ModelCheckpoint` happily saves the result as "best". This is worth stating explicitly in any write-up, since the original symptom was reported as "NaN val-auroc".
+
+> **Diagnostic (not yet run):** loading the CT checkpoint and counting `StdConv2d` filters whose per-filter variance is below `6.104e-5` would confirm the mechanism directly against the actual weights. The diagnosis is consistent with every observation but has not been verified empirically.
+
+---
+
+## 21. RSPECT Split Defect — Diagnosis, Impact & Corrective Tooling
+
+### 21.1 Origin
+
+The public Kaggle RSNA-STR (RSPECT) release ships `train.csv` with 17 columns and **no split column**. Upstream `radfusion3` assumed one existed on the authors' cluster copy:
+
+```python
+# original, ZepengHuo, Nov 2023
+if self.split != "all":
+    self.df = self.df[self.df['Split'] == self.split]      # KeyError if absent
+```
+
+Commit `1fb422f` (2026-07-22 12:42) replaced this with a tolerant form that accepts either capitalisation but has **no `else` branch**:
+
+```python
+if "Split" in self.df.columns:   ...
+elif "split" in self.df.columns: ...
+# (nothing — filter silently skipped)
+```
+
+The first run launched four minutes later. With neither column present, the filter is a no-op and `train`, `valid` and `test` all become the full positive-exam dataframe.
+
+Corroborating evidence that upstream maintained splits externally: `constants.py` declares `SPLIT_COL = 'Split'`; `RSNADataset1D` still filters on `"Split"` unconditionally; and `RSNADataset1D` hardcodes a path to `rsna_hdf5_keys_testsplit.pkl`.
+
+### 21.2 Confirmation
+
+Three independent derivations, all agreeing to within one batch:
+
+| source | quantity | value |
+|---|---|---|
+| aborted run A (`accumulate_grad_batches=1`) | train batches in one epoch | 144,862 |
+| run B, `global_step` 43,015 over 19 epochs × 64 accumulation | train batches/epoch | ≈144,890 |
+| run B, `val/loss_step` 2,752,396 over 19 validations | val batches/epoch | 144,863 |
+
+At `batch_size: 4` all three imply ~579,450 slices. Direct measurement of the CSV later gave **579,449** positive-exam slices — `floor(579449/4) = 144,862` train batches (`drop_last=True`) and `ceil(579449/4) = 144,863` val batches (`drop_last=False`). Exact match. Train and validation were the same slices.
+
+### 21.3 Impact Assessment
+
+**No reported result is affected.** RSPECT is used solely to pretrain the slice encoder; all reported metrics come from INSPECT, a disjoint Stanford cohort the encoder never sees. Training a feature extractor on the full corpus remains methodologically sound — ImageNet and BiT backbones are trained on 100% of their data.
+
+What was lost is *monitoring*: `val/mean_auroc` measured training data, so it could not support checkpoint selection or early stopping. The final reported figures (test AUROC 0.9983, AUPRC 0.9906, loss 0.0490) are training-set metrics and should be presented as such.
+
+Secondary cost: the validation pass ran over the full 579k slices every epoch. Forward-only work is roughly a third the per-sample cost of training, so validation consumed ~25% of each 3.96 h epoch — on the order of 30 h across the 30-epoch run.
+
+### 21.4 Corrective Tooling
+
+| artefact | purpose |
+|---|---|
+| `Custom/make_rspect_splits.py` | Generates a study-level, PE-status-stratified `Split` column (grouped by `StudyInstanceUID`), writing a **new** CSV so the source file is never mutated. Verifies no study or series spans splits, refuses in-place overwrite, deterministic under `--seed`. |
+| `Custom/check_rsna_splits.py` | Replays `RSNADataset2D`'s filtering and reports split sizes, class balance, study-level overlap and validation cost. Resolves the CSV from `rsna.yaml` and warns if it differs from the file being inspected. |
+| `image/radfusion3/data/dataset_2d.py` | `else: raise ValueError(...)` when no split column exists, plus a second guard raising when a split matches zero rows (catches `"val"` vs `"valid"`). |
+| `image/radfusion3/configs/dataset/rsna.yaml` | `csv_path` repointed at the split-annotated CSV. |
+
+---
+
+## 22. RSPECT Dataset Characterisation
+
+Measured directly from `train.csv` (2026-07-29):
+
+| quantity | value |
+|---|---|
+| total slices | 1,790,594 |
+| total studies | 7,279 |
+| mean slices per study | 246.0 |
+| PE-positive exams (`negative_exam_for_pe == 0`) | 2,368 (32.5%) |
+| slices retained after the positive-exam filter | 579,449 (32.4%) |
+| PE-positive slices | 96,540 |
+| slice PE prevalence **within positive exams** | **0.1666** |
+| slice PE prevalence across all slices | 0.0539 |
+| `WeightedRandomSampler` oversampling factor on positives | **3.00×** |
+
+### 22.1 Why Negative Exams Are Dropped
+
+In a PE-negative exam every slice has `pe_present_on_image == 0` by definition, so those studies contribute only trivially-easy negatives. Retaining only positive exams means each study supplies both positive slices and *matched* negatives — same patient, scanner and contrast timing — forcing the model to learn where the embolus is rather than whether the scan "looks like" a PE study.
+
+The filter also serves as prevalence management. Slice prevalence rises from 5.4% to 16.7%, which cuts the balanced sampler's oversampling factor from ~9× to 3.0× and correspondingly reduces repetition of the positive set.
+
+### 22.2 Physical Consistency Check
+
+At 1 mm slice thickness, 246 slices ≈ 24.6 cm of craniocaudal coverage — consistent with a CTPA from lung apices to costophrenic angles. Positive studies average 96,540 / 2,368 ≈ **40.8 positive slices**, i.e. ~4.1 cm of extent containing visible clot. For multifocal PE distributed across lobar and segmental branches this is anatomically plausible, and it independently corroborates the measured 16.7% prevalence.
+
+Note that `pe_present_on_image` marks the *union* of z-extents over all emboli, so prevalence scales with the number of emboli more than with any single clot's size, and with vessel orientation relative to the axial plane.
+
+### 22.3 Implication for the Overfitting Question
+
+Each positive slice is drawn ~3× per epoch; across 30 epochs that is ~90 exposures per positive slice, drawn from only **2,368 independent studies**. Whether the encoder memorised RSPECT is *unmeasurable from this run* — there was no held-out data — but the configuration is one in which memorisation is plausible. The INSPECT downstream AUROC is the first uncontaminated test of feature transfer.
+
+---
+
+## 23. MOTOR Split-Source Investigation — Stock FEMR vs. INSPECT
+
+### 23.1 The Question
+
+Do INSPECT's published MOTOR numbers sit on the same split as their GBM and imaging baselines? If not, the cross-arm comparison in the paper would need a caveat.
+
+### 23.2 What Stock FEMR Does
+
+Read directly from `som-shahlab/femr` at the commit INSPECT pins (`de3673d`):
+
+`femr/models/dataloader.py::create_batches` defines its own partition by hashing patients into percentile buckets:
+
+```python
+parser.add_argument("--seed",       default=97)   # random seed used for data splitting
+parser.add_argument("--val_start",  default=80)
+parser.add_argument("--test_start", default=85)
+...
+"splits": [["train", 0, args.val_start],
+           ["dev",   args.val_start, args.test_start],
+           ["test",  args.test_start, 100]],
+```
+
+INSPECT's `ehr/run_all_ehr.py` passes only `--val_start 80`, so it inherits seed 97 and an **80/5/15** partition.
+
+`femr/models/linear_probe.py::train_linear_probe` then evaluates on exactly that partition:
+
+```python
+for i, split in enumerate(("train", "dev", "test")):
+    ...
+    l_repr_split.append(np.ones(batch["num_indices"]) * i)
+...
+train_mask = split_indices == 0
+scores = [get_c(hazards, i) for i in range(3)]
+```
+
+It fits on split 0, tunes L2 on split 1, reports test AUROC on split 2 — and **never opens a cohort file**. Its argument list is only `output_dir`, `--data_path`, `--batches_path`, `--model_dir`.
+
+### 23.3 But INSPECT Does Not Run Stock FEMR
+
+`ehr/run_all_ehr.py` invokes:
+
+```
+clmbr_train_linear_probe {task_dir} --data_path ... --model_dir ... \
+    --batches_path ... --path_to_cohort {cohort_path}
+```
+
+`--path_to_cohort` **does not exist** in stock FEMR, and the script uses `parse_args()` (not `parse_known_args()`), so this would abort with "unrecognized arguments". INSPECT therefore runs a patched fork, and the only plausible purpose of that flag is to re-key the splits to the cohort file — i.e. the authors likely identified and fixed this themselves.
+
+**Conclusion: unresolved from the repositories available, but the evidence points toward INSPECT having corrected it.** The claim "INSPECT should not have compared MOTOR to its other arms" is *not* supported and should not be presented. Section 25.3 settles the question empirically instead.
+
+### 23.4 What Our Pipeline Does
+
+Both `run_MOTOR_MLP.py` and `9e_run_all_tasks_motor.py` still call `clmbr_create_batches --val_start 80` (the hash partition is needed to enumerate patients and build batches), then **discard the loader's split index** and reassign per patient from the cohort file via `load_cohort_splits`, keyed on `PatientID`. Patients absent from the cohort are skipped with a warning. Splits are therefore patient-level and identical to the GBM and imaging arms.
+
+`run_MOTOR_MLP_Hashed.py` (and `--split-source hash`) reproduces the stock behaviour on identical representations, so the two can be compared directly.
+
+---
+
+## 24. MOTOR Pipeline Defects Fixed
+
+Three defects in the custom MOTOR scripts, all present in **both** `run_MOTOR_MLP.py` and `9e_run_all_tasks_motor.py`. The first two are blocking; the third is silent.
+
+### 24.1 `config` Not Marked Static for `jax.jit`
+
+```python
+@jax.jit                                   # WRONG
+def compute_repr(params, rng, config, batch): ...
+```
+
+`config` is MOTOR's `config.msgpack` — a nested dict containing strings, including the pretraining batch path. JAX attempts to abstractify it and raises:
+
+```
+TypeError: Argument 'survival_batches_fixed/batch_info.msgpack' of type <class 'str'>
+           is not a valid JAX type
+```
+
+Stock FEMR uses `functools.partial(jax.jit, static_argnames=("config"))`. Fixed by binding explicitly:
+
+```python
+compute_repr = jax.jit(_compute_repr, static_argnames=("config",))
+```
+
+`hk.data_structures.to_immutable_dict(config)` on the preceding line already makes it hashable, which static arguments require.
+
+### 24.2 `integer_ages` Indexed by Position Instead of Label Index
+
+```python
+ages_list.append(np.array(raw_batch["transformer"]["integer_ages"][:num_indices]))   # WRONG
+```
+
+`integer_ages` is **per token** across the flattened 16,384-token batch; `label_indices` gives the token positions where labels sit. Stock FEMR fancy-indexes by those positions. Taking the first `num_indices` entries yields the ages of the first few tokens, unrelated to the label times, so the subsequent `lexsort` and alignment walk fail on `assert repr_ages[j_idx] <= l_age`. Fixed:
+
+```python
+li = np.asarray(raw_batch["transformer"]["label_indices"])[:num_indices]
+ages_list.append(np.asarray(raw_batch["transformer"]["integer_ages"])[li])
+```
+
+### 24.3 Label / Representation Desynchronisation (silent)
+
+When a patient is skipped for being absent from the cohort file, the label arrays must be filtered by **label** index, not representation index:
+
+* `run_MOTOR_MLP.py` returned `label_values`, `label_pids`, `label_ages` **unfiltered** while `matched_reprs` and `split_indices` excluded skipped patients → length mismatch.
+* `9e_run_all_tasks_motor.py` did `label_values[matching_indices]`, where `matching_indices` holds positions into the sorted **representation** arrays → each representation paired with the wrong patient's label. **This would not have crashed**; it would have produced plausible-looking, meaningless AUROCs.
+
+Both now track `kept_label_idx` separately, with an assertion that reprs, labels and splits have equal length and a log line reporting the aligned per-split counts. With 18,738 cohort splits against ≤18,640 labels, patients *are* skipped, so this defect was live.
+
+### 24.4 Seeding & Repeatability
+
+The MLP head had no seeding at all — no `torch.manual_seed`, and `DataLoader(..., shuffle=True)` with no `generator=`. Weight init, dropout masks and batch order were fresh randomness on every invocation, so two runs of the same configuration differed and small gaps between configurations were uninterpretable.
+
+Added to `run_MOTOR_MLP.py`:
+
+* `--seed N` — seeds `torch`, `torch.cuda`, `numpy` and the DataLoader generator.
+* `--n-repeats N` — retrains the head N times on the **same** representations with seeds `seed..seed+N-1`, reporting mean/std/min/max per split plus a per-seed breakdown. Representation extraction (~11 min) is deterministic and is not repeated, so repeats are nearly free.
+
+`9e_run_all_tasks_motor.py` needs no seeding: `LogisticRegression(solver="lbfgs")` solves a strictly convex objective deterministically, `random_state` is ignored by `lbfgs`, and there is no shuffling anywhere in the file. Its numbers are reproducible to the digit.
+
+---
+
+## 25. MOTOR Results
+
+### 25.1 Linear Probe, All Tasks, Cohort Split (`9e_run_all_tasks_motor.py`)
+
+| Task | Train | Valid | Test | L2 |
+|---|---|---|---|---|
+| PE | 0.7840 | 0.7131 | 0.6817 | 1.00e+01 |
+| 1-month mortality | 0.9457 | 0.9275 | 0.9360 | 1.00e+01 |
+| 6-month mortality | 0.9299 | 0.9059 | 0.9099 | 1.00e+01 |
+| 12-month mortality | 0.9234 | 0.8826 | 0.8975 | 1.00e+01 |
+| 1-month readmission | 0.8663 | 0.8453 | 0.7833 | 1.00e+01 |
+| 6-month readmission | 0.8307 | 0.7807 | 0.7701 | 1.00e+01 |
+| 12-month readmission | 0.8203 | 0.7315 | 0.7572 | 1.00e+01 |
+| 12-month PH | 0.8942 | 0.8572 | 0.8505 | 4.83e+00 |
+
+> **⚠ These numbers are superseded — see §25.1.1. They were produced with a mis-parameterised L2 conversion and are under-regularised. Retained for the record and because they are what §25.3's original comparison used.**
+
+### 25.1.1 L2 Parameterisation Bug (diagnosed 2026-07-30, fixed)
+
+Every task selected an L2 at or adjacent to the top of the grid — seven at the maximum of 10, and `12_month_PH` at 4.83, which is exactly `10 / 2.069`, the second grid point down. Selection pinned to a boundary means the optimum lies outside the grid and the chosen value is **censored, not optimal**.
+
+The cause was the conversion from FEMR's `l2` to sklearn's `C`:
+
+```python
+C = 1.0 / l2          # WRONG — omits n
+```
+
+The two libraries parameterise the objective differently:
+
+| | objective |
+|---|---|
+| stock FEMR | `mean(BCE) + 0.5·l2·‖β‖²` |
+| sklearn | `0.5·‖w‖² + C·Σᵢ loss` |
+
+Dividing sklearn's objective by `C·n` gives `0.5/(C·n)·‖w‖² + mean(loss)`, so the two are identical (to floating point) when
+
+```
+l2 = 1/(C·n)      ⟺      C = 1/(l2 · n_train)
+```
+
+Verified numerically: `J_sklearn/(C·n) == J_femr` to 1e-12 across `l2 ∈ {1e-3, 1e-2, 1e-1, 1}`.
+
+With `C = 1/l2` the effective penalty was `l2/n` — about four decades too weak at n ≈ 13,000. Mapping stock FEMR's selected optima into the nominal scale 9e was searching shows the optimum was unreachable for every task but PE:
+
+| task | stock optimum | nominal `l2` 9e would need (`= opt·n`) | within grid (max 10)? |
+|---|---|---|---|
+| PE | 4.00e-4 | 5.2 | yes |
+| 1-month mortality | 3.40e-3 | 44.2 | no |
+| 6-month mortality | 6.16e-2 | 800.8 | no |
+| 12-month mortality | 1.44e-2 | 187.2 | no |
+| 1-month readmission | 1.1288 | 14,674 | no |
+| 6-month readmission | 7.00e-3 | 91.0 | no |
+| 12-month readmission | 2.98e-2 | 387.4 | no |
+| 12-month PH | 1.44e-2 | 187.2 | no |
+
+**Fix applied** in `9e_run_all_tasks_motor.py`:
+
+* `C = 1.0 / (l2 * n_train)` in the sweep.
+* The same conversion in the final re-fit that saves predictions — previously `1.0 / metrics["l2_strength"]`, which would have written predictions from a differently-regularised model than the one whose metrics were reported.
+* A warning logged whenever the selected `l2` sits at either end of the grid, so censored selection cannot recur silently.
+
+The grid itself was never the problem, and extending it (an earlier recommendation in this document, now withdrawn) would have masked the parameterisation error rather than fixing it.
+
+A corroborating signal, visible before the algebra: the hash-split runs from stock FEMR show train and valid AUROC close together (6-month mortality: 0.9083 / 0.9206), whereas the mis-parameterised cohort-split runs show wider gaps on the same task (0.9299 / 0.9059) — the signature of insufficient shrinkage.
+
+**All §25.1, §25.2 and §25.3 figures require re-running with the corrected conversion.**
+
+### 25.2 Reproduction of Published INSPECT Baselines
+
+| Task | INSPECT | Ours (cohort split) | Δ |
+|---|---|---|---|
+| PE | 0.677 | 0.682 | +0.005 |
+| 1-month mortality | 0.923 | 0.936 | +0.013 |
+| 6-month mortality | 0.901 | 0.910 | +0.009 |
+| 12-month mortality | 0.892 | 0.897 | +0.005 |
+| 1-month readmission | 0.773 | 0.783 | +0.010 |
+| 6-month readmission | 0.779 | 0.770 | −0.009 |
+| 12-month readmission | 0.767 | 0.757 | −0.010 |
+| 12-month PH | 0.824 | 0.851 | +0.027 |
+
+> **⚠ Superseded — these came from the mis-parameterised run (§25.1.1) and must be regenerated.**
+
+Mean **+0.006**, 6/8 above, all within 0.027. Across eight tasks with an independently rebuilt cohort, a later label vintage and 12% of codes falling outside MOTOR's vocabulary, this is a successful reproduction. It should be presented as such — **not** as an improvement, since the differences have several innocent explanations (779 records dropped for missing `StudyTime`, 12 deduplicated `impression_id`s, vocabulary coverage, seeds).
+
+`12_month_PH` is the largest deviation and is also the only task that did not peg L2 at the grid boundary; if INSPECT's run hit the ceiling and ours did not, the two are not regularised identically.
+
+### 25.3 Split Source Has No Detectable Effect
+
+> **⚠ Confounded — read §25.3.1 before citing.** The cohort column below comes from `9e` under the mis-parameterised L2 conversion (§25.1.1); the hash column comes from stock `clmbr_train_linear_probe`, which is correctly regularised. The comparison therefore mixes split source with regularisation strength. The conclusion still holds, but on the strength of the *clean* comparison in §25.3.1, not this table.
+
+Linear probe, same representations, cohort split vs. CLMBR hash split:
+
+| Task | cohort | hash | Δ |
+|---|---|---|---|
+| PE | 0.682 | 0.705 | +0.023 |
+| 1-month mortality | 0.936 | 0.930 | −0.006 |
+| 6-month mortality | 0.910 | 0.907 | −0.003 |
+| 12-month mortality | 0.897 | 0.899 | +0.002 |
+| 1-month readmission | 0.783 | 0.759 | −0.024 |
+| 6-month readmission | 0.770 | 0.792 | +0.022 |
+| 12-month readmission | 0.757 | 0.779 | +0.022 |
+| 12-month PH | 0.851 | 0.853 | +0.002 |
+
+**mean Δ = +0.005, 95% CI [−0.009, +0.019], paired t(7) = 0.81, p = 0.45, 5/8 favour hash.**
+
+Non-parametric confirmation (n = 8 makes normality unverifiable): Wilcoxon signed-rank W⁺ = 21 against E[W⁺] = 18, exact two-sided p = 0.71; sign test p = 0.73. The t-test uses magnitudes and is the most sensitive of the three, and it is the one reporting p = 0.45.
+
+Two structural observations support the null reading:
+
+1. **The sign flips.** The single largest difference (1-month readmission, −0.024) favours the *cohort* split. A systematic mechanism effect would be consistent in direction.
+2. **Magnitude tracks task difficulty, not mechanism.** The four largest |Δ| are the four lowest-AUROC tasks (PE and the three readmission horizons, 0.68–0.78); the four smallest are the four highest (three mortality horizons and PH, 0.85–0.94). That is the signature of sampling noise.
+
+Caveats to state alongside the result: the CI is over **tasks**, not patients, and the eight tasks are not independent (same patients, correlated outcomes), so the effective n is below 8 and the interval is if anything too narrow — which only strengthens a null conclusion. Individual per-task AUROCs carry their own ~±0.011 sampling error that is not drawn. And with n = 8 the test has low power: an effect smaller than ~0.019 would be invisible. Phrase as *no detectable difference*, not equivalence.
+
+Figure: `Custom/figures/motor_split_delta.png` (generator: `Custom/figures/make_split_delta_plot.py`).
+
+### 25.3.1 What the Comparison Actually Supports
+
+Three differences separate the two columns in §25.3, not one:
+
+1. **split source** — cohort patient-level vs. CLMBR 80/5/15 hash percentiles (the intended comparison)
+2. **regularisation** — mis-parameterised vs. correct (§25.1.1)
+3. **optimiser** — sklearn `lbfgs` vs. FEMR's hand-written conjugate gradient (equivalent at convergence, so benign)
+
+Difference 2 invalidates that table as a clean test of difference 1.
+
+**The clean comparison is the MLP pair**, where identical code, head and representations are used and only the split source varies:
+
+| | cohort split | hash split | Δ |
+|---|---|---|---|
+| MLP, `12_month_PH` | 0.847 | 0.856 | +0.009 |
+
+That supports the null, with the caveat that the MLP head was unseeded when those numbers were produced, so part of the 0.009 is run-to-run variance — measurable with `--n-repeats` (§24.4) but not yet measured.
+
+Three further reasons the null reading survives the confound:
+
+* The **sign flips** across tasks in §25.3, and the single largest difference favours the cohort split. A systematic mechanism effect would be directionally consistent.
+* **Magnitude tracks task difficulty**, not split mechanism — the four largest |Δ| are the four lowest-AUROC tasks.
+* **The two partitions are the same size.** Measured from `cohort_0.2.0_master_file_anon.csv`: 81.5% / 4.7% / 13.8% of exams (81.4 / 4.7 / 13.9 of patients) against CLMBR's 80/5/15 — almost certainly because both descend from the same Shah-lab percentile convention (`femr.splits_omop_2023_03_05`). The comparison therefore isolates *which* patients land in each split, not how many, which makes the null reading cleaner rather than weaker. (An earlier draft of this section assumed a 70/15/15 cohort split and argued the hash arm had a training-size advantage; that was wrong and is withdrawn.)
+
+### 25.3.2 Measured Cohort Split Distribution
+
+| split | exams | % exams | patients | % patients |
+|---|---|---|---|---|
+| train | 18,293 | 81.5% | 15,247 | 81.4% |
+| valid | 1,056 | 4.7% | 882 | 4.7% |
+| test | 3,108 | 13.8% | 2,609 | 13.9% |
+| **total** | **22,457** | | **18,738** | |
+
+* **Patients spanning more than one split: 0.** Patient-level integrity confirmed directly on the file the MOTOR runs load, not only via `4_validate_cohort_pipeline.py`.
+* 2,608 patients (13.9%) have more than one CTPA, max 13, mean 1.198 exams per patient. The repeat-exam leakage risk is real and correctly handled.
+* The 18,738 figure matches the `Loaded 18738 patient splits` line emitted by `load_cohort_splits`.
+
+> **Model selection is the weak link in both arms.** Validation is only 4.7% of the cohort — ~1,056 exams, and at the 14.0% prevalence of `12_month_PH` roughly 150 positives. Both the L2 sweep (linear probe) and the best-epoch choice (MLP) are made on that set, so selection is noisy regardless of split source. This is a stronger candidate explanation for run-to-run variability than anything about the split mechanism, and it argues for reporting selection-robust summaries (e.g. `--n-repeats`) rather than single best-validation values.
+
+**Outstanding work to settle it cleanly:** re-run `9e_run_all_tasks_motor.py` with the corrected `C`, and run `run_MOTOR_MLP.py --n-repeats 5` on both split sources. That yields a deterministic linear-probe comparison with no confounds and a measured noise floor for the MLP.
+
+### 25.4 MLP Head vs. Linear Probe
+
+| | cohort split | hash split |
+|---|---|---|
+| Linear probe | 0.8505 | 0.853 |
+| 2-stage MLP | 0.847 | 0.856 |
+
+On `12_month_PH` the MLP head buys nothing over the linear probe (0.856 vs 0.853). MOTOR's 768-d representations are already linearly separable for this task, which is the expected behaviour of a well-trained foundation model. **The linear probe is the number to quote** — it is both what INSPECT published and the deterministic one.
+
+Note the asymmetry when comparing: the linear probe is a fixed point, while MLP numbers are draws from a distribution whose width `--n-repeats` measures.
+
+---
+
+## 26. Hyperparameter Sweep Provenance
+
+`image/sweep.yaml` has been in the repository since the first upstream commit and confirms a **wandb Bayesian sweep**:
+
+```yaml
+method: bayes
+metric: {name: val/_auroc, goal: maximize}
+parameters:
+  lr:                              [0.005, 0.001, 0.0005, 0.0001]
+  model.aggregation:               [max, mean, attention, attention+max]
+  model.seq_encoder.rnn_type:      [LSTM, GRU, transformer]
+  model.seq_encoder.hidden_size:   [64, 128, 256]
+  model.seq_encoder.bidirectional: [true, false]
+  model.seq_encoder.num_layers:    [1, 3]
+  model.seq_encoder.dropout_prob:  [0.0, 0.25, 0.5]
+  dataset.num_slices:              [200, 250, 300]
+  dataset.weighted_sample:         [true, false]
+  dataset.sample_strategy:         [fix, random]
+```
+
+`run_sweep.py` is only the controller — it polls the wandb API and stops a sweep at `--max_runs` (default 50). The target is pinned on line 8 of the `command` block, and the README notes that line specifies the prediction target, so the sweep was run **once per task**. That is why the per-task launchers carry different hyperparameters.
+
+Two caveats: the committed YAML sweeps `vit_base_14_dinov2` features, whereas the final launchers use `resnetv2_101_ct`; and `rnn_type: transformer` was in the search space but did not win for any task.
+
+### 26.1 Swept Results per Task (from `image/run_classify_*.sh`)
+
+| Script | Target | Aggregation | RNN | Hidden | Dropout | LR |
+|---|---|---|---|---|---|---|
+| pe | pe_positive_nlp | max | LSTM | 128 | 0.5 | 1e-3 |
+| ph | 12_month_PH | attention | GRU | 128 | 0.25 | 1e-3 |
+| 1m_mort | 1_month_mortality | max | GRU | 128 | 0.25 | 1e-3 |
+| 6m_mort | 6_month_mortality | mean | GRU | 128 | 0.0 | 5e-4 |
+| 12m_mort | 12_month_mortality | attention | GRU | 128 | 0.5 | 5e-4 |
+| read_1m | 1_month_readmission | max | LSTM | 128 | 0.0 | 1e-3 |
+| read_6m | 6_month_readmission | max | LSTM | 128 | 0.5 | 1e-3 |
+| read_12m | 12_month_readmission | mean | LSTM | 128 | 0.25 | 5e-4 |
+
+`hidden_size=128`, `num_layers=1`, `bidirectional=true` and `num_slices=250` are constant across all eight, so every task's pre-classifier embedding is **256-d**. `run_classify.sh` is a stale template — not called by `run_classify_all.sh`, duplicates `1_month_mortality`, and is the only launcher that does not override `hidden_size`.
+
+**Important:** these launcher overrides differ substantially from `configs/model/model_1d.yaml` defaults (GRU / hidden 512 / `attention+max` / dropout 0.0). Running `run_classify.py model=model_1d dataset=stanford_featurized` without the launcher flags does **not** reproduce the swept configuration.
+
+### 26.2 Aggregation Semantics
+
+The sequence encoder emits `(batch, 250, 256)`; aggregation collapses the slice axis to one vector per study:
+
+* `max` — element-wise maximum over slices. Suits localised findings where one slice should drive the prediction.
+* `mean` — average over slices. Suits diffuse properties.
+* `attention` — learned weighted average via the `Attention` module.
+* `attention+max` — concatenation of both, doubling the dimension. Not selected by any task.
+
+---
+
+## 27. Outstanding Defects in `image/` (upstream, not yet fixed)
+
+Found while tracing the 1-D pipeline. None are our code; all are in the original `radfusion3` and would affect any run.
+
+### 27.1 `RNNSequentialEncoder` Contradicts Its Own Axis Convention
+
+```python
+self.rnn = getattr(nn, rnn_type)(..., batch_first=True, ...)
+
+def forward(self, x):
+    x = x.transpose(0, 1)
+    x, _ = self.rnn(x)          # comment says (Slice, Batch, Feature)
+    x = x.transpose(0, 1)
+    return x
+```
+
+`batch_first=True` expects `(batch, seq, feature)`, and `x` already arrives as `(B, 250, 6145)`. The transpose makes it `(250, B, 6145)`, so **the RNN reads 250 as the batch dimension and the batch as the sequence**. No error is raised because `input_size` only constrains the last axis, and the output transposes back to the expected `(B, 250, 256)`.
+
+If this reading holds: the recurrence never runs along slices, so no slice-order information is modelled; a study's representation depends on which *other studies* share its batch; and at `batch_size=1` the sequence length is 1, degenerating to a context-free per-slice transform. Pooling in `aggregate` still operates on dim 1 (real slices), so the model functions — as a per-slice projection followed by pooling — which is why it produces sensible AUROCs.
+
+`models_1d.py` has only two commits, both from the original authors (Nov 2023); this is entirely upstream. The fix is one line (drop the transposes, or set `batch_first=False`).
+
+**Verification snippet (not yet run):**
+
+```python
+import torch, torch.nn as nn
+torch.manual_seed(0)
+rnn = nn.LSTM(8, 4, batch_first=True, bidirectional=True)
+x = torch.randn(2, 5, 8)                                 # (batch=2, slices=5, feat=8)
+f = lambda t: rnn(t.transpose(0, 1))[0].transpose(0, 1)  # what the code does
+sp, bp = torch.randperm(5), torch.tensor([1, 0])
+print("slice order matters:", not torch.allclose(f(x)[:, sp], f(x[:, sp]), atol=1e-6))
+print("batch order matters:", not torch.allclose(f(x)[bp],   f(x[bp]),   atol=1e-6))
+# correct encoder → True, False.  Expected here → False, True.
+```
+
+### 27.2 `max` and `mean` Aggregation Ignore the Padding Mask
+
+```python
+elif cfg.model.aggregation == "mean":  x = torch.mean(x, 1)     # no mask
+elif cfg.model.aggregation == "max":   x, _ = torch.max(x, 1)   # no mask
+```
+
+Only `attention` applies `a = a * mask`. Studies shorter than `num_slices` are zero-padded by `fix_series_slice_number`; those zero vectors still pass through the RNN and produce non-zero outputs which are then pooled. `mean` additionally divides by 250 rather than the true slice count, shrinking representations for shorter studies. Affects six of the eight tasks, including PE. Fix: `masked_fill(-inf)` before `max`, and divide by `mask.sum(1)` for `mean`.
+
+### 27.3 `Attention` Returns the Wrong Tensor
+
+```python
+a = a / torch.sum(a, 1, keepdim=True) + 1e-10
+weighted_input = x * torch.unsqueeze(a, -1)
+return torch.sum(weighted_input, 1), self.weight    # returns the PARAMETER, not `a`
+```
+
+The per-slice attention scores `a` — the clinically interpretable output, showing which slices drove a prediction — are computed and discarded. Only relevant to `ph` and `12m_mort`, the two tasks using `attention`.
+
+Note also that the epsilon is added *after* the division, so it does not guard the denominator; a fully-masked sample yields `0/0` → NaN.
+
+### 27.4 Slice-Position Encoding Is Identically Zero for RSPECT
+
+`DatasetBase.__init__` loads `dict_slice_thickness` from a Stanford cluster path and falls back to `{}` when absent. `read_from_hdf5` then does `self.dict_slice_thickness[key] * idx_th` inside a bare `try/except` appending `0` on failure. With the dictionary empty, the appended slice-position column — the `+1` making features 6145-d, and what `trainer.position_encoding: true` is meant to supply — is **zero for every slice**. The 1-D model receives no positional information.
+
+### 27.5 `Dataset1D` Label Parsing Is Type-Fragile
+
+```python
+self.df[cfg.dataset.target] = self.df[cfg.dataset.target].astype(str)
+self.labels = [1 if t == "True" else 0 for t in self.df[cfg.dataset.target]]
+```
+
+Matches the literal string `"True"` with no `.upper()`. If a label column round-trips as integers, `astype(str)` yields `"1"`, every label silently becomes 0, and `get_auroc` reports its single-class `0.0`. (The EHR path in `ehr/2_generate_labels_and_features.py` was already patched with `.strip().upper()` and a `CENSORED`/`NAN` skip; `Dataset1D` was not.) Verified for our cohort: `12_month_PH` holds `TRUE` / `FALSE` / `CENSORED` strings, so the EHR path is safe.
+
+### 27.6 `ModelCheckpoint` Filename Contains a Slash
+
+`filename="{epoch}-{val/mean_auroc:.3f}"` is not sanitised, so Lightning writes `epoch=18-val/mean_auroc=0.996.ckpt` — a *subdirectory* per epoch. `save_top_k=1` deletes the superseded files but leaves the empty directories behind. Cosmetic; fixable with `auto_insert_metric_name=False` and a slash-free template.
+
+### 27.7 Missing Training Hygiene in `run_classify.py`
+
+* No `EarlyStopping` callback — every run grinds through `max_epochs` regardless.
+* `save_top_k=1` means only the single best checkpoint survives, so an earlier epoch cannot be recovered without retraining.
+* No `logger=` is passed, so `flat_config` (computed at line 28) is unused and nothing reaches wandb; metrics land in Lightning's default CSV/TensorBoard logger under `<save_dir>/lightning_logs/`.
+* `on_train_epoch_end` computes train-split AUROC, accumulating ~579k single-element CPU tensors plus ID strings per epoch (~1 GB sawtooth), then re-materialises them via `torch.cat([f for x in ... for f in x])`. The `.detach().cpu()` fix removed the severe autograd-graph retention; this is the residual.
