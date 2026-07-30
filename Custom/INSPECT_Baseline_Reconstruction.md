@@ -853,6 +853,24 @@ Added to `run_MOTOR_MLP.py`:
 
 ### 25.1 Linear Probe, All Tasks, Cohort Split (`9e_run_all_tasks_motor.py`)
 
+**Current results — corrected L2 parameterisation (`C = 1/(l2·n_train)`), run 2026-07-30:**
+
+| Task | Train | Valid | Test | L2 |
+|---|---|---|---|---|
+| PE | 0.7533 | 0.7261 | 0.6907 | 1.44e-02 |
+| 1-month mortality | 0.9481 | 0.9273 | 0.9343 | 3.79e-04 |
+| 6-month mortality | 0.9114 | 0.9123 | 0.9099 | 2.98e-02 |
+| 12-month mortality | 0.9062 | 0.8913 | 0.9015 | 2.98e-02 |
+| 1-month readmission | 0.8342 | 0.8552 | 0.7907 | 3.36e-03 |
+| 6-month readmission | 0.7991 | 0.7984 | 0.7838 | 1.44e-02 |
+| 12-month readmission | 0.7903 | 0.7501 | 0.7750 | 1.44e-02 |
+| 12-month PH | 0.8933 | 0.8568 | 0.8510 | 3.79e-04 |
+
+Every selected L2 is now **interior** and lands in the `3.8e-4` – `3.0e-2` range, overlapping stock FEMR's optima. The boundary warning does not fire on any task.
+
+<details>
+<summary>Superseded results (mis-parameterised L2, retained for the record)</summary>
+
 | Task | Train | Valid | Test | L2 |
 |---|---|---|---|---|
 | PE | 0.7840 | 0.7131 | 0.6817 | 1.00e+01 |
@@ -864,7 +882,11 @@ Added to `run_MOTOR_MLP.py`:
 | 12-month readmission | 0.8203 | 0.7315 | 0.7572 | 1.00e+01 |
 | 12-month PH | 0.8942 | 0.8572 | 0.8505 | 4.83e+00 |
 
-> **⚠ These numbers are superseded — see §25.1.1. They were produced with a mis-parameterised L2 conversion and are under-regularised. Retained for the record and because they are what §25.3's original comparison used.**
+</details>
+
+**Measured effect of the fix:** test AUROC **+0.0063** on average, 6/8 tasks improved (largest: 12-month readmission +0.0178), and the mean train−test gap **halved from 0.0510 to 0.0249**. Train AUROC fell as expected under stronger shrinkage. This is the textbook signature of correcting under-regularisation and confirms the diagnosis independently of the algebra.
+
+> **An unintended reproducibility check.** The fix was initially not pulled onto the lab machine, so the pre-fix code ran a second time. All eight tasks reproduced to three decimals, with ~1e-4 drift attributable to GPU floating-point nondeterminism in representation extraction. This confirms the determinism claim in §24.4 empirically.
 
 ### 25.1.1 L2 Parameterisation Bug (diagnosed 2026-07-30, fixed)
 
@@ -918,43 +940,52 @@ A corroborating signal, visible before the algebra: the hash-split runs from sto
 
 ### 25.2 Reproduction of Published INSPECT Baselines
 
-| Task | INSPECT | Ours (cohort split) | Δ |
+| Task | INSPECT | Ours (cohort split, corrected L2) | Δ |
 |---|---|---|---|
-| PE | 0.677 | 0.682 | +0.005 |
-| 1-month mortality | 0.923 | 0.936 | +0.013 |
-| 6-month mortality | 0.901 | 0.910 | +0.009 |
-| 12-month mortality | 0.892 | 0.897 | +0.005 |
-| 1-month readmission | 0.773 | 0.783 | +0.010 |
-| 6-month readmission | 0.779 | 0.770 | −0.009 |
-| 12-month readmission | 0.767 | 0.757 | −0.010 |
-| 12-month PH | 0.824 | 0.851 | +0.027 |
+| PE | 0.677 | 0.6907 | +0.0137 |
+| 1-month mortality | 0.923 | 0.9343 | +0.0113 |
+| 6-month mortality | 0.901 | 0.9099 | +0.0089 |
+| 12-month mortality | 0.892 | 0.9015 | +0.0095 |
+| 1-month readmission | 0.773 | 0.7907 | +0.0177 |
+| 6-month readmission | 0.779 | 0.7838 | +0.0048 |
+| 12-month readmission | 0.767 | 0.7750 | +0.0080 |
+| 12-month PH | 0.824 | 0.8510 | +0.0270 |
 
-> **⚠ Superseded — these came from the mis-parameterised run (§25.1.1) and must be regenerated.**
+**Mean +0.0126, 8/8 above, 95% CI [+0.0068, +0.0185], t(7) = 5.11, p = 0.001.**
 
-Mean **+0.006**, 6/8 above, all within 0.027. Across eight tasks with an independently rebuilt cohort, a later label vintage and 12% of codes falling outside MOTOR's vocabulary, this is a successful reproduction. It should be presented as such — **not** as an improvement, since the differences have several innocent explanations (779 records dropped for missing `StudyTime`, 12 deduplicated `impression_id`s, vocabulary coverage, seeds).
+After correcting the L2 parameterisation the offset became both larger and perfectly consistent in sign — under the mis-parameterised run it was +0.006 with 6/8 above. It is therefore **systematic, not noise**.
 
-`12_month_PH` is the largest deviation and is also the only task that did not peg L2 at the grid boundary; if INSPECT's run hit the ceiling and ours did not, the two are not regularised identically.
+**This must not be presented as an improvement over INSPECT.** The comparison is not paired: their AUROC is measured on their test patients and ours on ours, and the cohorts differ. Candidate explanations, none of which involve method quality:
+
+* 779 records dropped for missing `StudyTime` and 12 deduplicated `impression_id`s (§4.1) — a different, possibly easier, cohort
+* a later label vintage (`labels_20250611`)
+* 4,888 of 40,996 codes falling outside MOTOR's fixed vocabulary
+* possible differences in the MOTOR checkpoint or FEMR version used for the published run
+
+The defensible claim is **a faithful reproduction carrying a small systematic positive offset (+0.013) whose cause is not established.** Establishing it would require running our pipeline on their exact cohort, which the dropped records make impossible.
+
+Note also that p = 0.001 assumes eight independent observations. Three mortality horizons and three readmission horizons are strongly correlated, so the effective n is well below 8 and the true p is larger. The 8/8 sign consistency is the more robust part of the evidence.
 
 ### 25.3 Split Source Has No Detectable Effect
 
-> **⚠ Confounded — read §25.3.1 before citing.** The cohort column below comes from `9e` under the mis-parameterised L2 conversion (§25.1.1); the hash column comes from stock `clmbr_train_linear_probe`, which is correctly regularised. The comparison therefore mixes split source with regularisation strength. The conclusion still holds, but on the strength of the *clean* comparison in §25.3.1, not this table.
-
-Linear probe, same representations, cohort split vs. CLMBR hash split:
+Linear probe, same representations, cohort split vs. CLMBR hash split. **Both arms use the corrected L2 parameterisation, so this comparison isolates split source alone.**
 
 | Task | cohort | hash | Δ |
 |---|---|---|---|
-| PE | 0.682 | 0.705 | +0.023 |
-| 1-month mortality | 0.936 | 0.930 | −0.006 |
-| 6-month mortality | 0.910 | 0.907 | −0.003 |
-| 12-month mortality | 0.897 | 0.899 | +0.002 |
-| 1-month readmission | 0.783 | 0.759 | −0.024 |
-| 6-month readmission | 0.770 | 0.792 | +0.022 |
-| 12-month readmission | 0.757 | 0.779 | +0.022 |
-| 12-month PH | 0.851 | 0.853 | +0.002 |
+| PE | 0.6907 | 0.7046 | +0.0139 |
+| 1-month mortality | 0.9343 | 0.9305 | −0.0038 |
+| 6-month mortality | 0.9099 | 0.9074 | −0.0025 |
+| 12-month mortality | 0.9015 | 0.8987 | −0.0028 |
+| 1-month readmission | 0.7907 | 0.7587 | −0.0320 |
+| 6-month readmission | 0.7838 | 0.7924 | +0.0086 |
+| 12-month readmission | 0.7750 | 0.7795 | +0.0045 |
+| 12-month PH | 0.8510 | 0.8533 | +0.0023 |
 
-**mean Δ = +0.005, 95% CI [−0.009, +0.019], paired t(7) = 0.81, p = 0.45, 5/8 favour hash.**
+**mean Δ = −0.0015, 95% CI [−0.0130, +0.0100], paired t(7) = −0.30, p = 0.77, 4/8 favour hash (sign test p = 1.00).**
 
-Non-parametric confirmation (n = 8 makes normality unverifiable): Wilcoxon signed-rank W⁺ = 21 against E[W⁺] = 18, exact two-sided p = 0.71; sign test p = 0.73. The t-test uses magnitudes and is the most sensitive of the three, and it is the one reporting p = 0.45.
+The mean is now within 0.0015 of zero, the split is exactly even at 4/4, and the interval comfortably straddles zero. This supersedes the earlier confounded comparison (mean +0.005, p = 0.45), which mixed split source with regularisation strength; correcting the parameterisation moved the result *closer* to the null.
+
+The partitions are also matched in size — 81.5/4.7/13.8 for the cohort split against CLMBR's 80/5/15 (§25.3.2) — so the comparison isolates *which* patients land where rather than how many.
 
 Two structural observations support the null reading:
 
@@ -965,25 +996,19 @@ Caveats to state alongside the result: the CI is over **tasks**, not patients, a
 
 Figure: `Custom/figures/motor_split_delta.png` (generator: `Custom/figures/make_split_delta_plot.py`).
 
-### 25.3.1 What the Comparison Actually Supports
+### 25.3.1 What the Comparison Supports
 
-Three differences separate the two columns in §25.3, not one:
+The remaining difference between the two arms is the optimiser — sklearn `lbfgs` versus FEMR's hand-written conjugate gradient. Both minimise the same strictly convex objective with a unique global optimum, so they converge to the same coefficients and the difference is benign. Regularisation is now matched (§25.1.1) and partition sizes are matched (§25.3.2), so split source is the only substantive variable left.
 
-1. **split source** — cohort patient-level vs. CLMBR 80/5/15 hash percentiles (the intended comparison)
-2. **regularisation** — mis-parameterised vs. correct (§25.1.1)
-3. **optimiser** — sklearn `lbfgs` vs. FEMR's hand-written conjugate gradient (equivalent at convergence, so benign)
-
-Difference 2 invalidates that table as a clean test of difference 1.
-
-**The clean comparison is the MLP pair**, where identical code, head and representations are used and only the split source varies:
+A second, independent line of evidence comes from the MLP pair, where identical code, head and representations are used:
 
 | | cohort split | hash split | Δ |
 |---|---|---|---|
 | MLP, `12_month_PH` | 0.847 | 0.856 | +0.009 |
 
-That supports the null, with the caveat that the MLP head was unseeded when those numbers were produced, so part of the 0.009 is run-to-run variance — measurable with `--n-repeats` (§24.4) but not yet measured.
+Consistent in direction with the linear probe's PH result (+0.0023), though the MLP head was unseeded when those numbers were produced, so part of the 0.009 is run-to-run variance — measurable with `--n-repeats` (§24.4) but not yet measured.
 
-Three further reasons the null reading survives the confound:
+Three further reasons the null reading is robust:
 
 * The **sign flips** across tasks in §25.3, and the single largest difference favours the cohort split. A systematic mechanism effect would be directionally consistent.
 * **Magnitude tracks task difficulty**, not split mechanism — the four largest |Δ| are the four lowest-AUROC tasks.

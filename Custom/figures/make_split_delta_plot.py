@@ -18,13 +18,13 @@ import matplotlib.pyplot as plt
 SHORT  = ["PE", "1-mo\nMortality", "6-mo\nMortality", "12-mo\nMortality",
           "1-mo\nReadmission", "6-mo\nReadmission", "12-mo\nReadmission",
           "12-mo\nPH"]
-COHORT = np.array([0.682, 0.936, 0.910, 0.897, 0.783, 0.770, 0.757, 0.851])
-HASH   = np.array([0.705, 0.930, 0.907, 0.899, 0.759, 0.792, 0.779, 0.853])
+COHORT = np.array([0.6907, 0.9343, 0.9099, 0.9015, 0.7907, 0.7838, 0.7750, 0.8510])
+HASH   = np.array([0.7046, 0.9305, 0.9074, 0.8987, 0.7587, 0.7924, 0.7795, 0.8533])
 
 NAVY, STEEL, GREY, MUTED = "#1B3A57", "#4E80B8", "#9AA5AD", "#6B7680"
 
 d = HASH - COHORT
-labels = [f"{t}\n({a:.3f})" for t, a in zip(SHORT, COHORT)]
+labels = [f"{t}\n({a:.4f})" for t, a in zip(SHORT, COHORT)]
 
 mean = d.mean()
 se = d.std(ddof=1) / np.sqrt(len(d))
@@ -58,7 +58,7 @@ for xi, v in zip(x, d):
             fontsize=10.5, color="#222222", zorder=5)
 
 # band label, placed in empty space inside the CI band
-ax.text(len(d) - 0.55, hi - 0.0015, "95% CI of mean", ha="right", va="top",
+ax.text(3.45, hi - 0.0015, "95% CI of mean", ha="right", va="top",
         fontsize=9, color=MUTED, style="italic")
 
 ax.annotate("favours hash split", xy=(-0.42, 0.0305), fontsize=9.5,
@@ -82,8 +82,8 @@ ax.text(0.5, 1.045,
         transform=ax.transAxes, ha="center", va="bottom",
         fontsize=10.5, color=MUTED)
 ax.text(0.5, -0.205,
-        "cohort-split AUROC in parentheses — the largest differences fall on the "
-        "lowest-AUROC tasks, consistent with sampling noise",
+        "cohort-split AUROC in parentheses. Both arms use the corrected L2 parameterisation "
+        "(C = 1/(l2·n)), so the comparison isolates split source alone.",
         transform=ax.transAxes, ha="center", va="top", fontsize=9.5, color=MUTED)
 
 for s in ("top", "right", "bottom"):
