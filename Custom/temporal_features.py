@@ -115,9 +115,20 @@ DEFAULT_COHORT = DATA_ROOT / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.c
 DEFAULT_DATABASE = DATA_ROOT / "DATA_RAW" / "EHR_FEMR_DB" / "extract"
 DEFAULT_LABELS = DATA_ROOT / "DATA_RAW" / "LABELS" / "labels_20250611.tsv"
 
-PATIENT_ID_COLUMN = "PatientID"
+# The cohort file has shipped with both spellings depending on which version of
+# 2_merge_labels.py produced it; resolve at read time rather than assuming.
+PATIENT_ID_CANDIDATES = ("patient_id", "PatientID", "person_id")
 TIME_COLUMN = "StudyTime"
 IMPRESSION_COLUMN = "impression_id"
+
+
+def resolve_patient_column(fieldnames) -> str:
+    for c in PATIENT_ID_CANDIDATES:
+        if c in fieldnames:
+            return c
+    raise KeyError(
+        f"No patient id column found. Looked for {PATIENT_ID_CANDIDATES}; "
+        f"file has {list(fieldnames)[:10]}...")
 
 CATCH_ALL_DAYS = 36500  # 100 years
 
@@ -308,6 +319,7 @@ class TemporalFeatureExtractor:
             if task not in reader.fieldnames:
                 raise KeyError(f"Task column '{task}' not in {self.cohort_path.name}. "
                                f"Available: {[c for c in reader.fieldnames][:20]}...")
+            pid_col = resolve_patient_column(reader.fieldnames)
             for row in reader:
                 raw = str(row.get(task, "")).strip().upper()
                 if raw in SKIP_LABEL_VALUES:
@@ -315,7 +327,7 @@ class TemporalFeatureExtractor:
                     continue
                 t = row[TIME_COLUMN]
                 t = datetime.datetime.fromisoformat(t) if isinstance(t, str) else t
-                rows.append((int(row[PATIENT_ID_COLUMN]), t - offset,
+                rows.append((int(row[pid_col]), t - offset,
                              str(row[IMPRESSION_COLUMN]), row.get("split", ""),
                              1.0 if raw in TRUTHY else 0.0))
         self._log(f"cohort: {len(rows):,} labelled rows ({skipped:,} censored/missing skipped)")
@@ -323,30 +335,40 @@ class TemporalFeatureExtractor:
 
     # -- survival ---------------------------------------------------------
     def _read_survival(self, task: str):
-        """-> {impression_id: (tte_days, event_indicator)} or None"""
+        """-> {impression_id: (tte_days, event_indicator)} or None
+
+        The cohort master file already carries the tte_*/is_censored_* columns,
+        so it is tried first -- no join, no key-mismatch risk. The labels TSV is
+        the fallback for cohorts built without them.
+        """
         if task not in SURVIVAL_COLUMNS:
             self._log(f"no survival columns registered for '{task}' — tte will be None")
             return None
-        if not self.labels_path.is_file():
-            self._log(f"labels file absent ({self.labels_path}) — tte will be None")
-            return None
         tte_col, cen_col = SURVIVAL_COLUMNS[task]
-        out = {}
-        with open(self.labels_path) as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            for col in (tte_col, cen_col):
-                if col not in reader.fieldnames:
-                    self._log(f"column '{col}' missing from labels file — tte will be None")
-                    return None
-            for row in reader:
-                raw = str(row[tte_col]).strip()
-                if raw in ("", "NA", "nan", "NaN"):
+
+        for path, delim, source in (
+            (self.cohort_path, "\t" if self.cohort_path.suffix == ".tsv" else ",", "cohort"),
+            (self.labels_path, "\t", "labels TSV"),
+        ):
+            if not path or not Path(path).is_file():
+                continue
+            with open(path) as f:
+                reader = csv.DictReader(f, delimiter=delim)
+                if not reader.fieldnames or not {tte_col, cen_col} <= set(reader.fieldnames):
                     continue
-                censored = str(row[cen_col]).strip().upper() in TRUTHY
-                out[str(row[IMPRESSION_COLUMN])] = (
-                    float(raw) / TTE_MINUTES_PER_DAY, 0.0 if censored else 1.0)
-        self._log(f"survival: {len(out):,} rows from {tte_col}/{cen_col}")
-        return out
+                out = {}
+                for row in reader:
+                    raw = str(row[tte_col]).strip()
+                    if raw in ("", "NA", "nan", "NaN"):
+                        continue
+                    censored = str(row[cen_col]).strip().upper() in TRUTHY
+                    out[str(row[IMPRESSION_COLUMN])] = (
+                        float(raw) / TTE_MINUTES_PER_DAY, 0.0 if censored else 1.0)
+            self._log(f"survival: {len(out):,} rows from {tte_col}/{cen_col} ({source})")
+            return out
+
+        self._log(f"no {tte_col}/{cen_col} in cohort or labels file — tte will be None")
+        return None
 
     # -- main -------------------------------------------------------------
     def build(self, task: str, groups: Sequence[FeatureGroup],
@@ -381,7 +403,7 @@ class TemporalFeatureExtractor:
                 CountFeaturizer(
                     is_ontology_expansion=True,
                     time_bins=tds,                      # already sorted ascending
-                    excluded_event_filter=_table_filter(g.tables),
+                    excluded_event_filter=_TableFilter(g.tables),
                 )
             )
         flist = FeaturizerList(featurizers)
@@ -425,11 +447,36 @@ class TemporalFeatureExtractor:
         return fm
 
 
-def _table_filter(tables: frozenset) -> Callable:
-    """excluded_event_filter: return True for events to EXCLUDE."""
-    def f(ev):
-        return getattr(ev, "omop_table", None) not in tables
-    return f
+class _TableFilter:
+    """`excluded_event_filter`: return True for events to EXCLUDE.
+
+    Implemented as a module-level class rather than a closure or lambda because
+    FEMR's `preprocess_featurizers` / `featurize` fan out over a multiprocessing
+    Pool, which pickles the featurizers. Closures and lambdas raise
+    `AttributeError: Can't pickle local object`. An instance of a top-level
+    class with picklable state pickles fine.
+
+    (The same defect exists in Custom/x_generate_binned_features.py, which
+    passes lambdas — it only survives with num_threads=1.)
+    """
+
+    __slots__ = ("tables",)
+
+    def __init__(self, tables: Iterable[str]):
+        self.tables = frozenset(tables)
+
+    def __call__(self, ev) -> bool:
+        return getattr(ev, "omop_table", None) not in self.tables
+
+    def __repr__(self) -> str:
+        return f"_TableFilter({sorted(self.tables)})"
+
+    # explicit, so __slots__ doesn't trip up the default pickling path
+    def __getstate__(self):
+        return {"tables": self.tables}
+
+    def __setstate__(self, state):
+        self.tables = state["tables"]
 
 
 def _column_names(featurizers, groups, include_age: bool) -> list[str]:
