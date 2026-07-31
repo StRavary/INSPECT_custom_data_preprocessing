@@ -6,7 +6,8 @@ from pathlib import Path
 
 def convert_npy_to_hdf5(input_dir, output_path, metadata_path):
     # Read metadata to get mapping between impression_id and image_id
-    df_metadata = pd.read_csv(metadata_path)
+    sep = '\t' if str(metadata_path).endswith('.tsv') else ','
+    df_metadata = pd.read_csv(metadata_path, sep=sep)
 
     # Create HDF5 file
     with h5py.File(output_path, 'w') as hdf5_file:
@@ -36,9 +37,9 @@ def convert_npy_to_hdf5(input_dir, output_path, metadata_path):
                 continue
 
 if __name__ == "__main__":
-    input_dir = "/share/pi/nigam/projects/zphuo/data/PE/inspect/image_modality/anon_pe_features_full_new"
-    output_path = "/share/pi/nigam/projects/zphuo/data/PE/inspect/image_modality/anon_pe_features_full_new/features.hdf5"
-    metadata_path = "/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_metadata.csv"
+    input_dir = "/data/processed/INSPECT/CNN_embeddings"
+    output_path = "/data/processed/INSPECT/CNN_embeddings/features.hdf5"
+    metadata_path = "/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv"
 
     convert_npy_to_hdf5(input_dir, output_path, metadata_path)
     print(f"HDF5 file created at: {output_path}")

@@ -5,7 +5,7 @@ stage: extract
 test_split: all
 
 exp:
-  base_dir: outputs
+  base_dir: /data/processed/INSPECT/CNN_embeddings
   name: all # test
 
 trainer:
@@ -20,5 +20,5 @@ trainer:
   num_workers: 16
 
 defaults:
-  - dataset: stanford_16_22
+  - dataset: stanford
   - model: resnetv2_ct # dinov2

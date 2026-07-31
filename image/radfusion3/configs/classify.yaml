@@ -1,9 +1,9 @@
 n_gpus: 1
 get_features: true
 stage: classify
-output_dir: outputs/wandb # use for wandb logging
+output_dir: /data/processed/INSPECT/CNN_embeddings/wandb # use for wandb logging
 test_split: test  # all
-ckpt: null
+ckpt: "/data/processed/INSPECT/2026-07-24 - RSNA_chkpt/11-23-09/outputs/classify_pe_present_on_image_2026-07-24_15:23:11/epoch=27-val/mean_auroc=0.998.ckpt"
 
 lr: 0.0005
 optimizer:
@@ -16,7 +16,7 @@ monitor:
   mode: max
 
 exp:
-  base_dir: outputs # use for ckpt saving
+  base_dir: /data/processed/INSPECT/CNN_embeddings # use for ckpt saving
   name: 'classify'
 
 trainer:

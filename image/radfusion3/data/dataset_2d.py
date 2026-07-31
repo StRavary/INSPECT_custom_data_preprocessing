@@ -11,6 +11,13 @@ from .dataset_base import DatasetBase
 from ..utils import read_tar_dicom
 
 
+def _read_df(path):
+    if not path:
+        return None
+    sep = '\t' if str(path).endswith('.tsv') else ','
+    return pd.read_csv(path, sep=sep)
+
+
 class Dataset2D(DatasetBase):
     def __init__(self, cfg, split="train", transform=None):
         super().__init__(cfg, split)
@@ -19,11 +26,25 @@ class Dataset2D(DatasetBase):
         self.cfg = cfg
 
         # Read main data
-        self.df = pd.read_csv(cfg.dataset.csv_path)
+        self.df = _read_df(cfg.dataset.csv_path)
+
+        # Map impression_id if not present in metadata
+        if 'impression_id' not in self.df.columns and 'image_id' in self.df.columns:
+            csv_dir = os.path.dirname(cfg.dataset.csv_path)
+            mapping_files = list(Path(csv_dir).glob("study_mapping*.tsv")) + list(Path(csv_dir).glob("study_mapping*.csv"))
+            if hasattr(cfg.dataset, 'mapping_csv') and cfg.dataset.mapping_csv:
+                mapping_files = [cfg.dataset.mapping_csv]
+            if mapping_files:
+                map_df = _read_df(mapping_files[0])
+                if 'image_id' in map_df.columns and 'impression_id' in map_df.columns:
+                    map_df['clean_image_id'] = map_df['image_id'].astype(str).str.replace('.nii.gz', '')
+                    self.df['clean_image_id'] = self.df['image_id'].astype(str).str.replace('.nii.gz', '')
+                    self.df = self.df.merge(map_df[['clean_image_id', 'impression_id']].drop_duplicates(subset=['clean_image_id']), on='clean_image_id', how='left')
+                    self.df = self.df.drop(columns=['clean_image_id'])
 
         # Read splits if split_path is provided
         if hasattr(cfg.dataset, 'split_path') and cfg.dataset.split_path:
-            splits_df = pd.read_csv(cfg.dataset.split_path)
+            splits_df = _read_df(cfg.dataset.split_path)
             # Merge splits with main dataframe
             self.df = self.df.merge(splits_df, on='impression_id', how='left')
 

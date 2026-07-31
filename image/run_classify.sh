@@ -12,8 +12,8 @@ python run_classify.py model=model_1d dataset=stanford_featurized \
 	dataset.weighted_sample=false \
 	trainer.max_epochs=1\
 	lr=0.001 \
-    exp.base_dir="/local-scratch/nigam/users/zphuo/data/image_modality/outputs" \
-    output_dir="/local-scratch/nigam/users/zphuo/data/image_modality/outputs/wandb" \
-    dataset.csv_path="/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_metadata_sample_20250303.csv" \
-    dataset.label_csv="/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_labels_sample_20250303.csv" \
-    dataset.split_csv="/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_splits_sample_20250303.csv" \
+    exp.base_dir="/data/processed/INSPECT/CNN_embeddings" \
+    output_dir="/data/processed/INSPECT/CNN_embeddings/wandb" \
+    dataset.csv_path="/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv" \
+    dataset.label_csv="/home/users/steven/INSPECT/DATA_RAW/LABELS/labels_20250611.tsv" \
+    dataset.split_csv="/home/users/steven/INSPECT/DATA_RAW/LABELS/splits_20250611.tsv"
