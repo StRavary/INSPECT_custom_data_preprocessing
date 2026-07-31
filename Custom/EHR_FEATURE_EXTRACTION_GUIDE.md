@@ -182,7 +182,7 @@ expands only two levels. FEMR's API is all-or-nothing.
 
 ---
 
-## 6. Caveats that will bite you
+## 6. Caveats that will hinder you
 
 ### 6.1 The FEMR extract is de-duplicated
 
