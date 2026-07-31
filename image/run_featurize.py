@@ -13,6 +13,10 @@ def run(config):
 
     from time import gmtime, strftime
 
+    import torch
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cudnn.benchmark = True
+
     pl.seed_everything(config.trainer.seed)
 
     # Saving checkpoints and logging with wandb.

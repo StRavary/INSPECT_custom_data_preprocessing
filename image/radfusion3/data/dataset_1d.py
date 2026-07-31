@@ -13,31 +13,52 @@ import os
 import pickle
 
 
+def _read_df(path):
+    if not path:
+        return None
+    sep = '\t' if str(path).endswith('.tsv') else ','
+    return pd.read_csv(path, sep=sep)
+
+
 class Dataset1D(DatasetBase):
     def __init__(self, cfg, split="train", transform=None):
         super().__init__(cfg, split)
 
         self.cfg = cfg
-        self.df = pd.read_csv(cfg.dataset.csv_path)
+        self.df = _read_df(cfg.dataset.csv_path)
 
         if "rsna" not in cfg.dataset.csv_path:
             # Use image_id directly from metadata and create impression_id
-            self.df["patient_datetime"] = self.df["image_id"].str.replace(".nii.gz", "")
-            # Set impression_id to be the same as patient_datetime if not present
-            if 'impression_id' not in self.df.columns:
-                self.df['impression_id'] = self.df["patient_datetime"]
+            self.df["patient_datetime"] = self.df["image_id"].astype(str).str.replace(".nii.gz", "")
 
             # duplicate patient_datetime remove
             self.df = self.df.drop_duplicates(subset=["patient_datetime"])
 
+            # Map impression_id if not present in metadata
+            if 'impression_id' not in self.df.columns:
+                csv_dir = os.path.dirname(cfg.dataset.csv_path)
+                mapping_files = list(Path(csv_dir).glob("study_mapping*.tsv")) + list(Path(csv_dir).glob("study_mapping*.csv"))
+                if hasattr(cfg.dataset, 'mapping_csv') and cfg.dataset.mapping_csv:
+                    mapping_files = [cfg.dataset.mapping_csv]
+                if mapping_files:
+                    map_df = _read_df(mapping_files[0])
+                    if 'image_id' in map_df.columns and 'impression_id' in map_df.columns:
+                        map_df['clean_image_id'] = map_df['image_id'].astype(str).str.replace('.nii.gz', '')
+                        self.df['clean_image_id'] = self.df['image_id'].astype(str).str.replace('.nii.gz', '')
+                        self.df = self.df.merge(map_df[['clean_image_id', 'impression_id']].drop_duplicates(subset=['clean_image_id']), on='clean_image_id', how='left')
+                        self.df = self.df.drop(columns=['clean_image_id'])
+
+            if 'impression_id' not in self.df.columns:
+                self.df['impression_id'] = self.df["patient_datetime"]
+
             # Read labels if provided separately
             if hasattr(cfg.dataset, 'label_csv') and cfg.dataset.label_csv:
-                label_df = pd.read_csv(cfg.dataset.label_csv)
+                label_df = _read_df(cfg.dataset.label_csv)
                 self.df = self.df.merge(label_df, on='impression_id', how='left')
 
             # Read splits if provided separately
             if hasattr(cfg.dataset, 'split_csv') and cfg.dataset.split_csv:
-                split_df = pd.read_csv(cfg.dataset.split_csv)
+                split_df = _read_df(cfg.dataset.split_csv)
                 self.df = self.df.merge(split_df, on='impression_id', how='left')
 
             if split != "all" and 'split' in self.df.columns:

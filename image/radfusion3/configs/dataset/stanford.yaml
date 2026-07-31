@@ -1,10 +1,10 @@
 type: 2d
-csv_path: '/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_metadata_sample_20250303.csv'
-split_path: '/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_splits_sample_20250303.csv'
-metadata_path: '/share/pi/nigam/projects/zphuo/data/PE/inspect/note/Final_metadata.csv'
+csv_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv'
+split_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/splits_20250611.tsv'
+metadata_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv'
 sample_frac: 1.0
-dicom_dir: /local-scratch/nigam/datasets/PE/inspect/anon_nii_gz/AIMI_ct_all/
-output_dir: /local-scratch/nigam/datasets/PE/inspect/anon_pe_features_full_new
+dicom_dir: /data/scratch/INSPECT/INSPECT_CTPA
+output_dir: /data/processed/INSPECT/CNN_embeddings
 
 batch_size: 256
 weighted_sample: false
