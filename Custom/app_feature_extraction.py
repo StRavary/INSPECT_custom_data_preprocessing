@@ -113,12 +113,23 @@ def validate_source(kind: str, path) -> tuple[bool, list[str]]:
             with open(p) as f:
                 header = f.readline().rstrip("\n").split(
                     "\t" if p.suffix == ".tsv" else ",")
-            need = {"PatientID", "StudyTime", "impression_id", "split"}
-            missing = need - set(header)
+            hset = set(header)
             msgs.append(f"{n:,} rows, {len(header)} columns")
+
+            # patient id ships as patient_id or PatientID depending on which
+            # version of 2_merge_labels.py produced the file
+            pid = next((c for c in ("patient_id", "PatientID", "person_id")
+                        if c in hset), None)
+            missing = {"StudyTime", "impression_id", "split"} - hset
+            if pid is None:
+                missing.add("patient_id / PatientID")
             if missing:
                 return False, msgs + [f"missing required columns: {sorted(missing)}"]
-            msgs.append("required columns present")
+            msgs.append(f"required columns present (patient id: {pid})")
+
+            n_tte = len([c for c in header if c.startswith("tte_")])
+            if n_tte:
+                msgs.append(f"{n_tte} survival endpoints in-file — labels TSV optional")
 
         elif kind == "labels":
             n = _line_count(p) - 1
