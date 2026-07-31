@@ -14,6 +14,10 @@ def run(config):
     from omegaconf import OmegaConf
     import re
 
+    import torch
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cudnn.benchmark = True
+
     pl.seed_everything(config.trainer.seed)
 
     # Create output directories with proper permissions

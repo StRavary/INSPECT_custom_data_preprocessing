@@ -28,7 +28,7 @@ trainer:
   max_epochs: 30
   gradient_clip_val: 1.0
   accumulate_grad_batches: 64
-  num_workers: 4
+  num_workers: 16
   strategy: ddp
   position_encoding: true
 
