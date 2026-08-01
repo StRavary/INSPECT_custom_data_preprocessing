@@ -2,7 +2,7 @@ import torch
 import pydicom
 import numpy as np
 import pandas as pd
-import cv2
+from PIL import Image as _PILImage
 import h5py
 import nibabel as nib
 
@@ -170,8 +170,10 @@ class DatasetBase(Dataset):
 
         # Resize image
         if resize_size != pixel_array.shape[-1]:
-            pixel_array = cv2.resize(
-                pixel_array, (resize_size, resize_size), interpolation=cv2.INTER_AREA
+            pixel_array = np.array(
+                _PILImage.fromarray(pixel_array.astype(np.float32)).resize(
+                    (resize_size, resize_size), _PILImage.LANCZOS
+                )
             )
 
         return pixel_array
