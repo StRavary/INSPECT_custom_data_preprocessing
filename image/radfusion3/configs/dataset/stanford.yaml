@@ -3,7 +3,7 @@ csv_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.t
 split_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/splits_20250611.tsv'
 metadata_path: '/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv'
 sample_frac: 1.0
-dicom_dir: /data/scratch/INSPECT/INSPECT_CTPA
+dicom_dir: /data/scratch/INSPECT/INSPECT_CTPA/full/CTPA
 output_dir: /data/processed/INSPECT/CNN_embeddings
 
 batch_size: 256

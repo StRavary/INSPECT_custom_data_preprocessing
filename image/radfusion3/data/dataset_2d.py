@@ -62,7 +62,10 @@ class Dataset2D(DatasetBase):
         # get all nifti files for each impression_id
         self.all_instances = []
         for idx, row in tqdm.tqdm(self.df.iterrows(), total=len(self.df)):
-            nifti_path = os.path.join(self.cfg.dataset.dicom_dir, row['image_id'])  # image_id already has .nii.gz
+            image_id = row['image_id']
+            if not image_id.endswith('.nii.gz'):
+                image_id = image_id + '.nii.gz'
+            nifti_path = os.path.join(self.cfg.dataset.dicom_dir, image_id)
             self.all_instances.append([row["impression_id"], 0, nifti_path])  # Use impression_id as identifier
 
     def __getitem__(self, index):
