@@ -82,11 +82,11 @@ class FeaturizeLightningModel(LightningModule):
         if self.features_dir:
             for ids, f in zip(instance_id, features.cpu().detach().float().numpy()):
                 try:
-                    # Clean the image_id to remove .nii.gz and get base name
-                    clean_id = ids.split('@')[0]  # First get impression_id
-                    cleaned_image_id = self.df_metadata[self.df_metadata['impression_id'] == int(clean_id)]['image_id'].iloc[0]
-                    cleaned_image_id = cleaned_image_id.replace('.nii.gz', '')  # Remove .nii.gz extension
-                    feature_path = os.path.join(self.features_dir, f"{cleaned_image_id}.npy")
+                    parts = ids.split('@')
+                    # Format: "{impression_id}@{instance_idx}@{image_id}"
+                    image_id = parts[2] if len(parts) > 2 else parts[0]
+                    image_id = image_id.replace('.nii.gz', '')
+                    feature_path = os.path.join(self.features_dir, f"{image_id}.npy")
                     np.save(feature_path, f)
                 except Exception as e:
                     print("[ERROR]", ids, str(e))

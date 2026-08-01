@@ -66,11 +66,12 @@ class Dataset2D(DatasetBase):
             if not image_id.endswith('.nii.gz'):
                 image_id = image_id + '.nii.gz'
             nifti_path = os.path.join(self.cfg.dataset.dicom_dir, image_id)
-            self.all_instances.append([row["impression_id"], 0, nifti_path])  # Use impression_id as identifier
+            raw_image_id = row['image_id']  # bare id without .nii.gz
+            self.all_instances.append([row["impression_id"], 0, nifti_path, raw_image_id])
 
     def __getitem__(self, index):
         # get slice row
-        pdt, instance_idx, slice_path = self.all_instances[index]
+        pdt, instance_idx, slice_path, raw_image_id = self.all_instances[index]
 
         # read slice from file
         ct_slice = self.process_slice(slice_path=slice_path)
@@ -92,7 +93,7 @@ class Dataset2D(DatasetBase):
         # get labels
         y = torch.tensor([0])
 
-        return x, y, f"{pdt}@{instance_idx}"
+        return x, y, f"{pdt}@{instance_idx}@{raw_image_id}"
 
     def __len__(self):
         return len(self.all_instances)
