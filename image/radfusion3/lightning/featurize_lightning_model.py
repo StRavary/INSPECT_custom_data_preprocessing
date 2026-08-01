@@ -31,7 +31,7 @@ class FeaturizeLightningModel(LightningModule):
 
         # Load metadata from config path
         if hasattr(cfg.dataset, 'metadata_path'):
-            self.df_metadata = pd.read_csv(cfg.dataset.metadata_path)
+            self.df_metadata = pd.read_csv(cfg.dataset.metadata_path, sep='\t' if cfg.dataset.metadata_path.endswith('.tsv') else ',')
         else:
             print("Warning: metadata_path not configured, image_id mapping will not be available")
 
