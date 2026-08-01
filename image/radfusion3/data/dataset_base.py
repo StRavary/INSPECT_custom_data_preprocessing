@@ -134,13 +134,17 @@ class DatasetBase(Dataset):
         # Read image based on format
         if file_path.endswith('.nii.gz'):
             # Read NIfTI
-            nifti_img = nib.load(file_path)
-            pixel_array = nifti_img.get_fdata()
-            # NIfTI doesn't use rescale slope/intercept like DICOM
-            # but we'll keep consistent array preprocessing
-            if len(pixel_array.shape) > 2:
-                # Take first volume/timepoint if 4D
-                pixel_array = pixel_array[:, :, 0] if len(pixel_array.shape) == 3 else pixel_array[:, :, 0, 0]
+            try:
+                nifti_img = nib.load(file_path)
+                pixel_array = nifti_img.get_fdata()
+                # NIfTI doesn't use rescale slope/intercept like DICOM
+                # but we'll keep consistent array preprocessing
+                if len(pixel_array.shape) > 2:
+                    # Take first volume/timepoint if 4D
+                    pixel_array = pixel_array[:, :, 0] if len(pixel_array.shape) == 3 else pixel_array[:, :, 0, 0]
+            except Exception as e:
+                print(f"[WARN] Corrupt or unreadable NIfTI, skipping: {file_path} ({e})")
+                pixel_array = np.zeros((resize_size, resize_size))
         else:
             # Read DICOM
             if self.is_rsna():
