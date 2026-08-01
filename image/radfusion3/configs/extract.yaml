@@ -17,7 +17,7 @@ trainer:
   precision: "32"  # full fp32 — avoids NVML pressure from mixed-precision scaler
   max_steps: 100_000
   gradient_clip_val: 0
-  num_workers: 32
+  num_workers: 8
 
 defaults:
   - dataset: stanford
