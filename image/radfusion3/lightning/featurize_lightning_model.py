@@ -42,15 +42,10 @@ class FeaturizeLightningModel(LightningModule):
         raise Exception("Validation not supported for featurize model")
 
     def test_step(self, batch, batch_idx):
-        # Get outputs including features
-        outputs = self.shared_step(batch, "test")
-
-        # Validate outputs before storing
-        if outputs is not None and len(outputs) == 3 and outputs[1] is not None:
-            # Store outputs for epoch end
-            self.test_step_outputs["outputs"].append(outputs)
-
-        return outputs
+        # shared_step saves per-slice .npy files to disk.
+        # shared_epoch_end reads from disk, so no need to accumulate tensors in memory.
+        self.shared_step(batch, "test")
+        return None
 
     def on_training_epoch_end(self):
         raise Exception("Training not supported for featurize model")
@@ -117,7 +112,7 @@ class FeaturizeLightningModel(LightningModule):
 
         n_written = 0
         n_skipped = 0
-        with h5py.File(hdf5_path, "w") as hdf5_fn:
+        with h5py.File(hdf5_path, "a") as hdf5_fn:
             for scan_dir in tqdm.tqdm(scan_dirs, desc="Building HDF5"):
                 image_id = scan_dir.name
                 slice_files = sorted(scan_dir.glob("slice_*.npy"))

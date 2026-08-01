@@ -14,7 +14,7 @@ trainer:
   val_check_interval: 1.0
   limit_val_batches: 1.0
   resume_from_checkpoint: null
-  precision: "32"  # full fp32 — avoids NVML pressure from mixed-precision scaler
+  precision: "bf16-mixed"
   max_steps: 100_000
   gradient_clip_val: 0
   num_workers: 8
