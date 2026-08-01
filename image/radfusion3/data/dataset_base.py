@@ -22,6 +22,10 @@ class DatasetBase(Dataset):
         self.split = split
         self.hdf5_dataset = None
 
+        # NIfTI last-file cache: avoids reloading the same file for each slice
+        self._nifti_cache_path = None
+        self._nifti_cache_data = None
+
         path = "/share/pi/nigam/projects/zphuo/data/omop_extract_PHI/som-nero-phi-nigam-starr.frazier/dict_slice_thickness.pkl"
         if os.path.exists(path):
             self.dict_slice_thickness = pickle.load(open(path, "rb"))
@@ -124,7 +128,7 @@ class DatasetBase(Dataset):
 
         return pixel_array
 
-    def read_image(self, file_path: str, resize_size=None, channels=None):
+    def read_image(self, file_path: str, resize_size=None, channels=None, slice_idx: int = 0):
         """Read medical image in DICOM or NIfTI format"""
         if resize_size is None:
             resize_size = self.cfg.dataset.transform.resize_size
@@ -133,17 +137,28 @@ class DatasetBase(Dataset):
 
         # Read image based on format
         if file_path.endswith('.nii.gz'):
-            # Read NIfTI
+            # Use last-file cache: DataLoader sorts by path so consecutive
+            # __getitem__ calls for the same scan hit the cache.
             try:
-                nifti_img = nib.load(file_path)
-                pixel_array = nifti_img.get_fdata()
-                # NIfTI doesn't use rescale slope/intercept like DICOM
-                # but we'll keep consistent array preprocessing
-                if len(pixel_array.shape) > 2:
-                    # Take first volume/timepoint if 4D
-                    pixel_array = pixel_array[:, :, 0] if len(pixel_array.shape) == 3 else pixel_array[:, :, 0, 0]
+                if self._nifti_cache_path != file_path:
+                    nifti_img = nib.load(file_path)
+                    self._nifti_cache_data = nifti_img.get_fdata()
+                    self._nifti_cache_path = file_path
+                volume = self._nifti_cache_data
+                if len(volume.shape) == 2:
+                    pixel_array = volume
+                elif len(volume.shape) == 3:
+                    # shape: (H, W, num_slices)
+                    actual_idx = min(slice_idx, volume.shape[2] - 1)
+                    pixel_array = volume[:, :, actual_idx]
+                else:
+                    # 4D: (H, W, num_slices, T)
+                    actual_idx = min(slice_idx, volume.shape[2] - 1)
+                    pixel_array = volume[:, :, actual_idx, 0]
             except Exception as e:
                 print(f"[WARN] Corrupt or unreadable NIfTI, skipping: {file_path} ({e})")
+                self._nifti_cache_path = None
+                self._nifti_cache_data = None
                 pixel_array = np.zeros((resize_size, resize_size))
         else:
             # Read DICOM

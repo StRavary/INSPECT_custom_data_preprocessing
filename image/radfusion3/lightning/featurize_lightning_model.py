@@ -78,15 +78,18 @@ class FeaturizeLightningModel(LightningModule):
         # Create output tuple with all needed info
         output = (logit, features.detach(), instance_id)
 
-        # Save features as individual files if needed
+        # Save per-slice feature files: {features_dir}/{image_id}/slice_{slice_idx:04d}.npy
         if self.features_dir:
             for ids, f in zip(instance_id, features.cpu().detach().float().numpy()):
                 try:
                     parts = ids.split('@')
-                    # Format: "{impression_id}@{instance_idx}@{image_id}"
+                    # Format: "{impression_id}@{slice_idx}@{image_id}"
+                    slice_idx = int(parts[1]) if len(parts) > 2 else 0
                     image_id = parts[2] if len(parts) > 2 else parts[0]
                     image_id = image_id.replace('.nii.gz', '')
-                    feature_path = os.path.join(self.features_dir, f"{image_id}.npy")
+                    scan_dir = os.path.join(self.features_dir, image_id)
+                    os.makedirs(scan_dir, exist_ok=True)
+                    feature_path = os.path.join(scan_dir, f"slice_{slice_idx:04d}.npy")
                     np.save(feature_path, f)
                 except Exception as e:
                     print("[ERROR]", ids, str(e))
@@ -95,49 +98,45 @@ class FeaturizeLightningModel(LightningModule):
         return output
 
     def shared_epoch_end(self, step_outputs, prefix):
-        # Extract feature vectors and instance IDs
-        all_features = []
-        all_instance_ids = []
+        """
+        After all test batches: walk features_dir, find per-scan subdirectories
+        containing slice_NNNN.npy files, stack them into (num_slices, 768) arrays,
+        and write everything to a single features.hdf5 file.
+        """
+        hdf5_path = os.path.join(self.features_dir, "features.hdf5")
+        print(f"\nBuilding HDF5 at {hdf5_path} ...")
 
-        # Collect outputs from all steps
-        for outputs in step_outputs["outputs"]:
-            if outputs is not None and len(outputs) > 0:
-                # Extract features and instance ID
-                _, feature_vector, instance_id = outputs
-                if isinstance(instance_id, (list, tuple)):
-                    all_instance_ids.extend(instance_id)
-                    all_features.extend(feature_vector.cpu().float().numpy())
-                else:
-                    all_instance_ids.append(instance_id)
-                    all_features.append(feature_vector.cpu().float().numpy())
+        scan_dirs = sorted([
+            d for d in Path(self.features_dir).iterdir()
+            if d.is_dir()
+        ])
 
-        # Convert features to numpy array
-        if len(all_features) > 0:
-            all_features = np.vstack(all_features)
+        if len(scan_dirs) == 0:
+            print("[WARN] No per-scan directories found in features_dir — nothing to write.")
+            return {}
 
-            # Create DataFrame with same number of rows for all columns
-            df_data = {'instance_id': all_instance_ids}
+        n_written = 0
+        n_skipped = 0
+        with h5py.File(hdf5_path, "w") as hdf5_fn:
+            for scan_dir in tqdm.tqdm(scan_dirs, desc="Building HDF5"):
+                image_id = scan_dir.name
+                slice_files = sorted(scan_dir.glob("slice_*.npy"))
+                if len(slice_files) == 0:
+                    print(f"[WARN] No slice files for {image_id}, skipping")
+                    n_skipped += 1
+                    continue
+                try:
+                    slices = np.stack([np.load(str(p)) for p in slice_files])  # (S, 768)
+                    hdf5_fn.create_dataset(image_id, data=slices.astype(np.float32),
+                                           chunks=True, compression="gzip",
+                                           compression_opts=1)
+                    n_written += 1
+                except Exception as e:
+                    print(f"[ERROR] Failed to write {image_id}: {e}")
+                    n_skipped += 1
 
-            # Add feature columns
-            for i in range(all_features.shape[1]):
-                df_data[f'feature_{i}'] = all_features[:, i]
-
-            # Create DataFrame
-            df = pd.DataFrame(df_data)
-
-            # Get impression ID from instance ID
-            df["impression_id"] = df["instance_id"].apply(lambda x: x.split("@")[0])
-            df["impression_id"] = df["impression_id"].astype(int)
-
-            print(f"Processed {len(df)} instances with {all_features.shape[1]} features")
-
-            # Create output path and save
-            output_path = Path(self.features_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            df.to_csv(output_path / f"{prefix}_features.csv", index=False)
-        else:
-            print("Warning: No features collected during epoch")
-
+        print(f"\nHDF5 complete: {n_written} scans written, {n_skipped} skipped.")
+        print(f"Features saved at: {hdf5_path}")
         return {}
 
     def shared_epoch_end_rsna(self, step_outputs, split):

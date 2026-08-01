@@ -59,22 +59,30 @@ class Dataset2D(DatasetBase):
                 sampled_ids = np.random.choice(all_ids, num_sample, replace=False)
                 self.df = self.df[self.df["impression_id"].isin(sampled_ids)]
 
-        # get all nifti files for each impression_id
+        # Build one entry per (unique NIfTI, slice_idx) so the 1D model
+        # receives a full slice-sequence per scan, not just the first slice.
+        unique_df = self.df.drop_duplicates(subset=['image_id'])
+
         self.all_instances = []
-        for idx, row in tqdm.tqdm(self.df.iterrows(), total=len(self.df)):
-            image_id = row['image_id']
-            if not image_id.endswith('.nii.gz'):
-                image_id = image_id + '.nii.gz'
-            nifti_path = os.path.join(self.cfg.dataset.dicom_dir, image_id)
-            raw_image_id = row['image_id']  # bare id without .nii.gz
-            self.all_instances.append([row["impression_id"], 0, nifti_path, raw_image_id])
+        for idx, row in tqdm.tqdm(unique_df.iterrows(), total=len(unique_df)):
+            raw_image_id = row['image_id']
+            image_id_file = raw_image_id if raw_image_id.endswith('.nii.gz') else raw_image_id + '.nii.gz'
+            nifti_path = os.path.join(self.cfg.dataset.dicom_dir, image_id_file)
+            impression_id = row['impression_id'] if 'impression_id' in row.index else raw_image_id
+            n_slices = int(row['num_slices']) if ('num_slices' in row.index and pd.notna(row.get('num_slices'))) else 1
+            for slice_idx in range(n_slices):
+                self.all_instances.append([impression_id, slice_idx, nifti_path, raw_image_id])
+
+        # Sort by NIfTI path so each DataLoader worker processes consecutive
+        # slices of the same file, maximising cache hit rate.
+        self.all_instances.sort(key=lambda x: x[2])
 
     def __getitem__(self, index):
         # get slice row
         pdt, instance_idx, slice_path, raw_image_id = self.all_instances[index]
 
         # read slice from file
-        ct_slice = self.process_slice(slice_path=slice_path)
+        ct_slice = self.process_slice(slice_path=slice_path, slice_idx=instance_idx)
 
         # transform
         if ct_slice.shape[0] == 3:
@@ -98,11 +106,11 @@ class Dataset2D(DatasetBase):
     def __len__(self):
         return len(self.all_instances)
 
-    def process_slice(self, slice_info: pd.Series = None, dicom_dir: Path = None, slice_path: str = None):
+    def process_slice(self, slice_info: pd.Series = None, dicom_dir: Path = None, slice_path: str = None, slice_idx: int = 0):
         """process slice with windowing, resize and transforms"""
         if slice_path is None:
             slice_path = dicom_dir / slice_info[INSTANCE_PATH_COL]
-        slice_array = self.read_image(slice_path)  # Use read_image instead of read_dicom
+        slice_array = self.read_image(slice_path, slice_idx=slice_idx)
 
         # window
         if self.cfg.dataset.transform.channels == "repeat":
