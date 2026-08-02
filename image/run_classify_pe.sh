@@ -17,7 +17,7 @@ strategy=auto
 batch_size=128
 num_workers=4
 num_slices=250
-ckpt="test"
+ckpt="null"
 
 echo "***************" "pe_positive_nlp" "********************************************"
 for seed in $seeds

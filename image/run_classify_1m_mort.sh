@@ -17,7 +17,7 @@ strategy=auto
 batch_size=128
 num_workers=4
 num_slices=250
-ckpt="test"
+ckpt="null"
 
 echo "***************" "1_month_mortality" "********************************************"
 for seed in $seeds
