@@ -56,22 +56,8 @@ class DatasetBase(Dataset):
         #     lambda x: f"{x.PatientID}_{x.StudyTime}", axis=1
         # )
 
-        # only add slice thickness to stanford data
-        if not self.is_rsna():
-            thickness_ls = []
-            for idx_th in range(arr.shape[0]):
-                try:
-                    thickness_ls.append(self.dict_slice_thickness[key] * idx_th)
-                except:
-                    print(
-                        key,
-                        idx_th,
-                        "=========no thickness info=============================",
-                    )
-                    thickness_ls.append(0)
-            thickness_ls = np.array(thickness_ls)
-            arr = np.concatenate([arr, thickness_ls[:, None]], axis=1)
-        elif self.is_rsna():
+        # Add slice thickness column only if the thickness dict is available
+        if self.dict_slice_thickness:
             thickness_ls = []
             for idx_th in range(arr.shape[0]):
                 try:
