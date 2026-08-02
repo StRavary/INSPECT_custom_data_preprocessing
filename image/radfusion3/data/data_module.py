@@ -17,7 +17,7 @@ class DataModule(pl.LightningDataModule):
         return dict(
             num_workers=nw,
             persistent_workers=False,
-            pin_memory=True,
+            pin_memory=False,
         )
 
     def train_dataloader(self):
