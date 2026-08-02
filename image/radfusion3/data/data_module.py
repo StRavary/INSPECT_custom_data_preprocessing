@@ -16,8 +16,7 @@ class DataModule(pl.LightningDataModule):
         nw = self.cfg.trainer.num_workers
         return dict(
             num_workers=nw,
-            persistent_workers=False,  # avoid HDF5 file-handle leaks across epochs
-            multiprocessing_context="spawn" if nw > 0 else None,  # h5py is not fork-safe
+            persistent_workers=False,
             pin_memory=True,
         )
 
