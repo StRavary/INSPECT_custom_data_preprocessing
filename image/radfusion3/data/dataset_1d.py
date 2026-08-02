@@ -79,7 +79,7 @@ class Dataset1D(DatasetBase):
             self.study = self.df["SeriesInstanceUID"].tolist()
 
         self.df[cfg.dataset.target] = self.df[cfg.dataset.target].astype(str)
-        self.labels = [1 if t == "True" else 0 for t in self.df[cfg.dataset.target]]
+        self.labels = [1 if t.upper() == "TRUE" else 0 for t in self.df[cfg.dataset.target]]
         print(
             f"Pos: {len([t for t in self.labels if t == 1])} ; Neg: {len([t for t in self.labels if t == 0])}"
         )
