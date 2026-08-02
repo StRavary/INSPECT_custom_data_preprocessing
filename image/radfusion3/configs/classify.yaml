@@ -3,7 +3,7 @@ get_features: true
 stage: classify
 output_dir: /data/processed/INSPECT/CNN_embeddings/wandb # use for wandb logging
 test_split: test  # all
-ckpt: "/data/processed/INSPECT/2026-07-24 - RSNA_chkpt/11-23-09/outputs/classify_pe_present_on_image_2026-07-24_15:23:11/epoch=27-val/mean_auroc=0.998.ckpt"
+ckpt: null
 
 lr: 0.0005
 optimizer:

@@ -13,7 +13,7 @@
 # seeds="0 1 2 3 4 5 6 7 8 9"
 seeds="0"
 n_gpus=1
-strategy=deepspeed
+strategy=auto
 batch_size=128
 num_workers=4
 num_slices=250
@@ -25,7 +25,7 @@ python run_classify.py model=model_1d dataset=stanford_featurized \
 	dataset.target=12_month_readmission \
 	dataset.pretrain_args.model_type=resnetv2_101_ct\
 	dataset.pretrain_args.channel_type=window\
-	dataset.feature_size=768 \
+	dataset.feature_size=6144 \
 	dataset.num_slices=250 \
 	model.aggregation=mean\
 	model.seq_encoder.rnn_type=LSTM\
