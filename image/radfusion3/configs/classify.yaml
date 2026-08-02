@@ -30,7 +30,7 @@ trainer:
   accumulate_grad_batches: 1
   num_workers: 16
   strategy: ddp
-  position_encoding: false
+  position_encoding: true
 
 defaults:
   - _self_

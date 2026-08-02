@@ -56,16 +56,19 @@ class DatasetBase(Dataset):
         #     lambda x: f"{x.PatientID}_{x.StudyTime}", axis=1
         # )
 
-        # Add slice thickness column only if the thickness dict is available
+        # Add positional encoding column
+        # When slice thickness is available (Stanford internal), use thickness * slice_idx
+        # (encodes absolute z-position in mm). Otherwise use normalized slice index (0→1)
+        # as a substitute positional signal. This matches position_encoding: true in classify.yaml.
+        n_slices = arr.shape[0]
         if self.dict_slice_thickness:
-            thickness_ls = []
-            for idx_th in range(arr.shape[0]):
-                try:
-                    thickness_ls.append(self.dict_slice_thickness[key] * idx_th)
-                except:
-                    thickness_ls.append(0)
-            thickness_ls = np.array(thickness_ls)
-            arr = np.concatenate([arr, thickness_ls[:, None]], axis=1)
+            pos = np.array([
+                self.dict_slice_thickness.get(key, 1.0) * i for i in range(n_slices)
+            ], dtype=np.float32)
+        else:
+            pos = np.arange(n_slices, dtype=np.float32) / max(n_slices - 1, 1)
+
+        arr = np.concatenate([arr, pos[:, None]], axis=1)
 
         return arr
 
