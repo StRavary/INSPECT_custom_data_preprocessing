@@ -28,6 +28,26 @@ def resnext_101_sup_ct(**kwargs):
     return model, features_dims
 
 
+def resnext_101_ct(**kwargs):
+    """ResNeXt-101-32x8d fine-tuned on RSNA CTPA.
+    Checkpoint: StanfordShahLab/ResNeXt101_ct on HuggingFace (1.04 GB).
+    This is the exact backbone used in the INSPECT paper (2048-d features).
+    """
+    model = model_2d.resnext101_32x8d(pretrained=False)
+    features_dims = model.fc.in_features  # 2048
+    model.fc = Identity()
+
+    ckpt_path = "/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt"
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    ckpt = {k.replace("model.", ""): v for k, v in checkpoint["state_dict"].items()}
+    msg = model.load_state_dict(ckpt, strict=False)
+    print("=" * 80)
+    print(f"Loaded INSPECT ResNeXt101 checkpoint from: {ckpt_path}")
+    print(msg)
+    print("=" * 80)
+    return model, features_dims
+
+
 def resnetv2_101_sup(**kwargs):
     model = timm.create_model("resnetv2_101x3_bitm_in21k", pretrained=True)
     model.head.fc = Identity()
