@@ -15,7 +15,7 @@ seeds="0"
 n_gpus=1
 strategy=auto
 batch_size=128
-num_workers=4
+num_workers=0
 num_slices=250
 ckpt="null"
 
@@ -26,7 +26,7 @@ python run_classify.py model=model_1d dataset=stanford_featurized \
 	dataset.target=1_month_mortality \
 	dataset.pretrain_args.model_type=resnetv2_101_ct\
 	dataset.pretrain_args.channel_type=window\
-	dataset.feature_size=6144 \
+	dataset.feature_size=2048 \
 	dataset.num_slices=250 \
 	model.aggregation=max\
 	model.seq_encoder.rnn_type=GRU \
