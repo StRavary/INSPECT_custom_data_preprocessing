@@ -23,7 +23,7 @@ for seed in $seeds
 do
 python run_classify.py model=model_1d dataset=stanford_featurized \
 	dataset.target=12_month_PH\
-	dataset.pretrain_args.model_type=resnetv2_101_ct\
+	dataset.pretrain_args.model_type=resnext_101_ct\
 	dataset.pretrain_args.channel_type=window\
 	dataset.feature_size=2048 \
 	dataset.num_slices=250 \
