@@ -77,6 +77,10 @@ class DatasetBase(Dataset):
             pos = np.array([
                 self.dict_slice_thickness.get(key, 1.0) * i for i in range(n_slices)
             ], dtype=np.float32)
+            # Normalize to [0, 1]: raw values are thickness_mm × slice_idx
+            # (e.g. 1.5mm × 249 = 373) which is orders of magnitude larger
+            # than CNN features and saturates LSTM gates → NaN loss.
+            pos = pos / max(pos[-1], 1.0)
         else:
             pos = np.arange(n_slices, dtype=np.float32) / max(n_slices - 1, 1)
 
