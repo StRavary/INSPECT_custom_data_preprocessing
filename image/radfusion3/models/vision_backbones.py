@@ -38,7 +38,7 @@ def resnext_101_ct(**kwargs):
     model.fc = Identity()
 
     ckpt_path = kwargs.get("checkpoint_path", "/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt")
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt = {k.replace("model.", ""): v for k, v in checkpoint["state_dict"].items()}
     msg = model.load_state_dict(ckpt, strict=False)
     print("=" * 80)
