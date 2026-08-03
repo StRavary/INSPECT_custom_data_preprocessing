@@ -26,11 +26,23 @@ class DatasetBase(Dataset):
         self._nifti_cache_path = None
         self._nifti_cache_data = None
 
-        path = "/share/pi/nigam/projects/zphuo/data/omop_extract_PHI/som-nero-phi-nigam-starr.frazier/dict_slice_thickness.pkl"
-        if os.path.exists(path):
-            self.dict_slice_thickness = pickle.load(open(path, "rb"))
+        # Try Stanford-internal pickle first (original source)
+        pickle_path = "/share/pi/nigam/projects/zphuo/data/omop_extract_PHI/som-nero-phi-nigam-starr.frazier/dict_slice_thickness.pkl"
+        if os.path.exists(pickle_path):
+            self.dict_slice_thickness = pickle.load(open(pickle_path, "rb"))
         else:
+            # Fall back to SliceThickness column in series metadata TSV
+            # Keys are image_id without .nii.gz extension
             self.dict_slice_thickness = {}
+            csv_path = getattr(getattr(cfg, "dataset", cfg), "csv_path", None)
+            if csv_path and os.path.exists(csv_path):
+                try:
+                    sep = "\t" if str(csv_path).endswith(".tsv") else ","
+                    meta = pd.read_csv(csv_path, sep=sep, usecols=["image_id", "SliceThickness"])
+                    meta["image_id"] = meta["image_id"].astype(str).str.replace(".nii.gz", "", regex=False)
+                    self.dict_slice_thickness = dict(zip(meta["image_id"], meta["SliceThickness"].fillna(1.0)))
+                except Exception as e:
+                    print(f"[WARN] Could not load SliceThickness from metadata: {e}")
 
     def is_rsna(self):
         csv_path = str(getattr(self.cfg.dataset, "csv_path", "")).lower()
