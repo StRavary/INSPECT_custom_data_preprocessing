@@ -37,7 +37,7 @@ def resnext_101_ct(**kwargs):
     features_dims = model.fc.in_features  # 2048
     model.fc = Identity()
 
-    ckpt_path = "/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt"
+    ckpt_path = kwargs.get("checkpoint_path", "/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt")
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     ckpt = {k.replace("model.", ""): v for k, v in checkpoint["state_dict"].items()}
     msg = model.load_state_dict(ckpt, strict=False)
