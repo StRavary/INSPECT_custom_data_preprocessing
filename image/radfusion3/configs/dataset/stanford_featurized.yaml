@@ -11,11 +11,7 @@ num_slices: 250
 feature_size: 2048
 weighted_sample: true
 batch_size: 32
-<<<<<<< Updated upstream
-hdf5_path: /data/processed/INSPECT/CNN_embeddings/features_resnext.hdf5
-=======
-hdf5_path: /data/processed/INSPECT/CNN_embeddings/features_uncompressed.hdf5
->>>>>>> Stashed changes
+hdf5_path: /data/processed/INSPECT/CNN_embeddings/features_resnext_uncompressed.hdf5
 
 pretrain_args:
   model_type: resnext_101_ct
