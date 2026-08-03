@@ -8,7 +8,7 @@ import tqdm
 import os
 
 SRC = "/data/processed/INSPECT/CNN_embeddings/features.hdf5"
-DST = "/data/processed/INSPECT/CNN_embeddings/features_uncompressed.hdf5"
+DST = "/data/processed/INSPECT/CNN_embeddings/features_resnext_uncompressed.hdf5"
 
 print(f"Source: {SRC}")
 print(f"Destination: {DST}")
