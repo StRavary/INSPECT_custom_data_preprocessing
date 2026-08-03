@@ -54,6 +54,41 @@ To generate image model results:
 - After that you can using **run_classify_all.sh** to get classification results on all 8 tasks
     - If you want, run hyperparameter search with **wandb sweep sweep.yaml**. Note that line 8 specifies the prediction target. 
 
+---
+
+### Custom Reconstruction on MEDomics-Beast (2025–2026)
+
+The full INSPECT pipeline was reconstructed on the MEDomics-Beast workstation (NVIDIA Blackwell Pro 6000 GPU, Intel 9965WX CPU, 256 GB RAM, 4 TB NVMe). Several fixes were required to run outside the Stanford Nero cluster. Full documentation is in `Custom/INSPECT_Baseline_Reconstruction.md`.
+
+#### Key changes to the 1-D classify pipeline
+
+**Position encoding** — the original code read slice thickness from a Stanford-internal pickle (`dict_slice_thickness.pkl`) that does not exist on beast. The fallback silently wrote zeros, giving the model a constant dead dimension. We added two fixes: (1) a normalized 0→1 position substitute when the pickle is absent, and (2) a proper fallback that reads `SliceThickness` from `series_metadata_20250611.tsv`, restoring `thickness_mm × slice_index` encoding. See `image/radfusion3/data/dataset_base.py`.
+
+**Bugs fixed** (see §28.3 of the Baseline Reconstruction doc for full detail):
+- `ckpt="test"` in PE and 1-month-mortality launchers triggered test-only mode, skipping training entirely → `ckpt="null"`
+- Label strings are `"TRUE"/"FALSE"` not `"True"/"False"` → `.upper()` comparison in `dataset_1d.py`
+- `accumulate_grad_batches: 64` with 75 batches/epoch = 1 optimizer step/epoch → `accumulate_grad_batches: 1`
+- gzip-compressed HDF5 + multiple DataLoader workers → deadlock → rebuilt as `features_uncompressed.hdf5` (`rebuild_hdf5_uncompressed.py`)
+- `pin_memory=True` + `num_workers=0` → silent crash from pinner thread → `pin_memory=False`
+- `persistent_workers=True` with h5py → file handle leaks → `persistent_workers=False`
+
+#### Preliminary results (Run 1 — normalized position encoding)
+
+| Task | Our AUROC | Paper |
+|---|---|---|
+| pe_positive_nlp | 0.590 | 0.721 |
+| 1_month_mortality | 0.689 | 0.794 |
+| 6_month_mortality | 0.658 | 0.755 |
+| 12_month_mortality | 0.669 | 0.748 |
+| 1_month_readmission | 0.507 | 0.549 |
+| 6_month_readmission | 0.512 | 0.515 |
+| 12_month_readmission | 0.543 | 0.525 |
+| 12_month_PH | 0.589 | 0.661 |
+
+The gap is largest on PE and mortality tasks. Contributing factors: no cross-slice recurrence (upstream LSTM axis bug §27.1 of reconstruction doc), CNN pre-trained on full RSNA without a hold-out split (paper used a proper train/val/test split), and ~1,500 corrupted scans excluded. Run 2 with real SliceThickness position encoding and Run 3 with a retrained CNN are in progress.
+
+---
+
 
 ### To simply replicate our results (injesting our trained model weights)
 > conda activate radfusion3 \

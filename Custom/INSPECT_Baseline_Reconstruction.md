@@ -1096,6 +1096,198 @@ The sequence encoder emits `(batch, 250, 256)`; aggregation collapses the slice 
 
 ---
 
+## 28. 1-D Classify Pipeline — Reconstruction on MEDomics-Beast
+
+This section documents every change made to bring the `image/radfusion3` LSTM/GRU classifier up to a runnable state on the beast workstation (Blackwell Pro 6000 GPU, 9965WX CPU, 256 GB RAM, 4 TB NVMe). The upstream code was written for the Stanford Nero cluster and assumed several cluster-specific paths and infrastructure details that do not exist on beast.
+
+### 28.1 Pipeline Overview
+
+The 1-D pipeline loads per-scan CNN feature matrices from an HDF5 file (`image/radfusion3/data/dataset_1d.py` + `dataset_base.py`), feeds them through a task-specific LSTM or GRU (`models/models_1d.py`), and optimises with PyTorch Lightning (`run_classify.py`). Hyperparameters were determined upstream by a wandb Bayesian sweep (§26). The entry point for running all eight tasks in sequence is:
+
+```bash
+cd image
+./run_classify_all.sh 2>&1 | tee classify_$(date +%Y%m%d_%H%M%S).log
+```
+
+Feature shape: `(num_slices, 6144)` per scan, stored under the scan's `image_id` key (with `.nii.gz` stripped). The upstream model expected a `(num_slices, 6145)` input when `position_encoding: true`, the extra dimension being an absolute z-position in millimetres derived from a Stanford-internal pickle.
+
+### 28.2 The Position Encoding Issue
+
+This is the single most important design point and the source of several cascading bugs.
+
+**Original design (Stanford cluster):**
+The file `dict_slice_thickness.pkl` at `/share/pi/nigam/projects/...` maps each `image_id` to its DICOM `SliceThickness` in mm. `DatasetBase.read_from_hdf5` appended a column `SliceThickness × slice_idx` to each feature row, encoding the absolute z-position of each slice in mm. With `position_encoding: true` in `classify.yaml`, `models_1d.py` set `seq_input_size = 6144 + 1 = 6145`.
+
+**Problem on beast:**
+The Stanford pickle does not exist. The original code silently caught the `KeyError` and appended `0` for every slice — so the positional column was identically zero for all slices across all studies. This is worse than no position encoding: the model sees a constant extra dimension that provides no information but was trained expecting a meaningful one.
+
+**What we found when tracing the bug:**
+Because `position_encoding: true` was the default but the appended column was all zeros, the LSTM input was 6145-d and the model instantiated correctly — there was no dimension mismatch, so no crash. Training proceeded but the positional channel carried no signal.
+
+**First fix — disable position encoding:**
+Setting `position_encoding: false` dropped the expected input size back to 6144, matching the raw features. This eliminated the dead dimension but also removed any slice-order signal. AUROC for PE dropped to roughly 0.59 (vs 0.721 in the paper), partially attributable to the loss of positional information.
+
+**Second fix — normalized substitute:**
+We added a normalized 0→1 position column as a substitute for the missing thickness data. In `dataset_base.py`:
+
+```python
+n_slices = arr.shape[0]
+if self.dict_slice_thickness:
+    pos = np.array([
+        self.dict_slice_thickness.get(key, 1.0) * i for i in range(n_slices)
+    ], dtype=np.float32)
+else:
+    pos = np.arange(n_slices, dtype=np.float32) / max(n_slices - 1, 1)
+arr = np.concatenate([arr, pos[:, None]], axis=1)
+```
+
+And re-enabled `position_encoding: true` in `classify.yaml`. This gives the model a relative ordering signal (0 = first slice, 1 = last), though it lacks the physical scale of true mm-based encoding.
+
+**Third fix — real SliceThickness from metadata TSV:**
+The series metadata file `series_metadata_20250611.tsv` contains a `SliceThickness` column keyed on `image_id`. `DatasetBase.__init__` now loads this as a fallback when the Stanford pickle is absent:
+
+```python
+pickle_path = "/share/pi/nigam/.../dict_slice_thickness.pkl"
+if os.path.exists(pickle_path):
+    self.dict_slice_thickness = pickle.load(open(pickle_path, "rb"))
+else:
+    self.dict_slice_thickness = {}
+    csv_path = getattr(getattr(cfg, "dataset", cfg), "csv_path", None)
+    if csv_path and os.path.exists(csv_path):
+        sep = "\t" if str(csv_path).endswith(".tsv") else ","
+        meta = pd.read_csv(csv_path, sep=sep, usecols=["image_id", "SliceThickness"])
+        meta["image_id"] = meta["image_id"].astype(str).str.replace(".nii.gz", "", regex=False)
+        self.dict_slice_thickness = dict(zip(meta["image_id"], meta["SliceThickness"].fillna(1.0)))
+```
+
+With this in place the positional column is `SliceThickness_mm × slice_index`, matching the original Stanford design. Run 2 (see §28.6) uses this fix.
+
+### 28.3 Bugs Found and Fixed
+
+All fixes are in the beast-local copy of the repository. Changes are itemised below.
+
+#### 28.3.1 `ckpt="test"` Skipped Training (PE and 1-month Mortality)
+
+`run_classify_pe.sh` and `run_classify_1m_mort.sh` both contained:
+
+```bash
+ckpt="test"
+```
+
+When `ckpt` is not `null`, `run_classify.py` enters the test-only branch (`trainer.test(model=model, datamodule=dm)`), loads a checkpoint, and exits without training. The scripts therefore finished in seconds with no model trained.
+
+**Fix:** `ckpt="null"` in both launchers.
+
+#### 28.3.2 Label Parsing Case-Sensitivity (`Dataset1D`)
+
+```python
+# upstream — broken
+self.labels = [1 if t == "True" else 0 for t in self.df[cfg.dataset.target]]
+```
+
+The Stanford cohort label columns contain `"TRUE"` / `"FALSE"` (all-caps), not Python booleans stringified as `"True"`. Every label silently became 0, producing `Pos: 0 / Neg: 17038`. AUROC was identically 0.5 (random chance) with no error raised.
+
+**Fix** in `dataset_1d.py`:
+
+```python
+self.labels = [1 if t.upper() == "TRUE" else 0 for t in self.df[cfg.dataset.target]]
+```
+
+#### 28.3.3 `accumulate_grad_batches: 64` with 75 Batches/Epoch
+
+The default `classify.yaml` had `accumulate_grad_batches: 64`. With ~19,000 training scans, `batch_size=128`, and `drop_last=True`, each epoch contains 75 batches. Gradient accumulation therefore triggers only once per epoch, making effective LR far too large and oscillating (equivalent to a batch of 8,192). AUROC plateaued around 0.578 after 33 epochs with no improvement.
+
+**Fix:** `accumulate_grad_batches: 1` in `classify.yaml`.
+
+#### 28.3.4 DataLoader Deadlocks with gzip-Compressed HDF5
+
+The original HDF5 (`features.hdf5`, ~40 GB) was stored with gzip compression. With `num_workers ≥ 1`, multiple workers decompressing simultaneously caused deadlocks that left the process hanging silently at the first `next(iter(dataloader))` call. Reducing workers from 16 → 8 → 4 → 2 → 1 all deadlocked. Switching the multiprocessing start method to `spawn` was too slow (each worker re-imported PyTorch, ~30 s per worker startup).
+
+**Fix — rebuild uncompressed HDF5:**
+
+```python
+# rebuild_hdf5_uncompressed.py (at repository root)
+SRC = "/data/processed/INSPECT/CNN_embeddings/features.hdf5"        # 40 GB, gzip
+DST = "/data/processed/INSPECT/CNN_embeddings/features_uncompressed.hdf5"  # 125 GB, no compression
+
+with h5py.File(SRC, "r") as src, h5py.File(DST, "w") as dst:
+    for key in tqdm.tqdm(list(src.keys())):
+        dst.create_dataset(key, data=src[key][:], chunks=True)
+```
+
+Updated `configs/dataset/stanford_featurized.yaml`: `hdf5_path: features_uncompressed.hdf5`.
+
+#### 28.3.5 `pin_memory=True` Silent Crash with `num_workers=0`
+
+After switching to the uncompressed HDF5 and setting `num_workers=0`, the process still died silently (no traceback, no CUDA error) during the first validation pass. Root cause: `pin_memory=True` with `num_workers=0` spawns a background pinner thread that tries to acquire h5py file handles across threads, causing a silent OS-level abort.
+
+**Fix** — refactored `DataModule` with a shared `_dataloader_kwargs()` helper:
+
+```python
+def _dataloader_kwargs(self):
+    nw = self.cfg.trainer.num_workers
+    return dict(
+        num_workers=nw,
+        persistent_workers=False,   # h5py file handle leaks across epochs
+        pin_memory=False,           # pinner thread deadlocks with num_workers=0
+    )
+```
+
+#### 28.3.6 `persistent_workers=True` with h5py
+
+When `persistent_workers=True`, DataLoader workers are kept alive between epochs. h5py file handles opened by one epoch's workers become invalid by the next epoch (the HDF5 file is re-opened in `read_from_hdf5` lazily per-worker). This caused intermittent `OSError: Unable to open file` crashes.
+
+**Fix:** `persistent_workers=False` in the `_dataloader_kwargs` helper above.
+
+### 28.4 Summary of All File Changes
+
+| File | Change |
+|---|---|
+| `image/radfusion3/data/dataset_base.py` | Added SliceThickness fallback from metadata TSV in `__init__`; `read_from_hdf5` always appends position column (mm-based or normalised 0→1) |
+| `image/radfusion3/data/dataset_1d.py` | Label parsing: `.upper() == "TRUE"` instead of `== "True"` |
+| `image/radfusion3/data/data_module.py` | Refactored all DataLoaders to `_dataloader_kwargs()`; `persistent_workers=False`, `pin_memory=False` |
+| `image/radfusion3/configs/classify.yaml` | `accumulate_grad_batches: 1`, `position_encoding: true`, `strategy: auto` |
+| `image/radfusion3/configs/dataset/stanford_featurized.yaml` | `hdf5_path: features_uncompressed.hdf5`, `feature_size: 6144` |
+| `image/run_classify_pe.sh` | `ckpt="null"`, `n_gpus=1`, `strategy=auto`, `dataset.feature_size=6144`, `num_workers=4`, `batch_size=128` |
+| `image/run_classify_1m_mort.sh` | Same fixes as PE script |
+| `rebuild_hdf5_uncompressed.py` | New script at repository root; rebuilds HDF5 without gzip |
+
+### 28.5 Preliminary Results (Run 1 — No Position Encoding)
+
+Run 1 used `position_encoding: false` and `num_workers=0` while the uncompressed HDF5 was being built. Features are 6144-d (no positional column). GPU utilisation was 30–60% (bursty, IO-bound at `num_workers=0`).
+
+Hyperparameters per task are as documented in §26 (bidirectional LSTM/GRU, `hidden_size=128`, `num_layers=1`, `num_slices=250`, 50 epochs). Results are `test/mean_auroc` from the saved prediction CSVs.
+
+| Task | Our AUROC (Run 1) | Paper (CT-only) | Δ |
+|---|---|---|---|
+| pe_positive_nlp | 0.590 | 0.721 | −0.131 |
+| 1_month_mortality | 0.689 | 0.794 | −0.105 |
+| 6_month_mortality | 0.658 | 0.755 | −0.097 |
+| 12_month_mortality | 0.669 | 0.748 | −0.079 |
+| 1_month_readmission | 0.507 | 0.549 | −0.042 |
+| 6_month_readmission | 0.512 | 0.515 | −0.003 |
+| 12_month_readmission | 0.543 | 0.525 | +0.018 |
+| 12_month_PH | 0.589 | 0.661 | −0.072 |
+
+The gap is largest on PE (−0.131) and mortality tasks (−0.08 to −0.11). Contributing factors:
+
+1. **No position encoding** — slices have no ordering signal; the model degenerates to a per-slice projection followed by pooling (see §27.1).
+2. **CNN pre-trained on full RSNA dataset** — the publication trained the CNN with a proper RSNA train/val/test split, likely preventing indirect overfitting to the Stanford label distribution. Our CNN was pre-trained on 100% of RSNA (no hold-out), which may have produced embeddings that overfit the source distribution.
+3. **~1,500 corrupted scans excluded** — scans that failed NIfTI loading during featurisation are absent from the HDF5; the resulting cohort shift may affect label difficulty.
+4. **Upstream LSTM axis bug (§27.1)** — with `batch_size=128` the RNN processes 128 as the sequence length and 250 as the batch. The model still functions as a per-slice projection + pooling, but learns no cross-slice recurrence.
+
+The three readmission tasks are at or above paper AUROCs, consistent with those being low-signal tasks where the gain from cross-slice recurrence is minimal.
+
+### 28.6 Run 2 — Real SliceThickness Position Encoding
+
+After implementing the metadata-TSV fallback (§28.2, third fix), a second training run was launched with `position_encoding: true` and `num_workers=4` (uncompressed HDF5 stable with multiple workers). The positional column is now `SliceThickness_mm × slice_index`, restoring the original Stanford encoding. Results pending.
+
+### 28.7 Planned Run 3 — Retrained CNN
+
+The CNN backbone is being retrained on RSNA with a proper train/val/test split to match the publication's pre-training protocol. Once new features are extracted, a third classify pass will be run on the same pipeline to isolate the effect of pre-training data leakage from the effect of position encoding.
+
+---
+
 ## 27. Outstanding Defects in `image/` (upstream, not yet fixed)
 
 Found while tracing the 1-D pipeline. None are our code; all are in the original `radfusion3` and would affect any run.
