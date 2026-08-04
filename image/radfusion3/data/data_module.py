@@ -16,7 +16,7 @@ class DataModule(pl.LightningDataModule):
         nw = self.cfg.trainer.num_workers
         return dict(
             num_workers=nw,
-            persistent_workers=False,
+            persistent_workers=nw > 0,
             pin_memory=False,
         )
 
