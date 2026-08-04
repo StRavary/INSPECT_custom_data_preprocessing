@@ -78,6 +78,18 @@ class Dataset1D(DatasetBase):
         else:
             self.study = self.df["SeriesInstanceUID"].tolist()
 
+        # Filter out studies whose keys are absent from the HDF5 (corrupt/missing scans).
+        # Opens the file once at init to build the key set, then closes it.
+        with h5py.File(self.hdf5_path, "r") as _f:
+            available_keys = set(_f.keys())
+        study_col = "patient_datetime" if "rsna" not in cfg.dataset.csv_path else "SeriesInstanceUID"
+        before = len(self.df)
+        self.df = self.df[self.df[study_col].apply(lambda k: k.replace(".nii.gz", "") in available_keys)]
+        removed = before - len(self.df)
+        if removed:
+            print(f"[Dataset1D] Filtered {removed} studies not found in HDF5.")
+        self.study = self.df[study_col].tolist()
+
         self.df[cfg.dataset.target] = self.df[cfg.dataset.target].astype(str)
         self.labels = [1 if t.upper() == "TRUE" else 0 for t in self.df[cfg.dataset.target]]
         print(

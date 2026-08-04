@@ -60,6 +60,9 @@ class DatasetBase(Dataset):
         if self.hdf5_dataset is None:
             self.hdf5_dataset = h5py.File(hdf5_path, "r")
 
+        if key not in self.hdf5_dataset:
+            return None
+
         if slice_idx is None:
             arr = self.hdf5_dataset[key][:]
         else:
