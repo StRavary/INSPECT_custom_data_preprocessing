@@ -16,7 +16,7 @@ monitor:
   mode: max
 
 exp:
-  base_dir: /data/processed/INSPECT/CNN_embeddings # use for ckpt saving
+  base_dir: /data/processed/INSPECT/checkpoints # use for ckpt saving
   name: 'classify'
 
 trainer:
