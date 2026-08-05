@@ -188,6 +188,11 @@ class Model1D(nn.Module):
             x = torch.mean(x, 1)
             return x, None
         elif self.cfg.model.aggregation == "max":
+            if mask is not None:
+                # mask: (Batch, Slice), 1=real, 0=padded
+                # set padded positions to -inf so they never win the max
+                inf_mask = (1 - mask).bool().unsqueeze(-1).expand_as(x)
+                x = x.masked_fill(inf_mask, float('-inf'))
             x, _ = torch.max(x, 1)
             return x, None
         else:
