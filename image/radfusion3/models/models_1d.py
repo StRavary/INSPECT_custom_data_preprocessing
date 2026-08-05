@@ -128,13 +128,10 @@ class Model1D(nn.Module):
     def __init__(self, cfg, num_classes=1):
         super(Model1D, self).__init__()
 
-        # rnn input size
-        # seq_input_size = cfg.dataset.pretrain_args.model_type
-        model_fn = getattr(vision_backbones, cfg.dataset.pretrain_args.model_type)
-        model, seq_input_size = model_fn()
+        # rnn input size — read directly from config, no need to load the backbone
+        seq_input_size = cfg.dataset.feature_size
         if cfg.trainer.position_encoding:
             seq_input_size += 1
-        del model
 
         if cfg.dataset.contextualize_slice:
             seq_input_size = seq_input_size * 3
