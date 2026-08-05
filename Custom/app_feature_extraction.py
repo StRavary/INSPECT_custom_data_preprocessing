@@ -181,9 +181,13 @@ def validate_source(kind: str, path) -> tuple[bool, list[str]]:
 
 GROUP_TABLES = {
     "vitals_labs": ["measurement", "observation"],
-    "diag_proc": ["condition_occurrence", "procedure_occurrence", "device_exposure"],
-    "drugs": ["drug_exposure"],
-    "visits": ["visit_occurrence", "visit_detail"],
+    # diag_proc keeps diagnoses + procedures together (matches published baseline)
+    "diag_proc":   ["condition_occurrence", "procedure_occurrence", "device_exposure"],
+    # diag / proc let you set different time horizons for each
+    "diag":        ["condition_occurrence"],
+    "proc":        ["procedure_occurrence", "device_exposure"],
+    "drugs":       ["drug_exposure"],
+    "visits":      ["visit_occurrence", "visit_detail"],
 }
 
 PRESETS = {
@@ -199,6 +203,12 @@ PRESETS = {
         "vitals_labs": [2, 7, 30],
         "diag_proc": [30],
         "drugs": [30],
+    },
+    "Split diag / proc (different horizons)": {
+        "vitals_labs": [2, 30, 365],
+        "diag":        [365, 1825],   # diagnoses: 1 y + 5 y lookback
+        "proc":        [30, 365],     # procedures: 1 m + 1 y lookback
+        "drugs":       [30, 365],
     },
 }
 

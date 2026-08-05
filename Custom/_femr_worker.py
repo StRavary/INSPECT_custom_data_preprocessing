@@ -43,10 +43,13 @@ def main() -> None:
 
     spec = json.loads(spec_path.read_text())
 
-    # GROUP_TABLES duplicated here to avoid importing Streamlit via the app module
+    # GROUP_TABLES duplicated here to avoid importing Streamlit via the app module.
+    # Keep in sync with GROUP_TABLES in app_feature_extraction.py.
     GROUP_TABLES = {
         "vitals_labs": ["measurement", "observation"],
         "diag_proc":   ["condition_occurrence", "procedure_occurrence", "device_exposure"],
+        "diag":        ["condition_occurrence"],
+        "proc":        ["procedure_occurrence", "device_exposure"],
         "drugs":       ["drug_exposure"],
         "visits":      ["visit_occurrence", "visit_detail"],
     }
