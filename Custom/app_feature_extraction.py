@@ -323,6 +323,26 @@ def _list_cached() -> list[tuple[str, Path]]:
     )
 
 
+def _default_concept_csv(omop_path: str) -> Path:
+    """Derive concept.csv path from the OMOP directory path."""
+    return Path(omop_path) / "concept.csv"
+
+
+# ---------------------------------------------------------------------------
+# Concept-map cache (loaded once per Streamlit session)
+# ---------------------------------------------------------------------------
+
+def _load_concept_map_cached(concept_csv: str, st):
+    """Streamlit-cached wrapper around temporal_features.load_concept_map."""
+    from Custom.temporal_features import load_concept_map
+
+    @st.cache_resource(show_spinner="Loading OMOP concept names …")
+    def _load(path: str):
+        return load_concept_map(path)
+
+    return _load(concept_csv)
+
+
 def spec_to_yaml(spec: dict) -> str:
     """Emit a reproducible spec plus the equivalent Python call."""
     lines = ["# INSPECT feature extraction spec",
@@ -414,8 +434,8 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
 
     from Custom.temporal_features import DX_TASKS, PX_TASKS
 
-    tab_src, tab_cfg, tab_run, tab_desc = st.tabs(
-        ["0 · Data sources", "1 · Configure", "2 · Extract", "3 · Describe"])
+    tab_src, tab_cfg, tab_run, tab_desc, tab_exp = st.tabs(
+        ["0 · Data sources", "1 · Configure", "2 · Extract", "3 · Describe", "4 · Export"])
 
     # ---------------- 0 · data sources ----------------------------------
     with tab_src:
@@ -522,6 +542,17 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
             proc_info = st.session_state.get(proc_key)  # (pid, out_path)
             if proc_info is not None:
                 pid, out_str = proc_info
+
+                # Output file existing is the definitive completion signal —
+                # check it before the pid, which can be a zombie or reused.
+                if Path(out_str).exists():
+                    st.success("✅ Extraction finished!")
+                    with open(out_str, "rb") as _f:
+                        st.session_state["fm"] = pickle.load(_f)
+                    st.session_state.pop(proc_key)
+                    st.rerun()
+
+                # Output file absent — check whether the process is still alive.
                 try:
                     os.kill(pid, 0)
                     still_running = True
@@ -537,16 +568,8 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                     time.sleep(5)
                     st.rerun()
                 else:
-                    # process exited — check for output
-                    if Path(out_str).exists():
-                        st.success("✅ Extraction finished!")
-                        with open(out_str, "rb") as _f:
-                            st.session_state["fm"] = pickle.load(_f)
-                        st.session_state.pop(proc_key)
-                        st.rerun()
-                    else:
-                        st.error("❌ Extraction failed — check the log above.")
-                        st.session_state.pop(proc_key)
+                    st.error("❌ Extraction failed — check the log above.")
+                    st.session_state.pop(proc_key)
 
             # ── cached result already on disk ─────────────────────────────
             elif pkl_path.exists():
@@ -640,6 +663,19 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
             st.text(fm.describe())
             st.dataframe(fm.to_frame().head(50), width='stretch')
 
+            # Show human-readable column preview if concept.csv is available
+            concept_csv = _default_concept_csv(spec["paths"].get("omop", ""))
+            if concept_csv.exists():
+                concept_map = _load_concept_map_cached(str(concept_csv), st)
+                st.caption("Sample feature columns (OMOP names resolved):")
+                st.dataframe(
+                    pd.DataFrame({
+                        "raw": fm.columns[:50],
+                        "human": fm.human_columns(concept_map)[:50],
+                    }),
+                    width='stretch', hide_index=True,
+                )
+
     # ---------------- 3 · describe --------------------------------------
     with tab_desc:
         fm = st.session_state.get("fm")
@@ -647,14 +683,31 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
             st.info("Run an extraction first.")
         else:
             from Custom.context_descriptors import ContextDescriber
+
+            # Build concept map if available (cached after first load)
+            concept_csv = _default_concept_csv(spec["paths"].get("omop", ""))
+            if concept_csv.exists():
+                concept_map = _load_concept_map_cached(str(concept_csv), st)
+                col_labels  = fm.human_columns(concept_map)
+            else:
+                concept_map = {}
+                col_labels  = fm.columns
+            # Map human label -> raw column name for ContextDescriber
+            label_to_raw = dict(zip(col_labels, fm.columns))
+
             dims = st.multiselect(
                 "Slice by",
                 ["split", "density_quartile", "age_band", "sex",
                  "race_concept_id", "ethnicity_concept_id", "care_site_id"],
                 default=["split"])
-            keycols = st.multiselect(
-                "Missingness for columns", fm.columns[:2000], default=[],
-                help="Adds missing_<column> per slice")
+            selected_labels = st.multiselect(
+                "Missingness for columns",
+                col_labels[:2000],
+                default=[],
+                help="Adds a missing_<column> row per slice. "
+                     "Columns shown with OMOP concept names where available.")
+            keycols = [label_to_raw[l] for l in selected_labels]
+
             use_demo = st.checkbox("Join person.csv demographics", value=True)
             if st.button("Describe"):
                 with st.spinner("Describing …"):
@@ -676,6 +729,200 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                            "ContextDescriber.attach_performance() to build the "
                            "(descriptors → performance) dataset.")
 
+    # ---------------- 4 · export ----------------------------------------
+    with tab_exp:
+        fm = st.session_state.get("fm")
+        if fm is None:
+            st.info("Load an extraction first (Extract tab).")
+        else:
+            st.subheader("Export extracted features")
+            st.caption(
+                "Exports per-split sparse feature matrices, metadata, and "
+                "ready-to-use load scripts for survival analysis and "
+                "multimodal pipelines. Join key across modalities: "
+                "**impression_id**.")
+
+            default_out = str(
+                DATA_ROOT / "DATA_PROCESSED" / "exports" /
+                f"{fm.task}_{datetime.datetime.now().strftime('%Y%m%d')}"
+            )
+            export_dir = st.text_input("Output directory", value=default_out)
+
+            concept_csv = _default_concept_csv(spec["paths"].get("omop", ""))
+            use_human = st.checkbox(
+                "Human-readable column names",
+                value=concept_csv.exists(),
+                disabled=not concept_csv.exists(),
+                help="Requires concept.csv in OMOP path (Data sources tab).",
+            )
+
+            drop_zero = st.checkbox(
+                "Drop zero-variance columns",
+                value=True,
+                help="Removes columns that are 0 for every patient — reduces "
+                     "matrix size significantly.",
+            )
+
+            st.markdown("**Outputs generated:**")
+            st.markdown(
+                "- `metadata.csv` — impression_id · patient_id · split · y · tte_days · event  \n"
+                "- `feature_names.csv` — index · raw_name · human_name  \n"
+                "- `{split}/X_sparse.npz` — scipy CSR matrix (one per split)  \n"
+                "- `{split}/y.npy`, `tte.npy`, `event.npy` — aligned arrays  \n"
+                "- `{split}/metadata.csv` — split-level metadata  \n"
+                "- `load_survival.py` — ready-to-run script for lifelines / scikit-survival  \n"
+                "- `load_multimodal.py` — shows how to join EHR features with imaging / NLP by impression_id"
+            )
+
+            if st.button("Export", type="primary"):
+                with st.spinner("Exporting …"):
+                    concept_map = (
+                        _load_concept_map_cached(str(concept_csv), st)
+                        if use_human and concept_csv.exists() else {}
+                    )
+                    msg = _do_export(fm, export_dir, drop_zero, concept_map)
+                st.success(msg)
+                st.code(export_dir)
+
+
+def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict) -> str:
+    """Write split-ready files to export_dir. Returns a summary string."""
+    import scipy.sparse
+    import pandas as pd
+    import numpy as np
+
+    out = Path(export_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ── column names ──────────────────────────────────────────────────────
+    raw_cols   = list(fm.columns)
+    human_cols = (fm.human_columns(concept_map) if concept_map else raw_cols)
+
+    # ── drop zero-variance columns ─────────────────────────────────────
+    X = fm.X.tocsr()
+    if drop_zero:
+        col_sums = np.asarray(X.sum(axis=0)).reshape(-1)
+        keep     = col_sums > 0
+        X          = X[:, keep]
+        raw_cols   = [c for c, k in zip(raw_cols,   keep) if k]
+        human_cols = [c for c, k in zip(human_cols, keep) if k]
+
+    n_dropped = len(fm.columns) - len(raw_cols)
+
+    # ── feature names ────────────────────────────────────────────────────
+    pd.DataFrame({"raw": raw_cols, "human": human_cols}).to_csv(
+        out / "feature_names.csv", index_label="col_index")
+
+    # ── global metadata ──────────────────────────────────────────────────
+    meta = fm.to_frame()   # impression_id, patient_id, split, anchor_time, y[, tte_days, event]
+    meta.to_csv(out / "metadata.csv", index=False)
+
+    # ── per-split arrays ─────────────────────────────────────────────────
+    written_splits = []
+    for split in ("train", "valid", "test"):
+        mask = fm.split == split
+        if not mask.any():
+            continue
+        sd = out / split
+        sd.mkdir(exist_ok=True)
+
+        scipy.sparse.save_npz(str(sd / "X_sparse.npz"), X[mask].tocsr())
+        np.save(sd / "y.npy",     fm.y[mask])
+        if fm.tte is not None:
+            np.save(sd / "tte.npy",   fm.tte[mask])
+            np.save(sd / "event.npy", fm.event[mask])
+        meta[mask].to_csv(sd / "metadata.csv", index=False)
+        written_splits.append(split)
+
+    has_survival = fm.tte is not None
+
+    # ── load_survival.py ─────────────────────────────────────────────────
+    surv_lines = f'''\
+"""
+load_survival.py  —  auto-generated by app_feature_extraction.py
+Load {fm.task} EHR features for survival analysis.
+"""
+import numpy as np
+import scipy.sparse
+import pandas as pd
+
+BASE = "{out}"
+
+def load_split(split):
+    """Return (X, y, tte, event, meta) for one split."""
+    d    = f"{{BASE}}/{{split}}"
+    X    = scipy.sparse.load_npz(f"{{d}}/X_sparse.npz")
+    y    = np.load(f"{{d}}/y.npy")
+    meta = pd.read_csv(f"{{d}}/metadata.csv")
+    {"tte   = np.load(f'{d}/tte.npy')" if has_survival else "tte   = None  # not available for this task"}
+    {"event = np.load(f'{d}/event.npy')" if has_survival else "event = None"}
+    return X, y, tte, event, meta
+
+X_tr, y_tr, tte_tr, ev_tr, meta_tr = load_split("train")
+X_va, y_va, tte_va, ev_va, meta_va = load_split("valid")
+X_te, y_te, tte_te, ev_te, meta_te = load_split("test")
+
+feat = pd.read_csv(f"{{BASE}}/feature_names.csv")
+print(f"train: {{X_tr.shape}},  valid: {{X_va.shape}},  test: {{X_te.shape}}")
+print(f"features: {{len(feat):,}},  label prevalence (train): {{y_tr.mean():.3f}}")
+
+# ── scikit-survival ───────────────────────────────────────────────────────
+# from sksurv.util import Surv
+# from sksurv.ensemble import RandomSurvivalForest
+# y_surv_tr = Surv.from_arrays(event=ev_tr.astype(bool), time=tte_tr)
+# rsf = RandomSurvivalForest().fit(X_tr, y_surv_tr)
+
+# ── lifelines ─────────────────────────────────────────────────────────────
+# from lifelines import CoxPHFitter
+# df = meta_tr.copy()
+# df["tte"] = tte_tr; df["event"] = ev_tr
+# cph = CoxPHFitter().fit(df[["tte","event","y"]], "tte", "event")
+'''
+    (out / "load_survival.py").write_text(surv_lines)
+
+    # ── load_multimodal.py ───────────────────────────────────────────────
+    mm_lines = f'''\
+"""
+load_multimodal.py  —  auto-generated by app_feature_extraction.py
+Join {fm.task} EHR features with imaging / NLP outputs using impression_id.
+"""
+import numpy as np
+import scipy.sparse
+import pandas as pd
+
+BASE = "{out}"
+
+# 1. Load EHR features for one split
+split = "train"
+X_ehr   = scipy.sparse.load_npz(f"{{BASE}}/{{split}}/X_sparse.npz")
+meta    = pd.read_csv(f"{{BASE}}/{{split}}/metadata.csv")
+feat    = pd.read_csv(f"{{BASE}}/feature_names.csv")
+
+# meta["impression_id"] is the join key for imaging and NLP modalities.
+print(meta[["impression_id","patient_id","split","y"]].head())
+
+# 2. Example: join with imaging embeddings
+# imaging_df = pd.read_csv("path/to/image_embeddings.csv")
+# merged = meta.merge(imaging_df, on="impression_id", how="inner")
+# aligned rows in X_ehr correspond to merged.index after the merge —
+# re-index X_ehr to keep alignment:
+# row_idx = meta.index.get_indexer(merged.index)
+# X_ehr_aligned = X_ehr[row_idx]
+
+# 3. Example: concatenate EHR + image embeddings for a joint model
+# import numpy as np
+# X_image = np.load("path/to/image_embeddings.npy")[row_idx]
+# X_joint = scipy.sparse.hstack([X_ehr_aligned,
+#                                 scipy.sparse.csr_matrix(X_image)])
+'''
+    (out / "load_multimodal.py").write_text(mm_lines)
+
+    return (
+        f"✅ Exported {len(raw_cols):,} features "
+        f"({n_dropped:,} zero-variance dropped) · "
+        f"splits: {', '.join(written_splits)} · "
+        f"survival arrays: {'yes' if has_survival else 'no (task not registered)'}"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

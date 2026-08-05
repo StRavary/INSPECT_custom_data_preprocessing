@@ -101,6 +101,7 @@ from __future__ import annotations
 import csv
 import datetime
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -186,6 +187,80 @@ TRUTHY = {"TRUE", "1", "1.0", "YES", "T"}
 SKIP_LABEL_VALUES = {"CENSORED", "CENSOR", "NAN", "NA", "NONE", ""}
 
 
+# ---------------------------------------------------------------------------
+# OMOP concept-name helpers
+# ---------------------------------------------------------------------------
+
+_WINDOW_RE = re.compile(r'(_-?\d+ days(?:, \d+:\d+:\d+)?)\s*$')
+
+
+def load_concept_map(concept_csv) -> dict:
+    """Build {VOCAB/concept_code: concept_name} from OMOP concept.csv.
+
+    Uses pandas for speed on the large (~5-8 M row) file; falls back to
+    csv.DictReader if pandas is absent.
+    """
+    p = Path(concept_csv)
+    try:
+        import pandas as pd
+        df = pd.read_csv(p, usecols=["vocabulary_id", "concept_code", "concept_name"],
+                         dtype=str, low_memory=False)
+        df["key"] = df["vocabulary_id"] + "/" + df["concept_code"]
+        return dict(zip(df["key"], df["concept_name"]))
+    except ImportError:
+        lookup: dict[str, str] = {}
+        with open(p, newline="") as f:
+            for row in csv.DictReader(f):
+                lookup[f"{row['vocabulary_id']}/{row['concept_code']}"] = row["concept_name"]
+        return lookup
+
+
+def _readable_window(window_str: str) -> str:
+    """'_18000 days, 0:00:00' -> '_whole_history',  '_30 days, 0:00:00' -> '_30d'."""
+    m = re.match(r"_(\d+) days", window_str)
+    if not m:
+        return window_str
+    days = int(m.group(1))
+    if days >= CATCH_ALL_DAYS:
+        return "_whole_history"
+    if days >= 365 and days % 365 == 0:
+        return f"_{days // 365}y"
+    return f"_{days}d"
+
+
+def humanize_column(col: str, concept_map: dict) -> str:
+    """Replace raw OMOP codes in a column name with human-readable concept names.
+
+    Example:
+        'diag:CPT4/1003343_18000 days, 0:00:00'
+        -> 'diag:Acute pulmonary embolism [CPT4/1003343]_whole_history'
+    Falls back gracefully for any code not in the map.
+    """
+    if ":" not in col:
+        return col  # "age"
+
+    group, rest = col.split(":", 1)
+
+    m = _WINDOW_RE.search(rest)
+    if m:
+        code_part   = rest[: m.start()]
+        window_part = _readable_window(m.group(1))
+    else:
+        code_part   = rest
+        window_part = ""
+
+    # code_part may carry a value or bucket suffix:
+    #   "CPT4/1003343"  |  "LOINC/718-7 some_val"  |  "SNOMED/73211009 [0, 5)"
+    base_code, *tail = code_part.split(" ", 1)
+    suffix = f" {tail[0]}" if tail else ""
+
+    name = concept_map.get(base_code)
+    if name:
+        return f"{group}:{name}{suffix} [{base_code}]{window_part}"
+    # code not in map — still shorten the window label
+    return f"{group}:{code_part}{window_part}"
+
+
 # --------------------------------------------------------------------------
 # Feature groups
 # --------------------------------------------------------------------------
@@ -255,6 +330,14 @@ class FeatureMatrix:
             d["tte_days"] = self.tte
             d["event"] = self.event
         return pd.DataFrame(d)
+
+    def human_columns(self, concept_map: dict) -> list[str]:
+        """Column names with OMOP concept names resolved.
+
+        Pass the dict returned by load_concept_map(). Falls back to the
+        original name (with window label shortened) for any code not found.
+        """
+        return [humanize_column(c, concept_map) for c in self.columns]
 
     def describe(self) -> str:
         lines = [
@@ -411,11 +494,18 @@ class TemporalFeatureExtractor:
         self._log("preprocessing featurizers ...")
         flist.preprocess_featurizers(str(self.database_path), labeled, self.num_threads)
         self._log("featurizing ...")
-        X, y, pids, times = flist.featurize(str(self.database_path), labeled, self.num_threads)
+        X, y_raw, pids, times = flist.featurize(str(self.database_path), labeled, self.num_threads)
 
         pids = np.asarray(pids).reshape(-1)
         times = np.asarray(times).reshape(-1)
-        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        # FEMR may return Label objects rather than scalar values; extract .value explicitly.
+        try:
+            y = np.asarray(
+                [float(l.value) if hasattr(l, "value") else float(l) for l in y_raw],
+                dtype=np.float32,
+            )
+        except (AttributeError, TypeError):
+            y = np.asarray(y_raw, dtype=np.float32).reshape(-1)
 
         imp, spl = [], []
         for p, t in zip(pids, times):
