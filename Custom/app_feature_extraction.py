@@ -538,92 +538,12 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
             st.error("Fix the required data sources in tab 0 first.")
 
         else:
-            # ── a subprocess is already running for this spec ─────────────
-            proc_info = st.session_state.get(proc_key)  # (pid, out_path)
-            if proc_info is not None:
-                pid, out_str = proc_info
-
-                # Output file existing is the definitive completion signal —
-                # check it before the pid, which can be a zombie or reused.
-                if Path(out_str).exists():
-                    st.success("✅ Extraction finished!")
-                    with open(out_str, "rb") as _f:
-                        st.session_state["fm"] = pickle.load(_f)
-                    st.session_state.pop(proc_key)
-                    st.rerun()
-
-                # Output file absent — check whether the process is still alive.
-                try:
-                    os.kill(pid, 0)
-                    still_running = True
-                except OSError:
-                    still_running = False
-
-                log_text = log_path.read_text() if log_path.exists() else "(waiting for output…)"
-                st.subheader("Extraction log")
-                st.code(log_text, language=None)
-
-                if still_running:
-                    st.info(f"⏳ Extraction running (PID {pid}) — page refreshes every 5 s …")
-                    time.sleep(5)
-                    st.rerun()
-                else:
-                    st.error("❌ Extraction failed — check the log above.")
-                    st.session_state.pop(proc_key)
-
-            # ── cached result already on disk ─────────────────────────────
-            elif pkl_path.exists():
-                size_mb = pkl_path.stat().st_size / 1e6
-                st.success(f"✅ Cached result on disk ({size_mb:.0f} MB) — "
-                           f"spec hash `{h}`")
-                c1, c2 = st.columns(2)
-                if c1.button("Load", type="primary"):
-                    with st.spinner("Loading …"):
-                        with open(pkl_path, "rb") as _f:
-                            st.session_state["fm"] = pickle.load(_f)
-                    st.rerun()
-                if c2.button("Re-run (overwrite cache)"):
-                    pkl_path.unlink(missing_ok=True)
-                    log_path.unlink(missing_ok=True)
-                    st.rerun()
-
-            # ── nothing running, nothing cached ───────────────────────────
-            else:
-                st.info(
-                    "Extraction runs FEMR preprocess + featurize over ~22k studies. "
-                    "Expect **15 – 60 minutes** depending on group config. "
-                    "The result is saved to disk so lab-mates can load it without re-running."
-                )
-
-                num_threads = st.slider(
-                    "Worker threads", min_value=1, max_value=16, value=4,
-                    help="Higher = faster, but uses more CPU/RAM. "
-                         "4 is a safe default on shared machines.")
-
-                if st.button("🚀 Run extraction", type="primary"):
-                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    _cache_spec(spec).write_text(json.dumps(spec, sort_keys=True))
-
-                    log_fh = open(log_path, "w")
-                    proc = subprocess.Popen(
-                        [sys.executable, str(WORKER_SCRIPT),
-                         str(_cache_spec(spec)), str(pkl_path),
-                         str(num_threads)],
-                        stdout=log_fh,
-                        stderr=subprocess.STDOUT,
-                        close_fds=True,
-                    )
-                    log_fh.close()   # child inherits the fd; parent can close its copy
-                    st.session_state[proc_key] = (proc.pid, str(pkl_path))
-                    st.rerun()
-
-            # ── previously computed results ───────────────────────────────
+            # ── 1. saved extractions (primary action — always shown first) ─
             cached_list = _list_cached()
             if cached_list:
-                st.divider()
-                st.subheader("Previously computed")
-                st.caption("Any result saved on this machine — share the path "
-                           "with lab-mates so they can load without re-running.")
+                st.subheader("Saved extractions")
+                st.caption("Click Load to use an existing extraction instantly — "
+                           "no need to re-configure or re-run.")
                 for chash, cpath in cached_list:
                     spec_file = CACHE_DIR / f"{chash}_spec.json"
                     label = chash
@@ -644,7 +564,7 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                         f"{label}  \n"
                         f"<small>`{chash}` · {size_mb:.0f} MB · {mtime}</small>",
                         unsafe_allow_html=True)
-                    if col2.button("Load", key=f"load_{chash}"):
+                    if col2.button("Load", key=f"load_{chash}", type="primary"):
                         with st.spinner("Loading …"):
                             with open(cpath, "rb") as _f:
                                 st.session_state["fm"] = pickle.load(_f)
@@ -655,6 +575,75 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                         if st.session_state.get("fm") is not None and \
                                 getattr(st.session_state["fm"], "_cache_hash", None) == chash:
                             del st.session_state["fm"]
+                        st.rerun()
+                st.divider()
+
+            # ── 2. run new extraction ──────────────────────────────────────
+            with st.expander("Run new extraction", expanded=not cached_list):
+                proc_info = st.session_state.get(proc_key)  # (pid, out_path)
+                if proc_info is not None:
+                    pid, out_str = proc_info
+
+                    if Path(out_str).exists():
+                        st.success("✅ Extraction finished!")
+                        with open(out_str, "rb") as _f:
+                            st.session_state["fm"] = pickle.load(_f)
+                        st.session_state.pop(proc_key)
+                        st.rerun()
+
+                    try:
+                        os.kill(pid, 0)
+                        still_running = True
+                    except OSError:
+                        still_running = False
+
+                    log_text = log_path.read_text() if log_path.exists() else "(waiting…)"
+                    st.code(log_text, language=None)
+
+                    if still_running:
+                        st.info(f"⏳ Running (PID {pid}) — refreshes every 5 s …")
+                        time.sleep(5)
+                        st.rerun()
+                    else:
+                        st.error("❌ Extraction failed — check log above.")
+                        st.session_state.pop(proc_key)
+
+                elif pkl_path.exists():
+                    size_mb = pkl_path.stat().st_size / 1e6
+                    st.success(f"✅ Result for this spec on disk ({size_mb:.0f} MB)")
+                    c1, c2 = st.columns(2)
+                    if c1.button("Load", type="primary"):
+                        with st.spinner("Loading …"):
+                            with open(pkl_path, "rb") as _f:
+                                st.session_state["fm"] = pickle.load(_f)
+                        st.rerun()
+                    if c2.button("Re-run (overwrite)"):
+                        pkl_path.unlink(missing_ok=True)
+                        log_path.unlink(missing_ok=True)
+                        st.rerun()
+
+                else:
+                    st.info(
+                        "Extraction runs FEMR preprocess + featurize over ~22k studies. "
+                        "Expect **15–60 minutes** depending on group config."
+                    )
+                    num_threads = st.slider(
+                        "Worker threads", min_value=1, max_value=16, value=4,
+                        help="4 is a safe default on shared machines.")
+                    if st.button("🚀 Run extraction", type="primary"):
+                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                        _cache_spec(spec).write_text(json.dumps(spec, sort_keys=True))
+                        log_fh = open(log_path, "w")
+                        proc = subprocess.Popen(
+                            [sys.executable, str(WORKER_SCRIPT),
+                             str(_cache_spec(spec)), str(pkl_path),
+                             str(num_threads)],
+                            stdout=log_fh,
+                            stderr=subprocess.STDOUT,
+                            close_fds=True,
+                        )
+                        log_fh.close()
+                        st.session_state[proc_key] = (proc.pid, str(pkl_path))
                         st.rerun()
 
         # ── result panel (shared by all paths above) ──────────────────────
@@ -683,78 +672,158 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                     width='stretch', hide_index=True,
                 )
 
-    # ---------------- 3 · describe --------------------------------------
+    # ---------------- 3 · cohort builder -----------------------------------
     with tab_desc:
         fm = st.session_state.get("fm")
         if fm is None:
-            st.info("Run an extraction first.")
+            st.info("Load an extraction first (Extract tab).")
         else:
-            from Custom.context_descriptors import ContextDescriber
+            import pandas as pd
+            from Custom.context_descriptors import (
+                ContextDescriber, GENDER, AGE_BANDS, _age_band,
+            )
 
-            # Build concept map if available (cached after first load)
-            concept_csv = _default_concept_csv(spec["paths"].get("omop", ""))
-            if concept_csv.exists():
-                concept_map = _load_concept_map_cached(str(concept_csv), st)
-                col_labels  = fm.human_columns(concept_map)
+            # ── build base case table (one row per study) ─────────────────
+            @st.cache_data(show_spinner="Building case table …")
+            def _build_case_table(fm_task, fm_anchor):
+                """Cached on task+anchor — rebuilds only when fm changes."""
+                _fm = st.session_state["fm"]
+                base = _fm.to_frame()   # impression_id, patient_id, split, anchor_time, y
+                if _fm.tte is not None:
+                    pass  # tte_days / event already in to_frame()
+
+                # demographics
+                person_path = spec["paths"].get("person", "")
+                if person_path and Path(person_path).is_file():
+                    wanted = set(int(p) for p in _fm.patient_ids)
+                    demo_rows = {}
+                    with open(person_path) as _f:
+                        for row in __import__("csv").DictReader(_f):
+                            try:
+                                pid = int(row["person_id"])
+                            except (KeyError, ValueError):
+                                continue
+                            if pid not in wanted:
+                                continue
+                            birth = row.get("birth_DATETIME") or row.get("year_of_birth", "")
+                            try:
+                                bd = (datetime.datetime.fromisoformat(str(birth))
+                                      if "-" in str(birth)
+                                      else datetime.datetime(int(birth), 7, 1))
+                            except Exception:
+                                bd = None
+                            demo_rows[pid] = {
+                                "sex": GENDER.get(
+                                    str(row.get("gender_concept_id", "")).strip(),
+                                    "other/unknown"),
+                                "birth": bd,
+                                "care_site_id": str(row.get("care_site_id", "")).strip(),
+                            }
+                    base["sex"] = [
+                        demo_rows.get(int(p), {}).get("sex", "unknown")
+                        for p in _fm.patient_ids
+                    ]
+                    base["care_site_id"] = [
+                        demo_rows.get(int(p), {}).get("care_site_id", "")
+                        for p in _fm.patient_ids
+                    ]
+                    ages = []
+                    for p, t in zip(_fm.patient_ids, _fm.anchor_times):
+                        bd = demo_rows.get(int(p), {}).get("birth")
+                        try:
+                            tt = (t if isinstance(t, datetime.datetime)
+                                  else datetime.datetime.fromisoformat(str(t)))
+                            ages.append(round((tt - bd).days / 365.25, 1))
+                        except Exception:
+                            ages.append(float("nan"))
+                    base["age_years"] = ages
+                    base["age_band"]  = [
+                        _age_band(a) if not __import__("math").isnan(a) else "unknown"
+                        for a in ages
+                    ]
+                return base
+
+            base = _build_case_table(fm.task, fm.anchor_kind)
+
+            # ── filters ───────────────────────────────────────────────────
+            st.subheader("Filters")
+            fc = st.columns(3)
+
+            sel_label = fc[0].multiselect(
+                "Label", ["Positive (y=1)", "Negative (y=0)"],
+                default=["Positive (y=1)", "Negative (y=0)"])
+
+            if "tte_days" in base.columns:
+                sel_event = fc[1].multiselect(
+                    "Survival event", ["Event observed", "Censored", "Unknown"],
+                    default=["Event observed", "Censored", "Unknown"])
             else:
-                concept_map = {}
-                col_labels  = fm.columns
-            # Map human label -> raw column name for ContextDescriber
-            label_to_raw = dict(zip(col_labels, fm.columns))
+                sel_event = []
 
-            dims = st.multiselect(
-                "Slice by",
-                ["split", "density_quartile", "age_band", "sex",
-                 "race_concept_id", "ethnicity_concept_id", "care_site_id"],
-                default=["split"])
-            selected_labels = st.multiselect(
-                "Missingness for columns",
-                col_labels[:2000],
-                default=[],
-                help="Adds a missing_<column> row per slice. "
-                     "Columns shown with OMOP concept names where available.")
-            keycols = [label_to_raw[l] for l in selected_labels]
+            if "sex" in base.columns:
+                all_sex = sorted(base["sex"].unique().tolist())
+                sel_sex = fc[2].multiselect("Sex", all_sex, default=all_sex)
+            else:
+                sel_sex = []
 
-            use_demo = st.checkbox("Join person.csv demographics", value=True)
-            if st.button("Describe"):
-                with st.spinner("Describing …"):
-                    demo = (st.session_state.get("path_person")
-                            if use_demo else None)
-                    cd = ContextDescriber(fm, demographics=demo,
-                                          key_columns=keycols, verbose=False)
-                    table = cd.describe(by=dims or ["split"])
-                st.session_state["desc"] = table
+            if "age_band" in base.columns:
+                all_bands = [f"{lo}-{hi}" if hi < 200 else f"{lo}+"
+                             for lo, hi in AGE_BANDS]
+                all_bands = [b for b in all_bands
+                             if b in base["age_band"].unique().tolist()]
+                sel_bands = st.multiselect("Age band", all_bands, default=all_bands)
+            else:
+                sel_bands = []
 
-            table = st.session_state.get("desc")
-            if table is not None:
-                st.dataframe(table, width='stretch')
-                buf = io.StringIO(); table.to_csv(buf, index=False)
-                st.download_button("Download descriptors .csv", buf.getvalue(),
-                                   file_name=f"descriptors_{task}.csv",
-                                   mime="text/csv")
-                st.caption("Attach per-slice performance with "
-                           "ContextDescriber.attach_performance() to build the "
-                           "(descriptors → performance) dataset.")
+            # ── apply filters ─────────────────────────────────────────────
+            mask = pd.Series(True, index=base.index)
+            if "Positive (y=1)" not in sel_label:
+                mask &= base["y"] != 1
+            if "Negative (y=0)" not in sel_label:
+                mask &= base["y"] != 0
+            if sel_sex:
+                mask &= base["sex"].isin(sel_sex)
+            if sel_bands:
+                mask &= base["age_band"].isin(sel_bands)
+            if "tte_days" in base.columns and sel_event:
+                ev_mask = pd.Series(False, index=base.index)
+                if "Event observed" in sel_event:
+                    ev_mask |= base["event"] == 1
+                if "Censored" in sel_event:
+                    ev_mask |= base["event"] == 0
+                if "Unknown" in sel_event:
+                    ev_mask |= base["event"].isna()
+                mask &= ev_mask
 
+            filtered = base[mask].reset_index(drop=True)
+
+            # ── active cohort summary ─────────────────────────────────────
             st.divider()
-            st.subheader("Patient-level table")
-            st.caption(
-                "One row per patient. Columns: n_studies, ever_positive, "
-                "n_positive, tte_days, event_observed, and demographics if loaded.")
-            if st.button("Generate patient table"):
-                with st.spinner("Building …"):
-                    demo = st.session_state.get("path_person") if use_demo else None
-                    cd   = ContextDescriber(fm, demographics=demo, verbose=False)
-                    pt   = cd.patient_table()
-                st.session_state["patient_table"] = pt
+            n_st  = len(filtered)
+            n_pt  = filtered["patient_id"].nunique()
+            ev_rt = filtered["y"].mean() if n_st else float("nan")
 
-            pt = st.session_state.get("patient_table")
-            if pt is not None:
-                st.dataframe(pt, width='stretch')
-                buf = io.StringIO(); pt.to_csv(buf, index=False)
-                st.download_button(
-                    "Download patient table .csv", buf.getvalue(),
-                    file_name=f"patients_{task}.csv", mime="text/csv")
+            mc = st.columns(3)
+            mc[0].metric("Studies", f"{n_st:,}", delta=f"{n_st - len(base):,} from filters" if n_st != len(base) else None)
+            mc[1].metric("Patients", f"{n_pt:,}")
+            mc[2].metric("Event rate", f"{ev_rt:.3f}" if n_st else "—")
+
+            # ── export ────────────────────────────────────────────────────
+            buf = io.StringIO()
+            filtered.to_csv(buf, index=False)
+            st.download_button(
+                "⬇️ Export cohort CSV",
+                buf.getvalue(),
+                file_name=f"cohort_{fm.task}.csv",
+                mime="text/csv",
+                help="Exports metadata for filtered studies. "
+                     "Use impression_id to join with imaging / NLP data.",
+            )
+
+            # ── case table ────────────────────────────────────────────────
+            st.divider()
+            st.subheader(f"Cases ({n_st:,} studies)")
+            st.dataframe(filtered, width="stretch", hide_index=True)
 
     # ---------------- 4 · export ----------------------------------------
     with tab_exp:
