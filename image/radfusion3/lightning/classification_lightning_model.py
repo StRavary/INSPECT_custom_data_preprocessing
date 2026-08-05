@@ -35,9 +35,17 @@ class ClassificationLightningModel(LightningModule):
         self.not_test_cases = []
 
     def configure_optimizers(self):
+        import torch
         optimizer = builder.build_optimizer(self.cfg, self.model)
-        # scheduler = builder.build_scheduler(self.cfg, optimizer)
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.cfg.trainer.max_epochs,
+            eta_min=1e-6,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch, "train")
