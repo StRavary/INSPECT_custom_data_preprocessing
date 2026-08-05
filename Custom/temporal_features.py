@@ -349,9 +349,15 @@ class FeatureMatrix:
             if n:
                 lines.append(f"  {s:<6} {n:>7,}  prevalence {self.y[self.split == s].mean():.4f}")
         if self.tte is not None:
-            lines.append(f"  events observed  : {int(self.event.sum()):,} "
-                         f"({self.event.mean():.1%});  median tte "
-                         f"{np.median(self.tte):.1f} d")
+            n_obs = int(np.nansum(self.event))
+            pct   = np.nanmean(self.event)
+            med   = np.nanmedian(self.tte)
+            n_nan = int(np.isnan(self.tte).sum())
+            lines.append(f"  events observed  : {n_obs:,} ({pct:.1%});  "
+                         f"median tte {med:.1f} d")
+            if n_nan:
+                lines.append(f"  WARNING: {n_nan:,} rows missing survival entry "
+                             f"(impression_id not matched in labels)")
         for g in self.groups:
             lines.append(f"  group '{g.name}': {[t.days for t in g.timedeltas()]} day windows")
         return "\n".join(lines)
@@ -494,11 +500,13 @@ class TemporalFeatureExtractor:
         self._log("preprocessing featurizers ...")
         flist.preprocess_featurizers(str(self.database_path), labeled, self.num_threads)
         self._log("featurizing ...")
-        X, y_raw, pids, times = flist.featurize(str(self.database_path), labeled, self.num_threads)
+        # FEMR return order: (feature_matrix, patient_ids, label_values, label_times)
+        # Confirmed in ehr/2_generate_labels_and_features.py and x_generate_binned_features.py
+        X, pids, y_raw, times = flist.featurize(str(self.database_path), labeled, self.num_threads)
 
         pids = np.asarray(pids).reshape(-1)
         times = np.asarray(times).reshape(-1)
-        # FEMR may return Label objects rather than scalar values; extract .value explicitly.
+        # label_values may be Label objects; extract .value explicitly if so.
         try:
             y = np.asarray(
                 [float(l.value) if hasattr(l, "value") else float(l) for l in y_raw],
@@ -507,13 +515,40 @@ class TemporalFeatureExtractor:
         except (AttributeError, TypeError):
             y = np.asarray(y_raw, dtype=np.float32).reshape(-1)
 
+        def _to_dt(t) -> datetime.datetime:
+            """Normalise whatever FEMR returns to a tz-naive datetime truncated to seconds."""
+            if hasattr(t, "item"):          # numpy datetime64
+                t = t.item()
+            if isinstance(t, datetime.datetime):
+                return t.replace(microsecond=0, tzinfo=None)
+            if isinstance(t, datetime.date):
+                return datetime.datetime(t.year, t.month, t.day)
+            # fallback: try pandas Timestamp
+            try:
+                import pandas as pd
+                return pd.Timestamp(t).to_pydatetime().replace(microsecond=0, tzinfo=None)
+            except Exception:
+                return t
+
+        # Rebuild meta with normalised keys so the lookup is robust to
+        # sub-second precision differences between cohort CSV and FEMR output.
+        meta_norm = {
+            (pid, _to_dt(t).replace(microsecond=0, tzinfo=None)): v
+            for (pid, t), v in meta.items()
+        }
+
         imp, spl = [], []
         for p, t in zip(pids, times):
-            tt = t.item() if hasattr(t, "item") else t
-            i_s = meta.get((int(p), tt), ("", ""))[:2]
+            key = (int(p), _to_dt(t))
+            i_s = meta_norm.get(key, ("", ""))[:2]
             imp.append(i_s[0]); spl.append(i_s[1])
         imp = np.array(imp, dtype=object)
         spl = np.array(spl, dtype=object)
+
+        n_missing_imp = int((imp == "").sum())
+        if n_missing_imp:
+            self._log(f"  WARNING: {n_missing_imp:,} rows could not be matched "
+                      f"back to impression_id (datetime precision mismatch?)")
 
         surv = self._read_survival(task)
         tte = ev = None

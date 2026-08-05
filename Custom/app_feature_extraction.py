@@ -639,7 +639,7 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                     size_mb = cpath.stat().st_size / 1e6
                     mtime   = datetime.datetime.fromtimestamp(
                         cpath.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                    col1, col2 = st.columns([5, 1])
+                    col1, col2, col3 = st.columns([5, 1, 1])
                     col1.markdown(
                         f"{label}  \n"
                         f"<small>`{chash}` · {size_mb:.0f} MB · {mtime}</small>",
@@ -648,6 +648,13 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                         with st.spinner("Loading …"):
                             with open(cpath, "rb") as _f:
                                 st.session_state["fm"] = pickle.load(_f)
+                        st.rerun()
+                    if col3.button("🗑️", key=f"del_{chash}", help="Delete this cache entry"):
+                        for suffix in (".pkl", ".log", "_spec.json"):
+                            (CACHE_DIR / f"{chash}{suffix}").unlink(missing_ok=True)
+                        if st.session_state.get("fm") is not None and \
+                                getattr(st.session_state["fm"], "_cache_hash", None) == chash:
+                            del st.session_state["fm"]
                         st.rerun()
 
         # ── result panel (shared by all paths above) ──────────────────────
@@ -728,6 +735,26 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                 st.caption("Attach per-slice performance with "
                            "ContextDescriber.attach_performance() to build the "
                            "(descriptors → performance) dataset.")
+
+            st.divider()
+            st.subheader("Patient-level table")
+            st.caption(
+                "One row per patient. Columns: n_studies, ever_positive, "
+                "n_positive, tte_days, event_observed, and demographics if loaded.")
+            if st.button("Generate patient table"):
+                with st.spinner("Building …"):
+                    demo = st.session_state.get("path_person") if use_demo else None
+                    cd   = ContextDescriber(fm, demographics=demo, verbose=False)
+                    pt   = cd.patient_table()
+                st.session_state["patient_table"] = pt
+
+            pt = st.session_state.get("patient_table")
+            if pt is not None:
+                st.dataframe(pt, width='stretch')
+                buf = io.StringIO(); pt.to_csv(buf, index=False)
+                st.download_button(
+                    "Download patient table .csv", buf.getvalue(),
+                    file_name=f"patients_{task}.csv", mime="text/csv")
 
     # ---------------- 4 · export ----------------------------------------
     with tab_exp:

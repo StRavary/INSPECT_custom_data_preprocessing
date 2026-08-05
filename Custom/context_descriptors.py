@@ -199,14 +199,13 @@ class ContextDescriber:
         pids = fm.patient_ids[idx]
 
         d = {
-            "n_studies": int(idx.size),
-            "n_patients": int(len(set(pids.tolist()))),
-            "studies_per_patient": float(idx.size / max(len(set(pids.tolist())), 1)),
-            "event_rate": float(y.mean()) if idx.size else np.nan,
-            "n_positive": int(y.sum()),
-            "mean_distinct_codes": float(nnz.mean()) if idx.size else np.nan,
-            "median_distinct_codes": float(np.median(nnz)) if idx.size else np.nan,
-            "mean_total_count": float(total.mean()) if idx.size else np.nan,
+            "n_studies":                int(idx.size),
+            "n_patients":               int(len(set(pids.tolist()))),
+            "event_rate":               float(y.mean())         if idx.size else np.nan,
+            "n_positive":               int(y.sum()),
+            "mean_distinct_codes":      float(nnz.mean())       if idx.size else np.nan,
+            "median_distinct_codes":    float(np.median(nnz))   if idx.size else np.nan,
+            "mean_total_count":         float(total.mean())     if idx.size else np.nan,
         }
 
         if fm.tte is not None:
@@ -305,6 +304,58 @@ class ContextDescriber:
         self._log(f"described {len(df)} slice(s) across "
                   f"{df['slice_dim'].nunique() if len(df) else 0} dimension(s)")
         return df
+
+    def patient_table(self) -> "pd.DataFrame":
+        """One row per patient, event status as columns.
+
+        Columns:
+            patient_id, n_studies, split,
+            n_positive  (studies where y=1),
+            ever_positive (1 if any study was positive),
+            tte_days, event_observed  (from survival data, if available),
+            sex, age_years, care_site_id  (if demographics loaded)
+        """
+        import pandas as pd
+        from collections import defaultdict
+
+        fm   = self.fm
+        ages = self.ages()
+        buckets: dict = defaultdict(list)
+        for i, pid in enumerate(fm.patient_ids.tolist()):
+            buckets[int(pid)].append(i)
+
+        rows = []
+        for pid, indices in sorted(buckets.items()):
+            idx = np.array(indices)
+            y   = fm.y[idx]
+
+            splits = fm.split[idx].tolist()
+            split  = splits[0] if len(set(splits)) == 1 else "mixed"
+
+            row: dict = {
+                "patient_id":    pid,
+                "n_studies":     len(idx),
+                "split":         split,
+                "n_positive":    int(y.sum()),
+                "ever_positive": int(y.any()),
+            }
+
+            if fm.tte is not None:
+                tte = fm.tte[idx]
+                ev  = fm.event[idx]
+                ok  = ~np.isnan(tte)
+                row["tte_days"]        = float(np.nanmin(tte)) if ok.any() else np.nan
+                row["event_observed"]  = int(np.nanmax(ev[ok])) if ok.any() else np.nan
+
+            if self._demo:
+                demo = self._demo.get(pid, {})
+                row["sex"]          = demo.get("sex", "unknown")
+                row["age_years"]    = float(np.nanmean(ages[idx]))
+                row["care_site_id"] = demo.get("care_site_id", "")
+
+            rows.append(row)
+
+        return pd.DataFrame(rows).reset_index(drop=True)
 
     @staticmethod
     def attach_performance(table, metrics: Mapping[str, float],
