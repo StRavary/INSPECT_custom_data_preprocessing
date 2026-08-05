@@ -26,9 +26,14 @@ Python API without the UI.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import json
+import os
+import pickle
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -270,6 +275,44 @@ def describe_anchor(task: str, anchor: str = "auto") -> str:
     return "StudyTime  (prognostic: label is a future event)"
 
 
+# ---------------------------------------------------------------------------
+# Disk cache helpers
+# ---------------------------------------------------------------------------
+
+CACHE_DIR    = DATA_ROOT / "DATA_PROCESSED" / "femr_cache"
+WORKER_SCRIPT = SCRIPT_DIR / "_femr_worker.py"
+
+
+def _spec_hash(spec: dict) -> str:
+    """Short, stable hash of the extraction spec (task + groups + paths)."""
+    return hashlib.md5(
+        json.dumps(spec, sort_keys=True).encode()
+    ).hexdigest()[:12]
+
+
+def _cache_pkl(spec: dict) -> Path:
+    return CACHE_DIR / f"{_spec_hash(spec)}.pkl"
+
+
+def _cache_log(spec: dict) -> Path:
+    return CACHE_DIR / f"{_spec_hash(spec)}.log"
+
+
+def _cache_spec(spec: dict) -> Path:
+    return CACHE_DIR / f"{_spec_hash(spec)}_spec.json"
+
+
+def _list_cached() -> list[tuple[str, Path]]:
+    """Return [(spec_hash, pkl_path)] for every finished extraction."""
+    if not CACHE_DIR.exists():
+        return []
+    return sorted(
+        [(p.stem, p) for p in CACHE_DIR.glob("*.pkl")],
+        key=lambda x: x[1].stat().st_mtime,
+        reverse=True,
+    )
+
+
 def spec_to_yaml(spec: dict) -> str:
     """Emit a reproducible spec plus the equivalent Python call."""
     lines = ["# INSPECT feature extraction spec",
@@ -452,22 +495,132 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
 
     # ---------------- 2 · extract ---------------------------------------
     with tab_run:
+        h        = _spec_hash(spec)
+        pkl_path = _cache_pkl(spec)
+        log_path = _cache_log(spec)
+        proc_key = f"proc_{h}"      # session-state key for the running subprocess
+
+        # ── guard: config errors or missing data ─────────────────────────
         if any(l == "error" for l, _ in msgs):
             st.error("Fix the errors in Configure first.")
-        else:
-            st.info("Extraction runs FEMR preprocess + featurize over ~22k "
-                    "studies. Expect minutes, not seconds. The result is cached "
-                    "for this spec.")
-            if not all(validate_source(k, spec["paths"][k])[0]
-                       for k in ("cohort", "database")):
-                st.error("Fix the required data sources in tab 0 first.")
-            elif st.button("Run extraction", type="primary"):
-                with st.spinner("Extracting …"):
-                    st.session_state["fm"] = _run_extraction(spec)
-                st.success("Done.")
+        elif not all(validate_source(k, spec["paths"][k])[0]
+                     for k in ("cohort", "database")):
+            st.error("Fix the required data sources in tab 0 first.")
 
+        else:
+            # ── a subprocess is already running for this spec ─────────────
+            proc_info = st.session_state.get(proc_key)  # (pid, out_path)
+            if proc_info is not None:
+                pid, out_str = proc_info
+                try:
+                    os.kill(pid, 0)
+                    still_running = True
+                except OSError:
+                    still_running = False
+
+                log_text = log_path.read_text() if log_path.exists() else "(waiting for output…)"
+                st.subheader("Extraction log")
+                st.code(log_text, language=None)
+
+                if still_running:
+                    st.info(f"⏳ Extraction running (PID {pid}) — page refreshes every 5 s …")
+                    time.sleep(5)
+                    st.rerun()
+                else:
+                    # process exited — check for output
+                    if Path(out_str).exists():
+                        st.success("✅ Extraction finished!")
+                        with open(out_str, "rb") as _f:
+                            st.session_state["fm"] = pickle.load(_f)
+                        st.session_state.pop(proc_key)
+                        st.rerun()
+                    else:
+                        st.error("❌ Extraction failed — check the log above.")
+                        st.session_state.pop(proc_key)
+
+            # ── cached result already on disk ─────────────────────────────
+            elif pkl_path.exists():
+                size_mb = pkl_path.stat().st_size / 1e6
+                st.success(f"✅ Cached result on disk ({size_mb:.0f} MB) — "
+                           f"spec hash `{h}`")
+                c1, c2 = st.columns(2)
+                if c1.button("Load", type="primary"):
+                    with st.spinner("Loading …"):
+                        with open(pkl_path, "rb") as _f:
+                            st.session_state["fm"] = pickle.load(_f)
+                    st.rerun()
+                if c2.button("Re-run (overwrite cache)"):
+                    pkl_path.unlink(missing_ok=True)
+                    log_path.unlink(missing_ok=True)
+                    st.rerun()
+
+            # ── nothing running, nothing cached ───────────────────────────
+            else:
+                st.info(
+                    "Extraction runs FEMR preprocess + featurize over ~22k studies. "
+                    "Expect **15 – 60 minutes** depending on group config. "
+                    "The result is saved to disk so lab-mates can load it without re-running."
+                )
+
+                num_threads = st.slider(
+                    "Worker threads", min_value=1, max_value=16, value=4,
+                    help="Higher = faster, but uses more CPU/RAM. "
+                         "4 is a safe default on shared machines.")
+
+                if st.button("🚀 Run extraction", type="primary"):
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    _cache_spec(spec).write_text(json.dumps(spec, sort_keys=True))
+
+                    log_fh = open(log_path, "w")
+                    proc = subprocess.Popen(
+                        [sys.executable, str(WORKER_SCRIPT),
+                         str(_cache_spec(spec)), str(pkl_path),
+                         str(num_threads)],
+                        stdout=log_fh,
+                        stderr=subprocess.STDOUT,
+                        close_fds=True,
+                    )
+                    log_fh.close()   # child inherits the fd; parent can close its copy
+                    st.session_state[proc_key] = (proc.pid, str(pkl_path))
+                    st.rerun()
+
+            # ── previously computed results ───────────────────────────────
+            cached_list = _list_cached()
+            if cached_list:
+                st.divider()
+                st.subheader("Previously computed")
+                st.caption("Any result saved on this machine — share the path "
+                           "with lab-mates so they can load without re-running.")
+                for chash, cpath in cached_list:
+                    spec_file = CACHE_DIR / f"{chash}_spec.json"
+                    label = chash
+                    if spec_file.exists():
+                        try:
+                            s = json.loads(spec_file.read_text())
+                            label = (f"**{s.get('task')}** · "
+                                     + ", ".join(
+                                         f"{n}={g.get('bins')}"
+                                         for n, g in s.get("groups", {}).items()))
+                        except Exception:
+                            pass
+                    size_mb = cpath.stat().st_size / 1e6
+                    mtime   = datetime.datetime.fromtimestamp(
+                        cpath.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    col1, col2 = st.columns([5, 1])
+                    col1.markdown(
+                        f"{label}  \n"
+                        f"<small>`{chash}` · {size_mb:.0f} MB · {mtime}</small>",
+                        unsafe_allow_html=True)
+                    if col2.button("Load", key=f"load_{chash}"):
+                        with st.spinner("Loading …"):
+                            with open(cpath, "rb") as _f:
+                                st.session_state["fm"] = pickle.load(_f)
+                        st.rerun()
+
+        # ── result panel (shared by all paths above) ──────────────────────
         fm = st.session_state.get("fm")
         if fm is not None:
+            st.divider()
             st.subheader("Result")
             c = st.columns(4)
             c[0].metric("Studies", f"{len(fm.y):,}")
@@ -513,25 +666,6 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                            "ContextDescriber.attach_performance() to build the "
                            "(descriptors → performance) dataset.")
 
-
-def _run_extraction(spec: dict):  # pragma: no cover
-    import streamlit as st
-
-    @st.cache_resource(show_spinner=False)
-    def _cached(key: str):
-        from Custom.temporal_features import FeatureGroup, TemporalFeatureExtractor
-        s = json.loads(key)
-        groups = [FeatureGroup(name=n, tables=frozenset(GROUP_TABLES[n]),
-                               bins=g["bins"], catch_all=g["catch_all"])
-                  for n, g in s["groups"].items()]
-        pth = s.get("paths", {})
-        return TemporalFeatureExtractor(
-            cohort=pth.get("cohort"), database=pth.get("database"),
-            labels=pth.get("labels"),
-        ).build(task=s["task"], groups=groups,
-                anchor=None if s["anchor"] == "auto" else s["anchor"])
-
-    return _cached(json.dumps(spec, sort_keys=True))
 
 
 if __name__ == "__main__":  # pragma: no cover
