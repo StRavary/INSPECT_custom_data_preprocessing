@@ -94,7 +94,7 @@ class RNNSequentialEncoder(nn.Module):
         self.rnn = getattr(nn, rnn_type)(
             self.feature_size,
             self.hidden_size,
-            batch_first=True,
+            batch_first=False,  # input is (Slice, Batch, Feature) after transpose
             num_layers=self.num_layers,
             dropout=self.dropout_prob,
             bidirectional=bidirectional,
