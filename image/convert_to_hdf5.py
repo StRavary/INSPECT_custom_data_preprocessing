@@ -49,7 +49,7 @@ def convert_npy_to_hdf5(input_dir, output_path, metadata_path):
 
 if __name__ == "__main__":
     input_dir = "/data/processed/INSPECT/CNN_embeddings"
-    output_path = "/data/processed/INSPECT/CNN_embeddings/features.hdf5"
+    output_path = "/data/processed/INSPECT/CNN_embeddings/features_resnext_uncompressed.hdf5"
     metadata_path = "/home/users/steven/INSPECT/DATA_RAW/LABELS/series_metadata_20250611.tsv"
 
     convert_npy_to_hdf5(input_dir, output_path, metadata_path)

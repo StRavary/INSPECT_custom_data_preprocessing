@@ -31,7 +31,7 @@ python run_classify.py model=model_1d dataset=stanford_featurized \
 	model.seq_encoder.rnn_type=LSTM\
 	model.seq_encoder.bidirectional=true\
 	model.seq_encoder.num_layers=1\
-	model.seq_encoder.hidden_size=128\
+	model.seq_encoder.hidden_size=256\
 	model.seq_encoder.dropout_prob=0.25\
 	dataset.weighted_sample=true \
 	trainer.max_epochs=50\

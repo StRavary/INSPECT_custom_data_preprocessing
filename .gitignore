@@ -13,3 +13,4 @@ outputs/
 metrics.csv
 *.ckpt
 *.log
+feature_ceiling.png

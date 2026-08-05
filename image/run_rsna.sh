@@ -1,7 +1,16 @@
-#CUDA_VISIBLE_DEVICES=1 python run_classify.py model=swinv2 dataset=rsna 
-#CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224 
-#python run_classify.py model=dinov2 dataset=rsna dataset.transform.resize_size=512 dataset.transform.crop_size=448 dataset.transform.final_size=448 dataset.batch_size=16
-CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct dataset=rsna dataset.transform.final_size=224 dataset.batch_size=256 trainer.accumulate_grad_batches=1
+# Fine-tune ResNeXt101-32x8d on RSPECT (RSNA PE) dataset.
+# Matches Table 14: architecture=resnext101_32x8d, optimizer=AdamW, lr=0.0005,
+# loss=BCEWithLogitsLoss, pretrain=BigTransfer (ImageNet large-scale).
+# Starting weights: resnext_101_ct.yaml checkpoint (CT-pretrained from HuggingFace).
+# After this run, copy the best val AUROC checkpoint to resnext_101_ct.yaml checkpoint_path.
+#
+# Other backbones tried previously (kept for reference):
+#CUDA_VISIBLE_DEVICES=1 python run_classify.py model=swinv2 dataset=rsna
+#CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224
+#CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2 dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4
 
-#dataset.tranform.final_size=224
-
+CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct dataset=rsna \
+    dataset.transform.final_size=224 \
+    dataset.batch_size=256 \
+    trainer.accumulate_grad_batches=1 \
+    lr=0.0005
