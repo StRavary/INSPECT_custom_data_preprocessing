@@ -483,7 +483,7 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
                     "tables": ", ".join(GROUP_TABLES[gname]),
                 })
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
             st.caption(f"{len(rows)} windows total. Column count ≈ "
                        f"(distinct codes after ontology expansion) × {len(rows)}.")
 
@@ -628,7 +628,7 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
             c[2].metric("Event rate", f"{fm.y.mean():.4f}")
             c[3].metric("Anchor", fm.anchor_kind)
             st.text(fm.describe())
-            st.dataframe(fm.to_frame().head(50), use_container_width=True)
+            st.dataframe(fm.to_frame().head(50), width='stretch')
 
     # ---------------- 3 · describe --------------------------------------
     with tab_desc:
@@ -657,7 +657,7 @@ def main() -> None:  # pragma: no cover - requires a Streamlit runtime
 
             table = st.session_state.get("desc")
             if table is not None:
-                st.dataframe(table, use_container_width=True)
+                st.dataframe(table, width='stretch')
                 buf = io.StringIO(); table.to_csv(buf, index=False)
                 st.download_button("Download descriptors .csv", buf.getvalue(),
                                    file_name=f"descriptors_{task}.csv",
