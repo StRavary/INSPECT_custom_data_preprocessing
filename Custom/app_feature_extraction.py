@@ -332,10 +332,10 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
                         np.where(valid, ds_vals, 0), unit="d")
                     record_date_arr[valid, j] = (
                         dates[valid].strftime("%Y-%m-%d").values)
-        elif col.startswith(("diag:", "drug:", "proc:")):
-            if count_dates is not None and col in count_dates.columns:
-                record_date_arr[:, j] = (
-                    count_dates[col].fillna("").astype(str).values)
+        elif count_dates is not None and col in count_dates.columns:
+            # Covers diag:, drug:, proc:, obs:, visit:, and _anc: variants
+            record_date_arr[:, j] = (
+                count_dates[col].fillna("").astype(str).values)
 
     # ── build wide feature DataFrame and melt ────────────────────────────────
     wide = pd.DataFrame(fm.X[:, feat_idx], columns=feat_cols)
@@ -660,29 +660,42 @@ def main() -> None:  # pragma: no cover
 
         # ── Feature types ──────────────────────────────────────────────────
         st.markdown("**Feature types to extract**")
-        ft_col1, ft_col2, ft_col3, ft_col4 = st.columns(4)
-        b_ft_labs  = ft_col1.checkbox(
+        ft_r1c1, ft_r1c2, ft_r1c3 = st.columns(3)
+        ft_r2c1, ft_r2c2, ft_r2c3 = st.columns(3)
+
+        b_ft_labs  = ft_r1c1.checkbox(
             "Labs (measurement)", value=True, key="b_ft_labs",
             help="Numerical lab values from measurement.csv — mean, min, max, last, n, "
                  "days_since per LOINC code × window.")
-        b_ft_diag  = ft_col2.checkbox(
+        b_ft_diag  = ft_r1c2.checkbox(
             "Diagnoses (condition)", value=False, key="b_ft_diag",
             help="ICD-10-CM / SNOMED diagnosis codes from condition_occurrence.csv — "
-                 "count of distinct event days per code within the lookback window.")
-        b_ft_drugs = ft_col3.checkbox(
+                 "count of distinct event days per code.")
+        b_ft_drugs = ft_r1c3.checkbox(
             "Drugs (drug_exposure)", value=False, key="b_ft_drugs",
             help="RxNorm ingredient codes from drug_exposure.csv — "
-                 "count of distinct event days per drug within the lookback window.")
-        b_ft_proc  = ft_col4.checkbox(
+                 "count of distinct event days per drug.")
+        b_ft_proc  = ft_r2c1.checkbox(
             "Procedures (procedure)", value=False, key="b_ft_proc",
-            help="CPT4 / ICD-10-PCS procedure codes from procedure_occurrence.csv — "
-                 "count of distinct event days per code within the lookback window.")
+            help="CPT4 / ICD-10-PCS codes from procedure_occurrence.csv — "
+                 "count of distinct event days per code.")
+        b_ft_obs   = ft_r2c2.checkbox(
+            "Observations (observation)", value=False, key="b_ft_obs",
+            help="OMOP observation domain from observation.csv — smoking status, "
+                 "functional status, qualitative clinical flags, social history. "
+                 "Count of distinct event days per concept.")
+        b_ft_visit = ft_r2c3.checkbox(
+            "Visits (visit_occurrence)", value=False, key="b_ft_visit",
+            help="Inpatient admissions, outpatient encounters, and ED visits from "
+                 "visit_occurrence.csv — count of distinct visit start dates per visit type.")
 
         b_feature_types = []
         if b_ft_labs:  b_feature_types.append("labs")
         if b_ft_diag:  b_feature_types.append("diagnoses")
         if b_ft_drugs: b_feature_types.append("drugs")
         if b_ft_proc:  b_feature_types.append("procedures")
+        if b_ft_obs:   b_feature_types.append("observations")
+        if b_ft_visit: b_feature_types.append("visits")
 
         if not b_feature_types:
             st.warning("Select at least one feature type.")
@@ -714,42 +727,86 @@ def main() -> None:  # pragma: no cover
             b_loinc_codes = None
 
         # ── Per-type lookback windows for count features ────────────────────
+        # Config: (feature_type_key, label, default_days, help_text)
+        _COUNT_FT_CONFIG = [
+            ("diagnoses",    "Diagnoses",    365,
+             "ICD-10-CM / SNOMED codes from condition_occurrence.csv."),
+            ("drugs",        "Drugs",         60,
+             "RxNorm ingredient codes from drug_exposure.csv."),
+            ("procedures",   "Procedures",   365,
+             "CPT4 / ICD-10-PCS codes from procedure_occurrence.csv."),
+            ("observations", "Observations", 365,
+             "OMOP observation domain (observation.csv) — smoking, functional status, etc."),
+            ("visits",       "Visits",       365,
+             "Inpatient / outpatient / ED visit types from visit_occurrence.csv."),
+        ]
+        active_count = [(ft, lbl, dflt, hlp)
+                        for ft, lbl, dflt, hlp in _COUNT_FT_CONFIG
+                        if ft in b_feature_types]
+
         b_count_windows: dict = {}
-        if b_ft_diag or b_ft_drugs or b_ft_proc:
+        if active_count:
             st.markdown("**Lookback window per event type** (days before anchor)")
-            cw_cols = st.columns(3)
-            if b_ft_diag:
-                b_count_windows["diagnoses"] = int(cw_cols[0].number_input(
-                    "Diagnoses", min_value=1, max_value=None, value=365, step=30,
-                    key="b_cw_diag",
-                    help="ICD-10-CM / SNOMED codes from condition_occurrence.csv. "
-                         "No upper limit."))
-            if b_ft_drugs:
-                b_count_windows["drugs"] = int(cw_cols[1].number_input(
-                    "Drugs", min_value=1, max_value=None, value=60, step=30,
-                    key="b_cw_drugs",
-                    help="RxNorm codes from drug_exposure.csv. No upper limit."))
-            if b_ft_proc:
-                b_count_windows["procedures"] = int(cw_cols[2].number_input(
-                    "Procedures", min_value=1, max_value=None, value=365, step=30,
-                    key="b_cw_proc",
-                    help="CPT4 / ICD-10-PCS codes from procedure_occurrence.csv. "
-                         "No upper limit."))
+            cw_cols = st.columns(len(active_count))
+            for idx, (ft, lbl, dflt, hlp) in enumerate(active_count):
+                b_count_windows[ft] = int(cw_cols[idx].number_input(
+                    lbl, min_value=1, max_value=None, value=dflt, step=30,
+                    key=f"b_cw_{ft}",
+                    help=hlp + " No upper limit."))
 
         # ── Shared settings ─────────────────────────────────────────────────
         b_min_studies = st.slider(
             "Min studies per feature", 10, 500, 50, key="b_min_studies",
             help="Features (labs or codes) present in fewer studies than this are dropped.")
 
+        # ── Concept-ancestor rollup ──────────────────────────────────────────
+        with st.expander("🧬 Concept ancestor rollup (optional)", expanded=False):
+            st.caption(
+                "Roll up events to their ancestor concepts in the OMOP hierarchy using "
+                "**concept_ancestor.csv** (~1.7 GB). This creates additional columns "
+                "prefixed with `diag_anc:`, `drug_anc:`, etc. — useful for grouping "
+                "rare specific codes under broader clinical categories. "
+                "Requires at least one non-lab feature type to be selected. "
+                "⚠️ Significantly increases extraction time."
+            )
+            _has_count_fts = any(
+                ft != "labs" for ft in b_feature_types
+            )
+            b_use_anc = st.checkbox(
+                "Enable concept ancestor rollup",
+                value=False,
+                key="b_use_ancestor",
+                disabled=not _has_count_fts,
+                help="Disabled when only Labs is selected — ancestor rollup applies to "
+                     "Diagnoses, Drugs, Procedures, Observations, and Visits.",
+            )
+            b_ancestor_levels = None
+            if b_use_anc and _has_count_fts:
+                _use_level_limit = st.checkbox(
+                    "Limit ancestor levels", value=False, key="b_limit_anc_levels",
+                    help="Restrict how many levels to climb in the OMOP hierarchy. "
+                         "Unchecked = all ancestors (broadest rollup)."
+                )
+                if _use_level_limit:
+                    b_ancestor_levels = int(st.number_input(
+                        "Max ancestor levels", min_value=1, max_value=10, value=2,
+                        step=1, key="b_ancestor_levels",
+                        help="2 = include parent and grandparent concepts only."
+                    ))
+            else:
+                b_use_anc = False  # ensure False if no count tables
+
         b_spec = {
-            "route":              "B",
-            "task":               b_task,
-            "anchor":             b_anchor,
-            "feature_types":      b_feature_types,
-            "windows_days":       b_windows,
-            "loinc_codes":        b_loinc_codes,
-            "count_window_days":  b_count_windows,   # dict: {feature_type: days}
-            "min_studies_per_lab": b_min_studies,
+            "route":                "B",
+            "task":                 b_task,
+            "anchor":               b_anchor,
+            "feature_types":        b_feature_types,
+            "windows_days":         b_windows,
+            "loinc_codes":          b_loinc_codes,
+            "count_window_days":    b_count_windows,   # dict: {feature_type: days}
+            "min_studies_per_lab":  b_min_studies,
+            "use_concept_ancestor": b_use_anc,
+            "ancestor_levels":      b_ancestor_levels,
             "paths": {
                 "cohort":      cohort_path,
                 "measurement": str(b_measurement),
@@ -1030,10 +1087,10 @@ def main() -> None:  # pragma: no cover
 
                 table_choices = col_tbl.multiselect(
                     "Event tables",
-                    ["measurement", "condition_occurrence",
-                     "drug_exposure", "procedure_occurrence"],
-                    default=["measurement", "condition_occurrence",
-                             "drug_exposure", "procedure_occurrence"],
+                    ["measurement", "condition_occurrence", "drug_exposure",
+                     "procedure_occurrence", "observation", "visit_occurrence"],
+                    default=["measurement", "condition_occurrence", "drug_exposure",
+                             "procedure_occurrence", "observation", "visit_occurrence"],
                 )
 
                 if st.button("🔍 Query events", type="primary",

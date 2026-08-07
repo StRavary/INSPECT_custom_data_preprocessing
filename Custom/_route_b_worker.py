@@ -33,22 +33,27 @@ def main() -> None:
     spec = json.loads(spec_path.read_text())
     pth  = spec.get("paths", {})
 
-    feature_types     = spec.get("feature_types", ["labs"])
+    feature_types         = spec.get("feature_types", ["labs"])
     # count_window_days is a dict {feature_type: days} e.g. {"diagnoses": 365, "drugs": 60}
-    count_window_days = spec.get("count_window_days", {})
+    count_window_days     = spec.get("count_window_days", {})
+    use_concept_ancestor  = spec.get("use_concept_ancestor", False)
+    ancestor_levels       = spec.get("ancestor_levels", None)
 
     print(f"[route_b_worker] task={spec['task']}  anchor={spec.get('anchor', 'auto')}",
           flush=True)
-    print(f"[route_b_worker] cohort         : {pth.get('cohort')}",          flush=True)
-    print(f"[route_b_worker] measurement    : {pth.get('measurement')}",      flush=True)
-    print(f"[route_b_worker] concept        : {pth.get('concept')}",          flush=True)
-    print(f"[route_b_worker] feature_types  : {feature_types}",               flush=True)
-    print(f"[route_b_worker] windows_days   : {spec.get('windows_days')}",    flush=True)
-    print(f"[route_b_worker] count_window   : {count_window_days}",            flush=True)
-    print(f"[route_b_worker] loinc_codes    : {spec.get('loinc_codes') or 'all LOINC'}",
+    print(f"[route_b_worker] cohort              : {pth.get('cohort')}",          flush=True)
+    print(f"[route_b_worker] measurement         : {pth.get('measurement')}",      flush=True)
+    print(f"[route_b_worker] concept             : {pth.get('concept')}",          flush=True)
+    print(f"[route_b_worker] feature_types       : {feature_types}",               flush=True)
+    print(f"[route_b_worker] windows_days        : {spec.get('windows_days')}",    flush=True)
+    print(f"[route_b_worker] count_window        : {count_window_days}",            flush=True)
+    print(f"[route_b_worker] loinc_codes         : {spec.get('loinc_codes') or 'all LOINC'}",
           flush=True)
-    print(f"[route_b_worker] min_studies    : {spec.get('min_studies_per_lab', 50)}",
+    print(f"[route_b_worker] min_studies         : {spec.get('min_studies_per_lab', 50)}",
           flush=True)
+    print(f"[route_b_worker] use_concept_ancestor: {use_concept_ancestor}",        flush=True)
+    if use_concept_ancestor:
+        print(f"[route_b_worker] ancestor_levels     : {ancestor_levels}",          flush=True)
 
     from Custom.route_b_labs import LabExtractor
 
@@ -69,6 +74,8 @@ def main() -> None:
         min_studies_per_lab=spec.get("min_studies_per_lab", 50),
         feature_types=feature_types,
         count_window_days=count_window_days,
+        use_concept_ancestor=use_concept_ancestor,
+        ancestor_levels=ancestor_levels,
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

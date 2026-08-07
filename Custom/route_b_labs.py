@@ -57,9 +57,10 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT  = SCRIPT_DIR.parent.parent
 
-DEFAULT_MEASUREMENT  = DATA_ROOT / "DATA_RAW"       / "EHR_CSV" / "measurement.csv"
-DEFAULT_CONCEPT      = DATA_ROOT / "DATA_RAW"       / "EHR_CSV" / "concept.csv"
-DEFAULT_PERSON       = DATA_ROOT / "DATA_RAW"       / "EHR_CSV" / "person.csv"
+DEFAULT_MEASUREMENT       = DATA_ROOT / "DATA_RAW"  / "EHR_CSV" / "measurement.csv"
+DEFAULT_CONCEPT           = DATA_ROOT / "DATA_RAW"  / "EHR_CSV" / "concept.csv"
+DEFAULT_CONCEPT_ANCESTOR  = DATA_ROOT / "DATA_RAW"  / "EHR_CSV" / "concept_ancestor.csv"
+DEFAULT_PERSON            = DATA_ROOT / "DATA_RAW"  / "EHR_CSV" / "person.csv"
 DEFAULT_COHORT       = DATA_ROOT / "DATA_PROCESSED" / "cohort_0.2.0_master_file_anon.csv"
 DEFAULT_LABELS       = DATA_ROOT / "DATA_RAW"       / "LABELS"  / "labels_20250611.tsv"
 
@@ -267,6 +268,18 @@ _EVENT_TABLES = {
         "value_col":   None,
         "label":       "procedure",
     },
+    "observation": {
+        "date_col":    "observation_date",
+        "concept_col": "observation_concept_id",
+        "value_col":   "value_as_number",
+        "label":       "observation",
+    },
+    "visit_occurrence": {
+        "date_col":    "visit_start_date",
+        "concept_col": "visit_concept_id",
+        "value_col":   None,
+        "label":       "visit",
+    },
 }
 
 # Configuration for count-based feature extraction (diagnoses, drugs, procedures).
@@ -289,6 +302,24 @@ _COUNT_TABLE_CONFIG = {
         "concept_col": "procedure_concept_id",
         "col_prefix":  "proc",
         "vocab_filter": "AND vocabulary_id IN ('CPT4', 'ICD10PCS', 'HCPCS', 'ICD9Proc')",
+    },
+    # Observation: smoking status, functional status, qualitative clinical flags,
+    # social history — anything recorded in OMOP observation domain.
+    "observation": {
+        "date_col":    "observation_date",
+        "concept_col": "observation_concept_id",
+        "col_prefix":  "obs",
+        "vocab_filter": "AND domain_id = 'Observation'",
+    },
+    # Visit occurrence: inpatient admissions, outpatient encounters, ED visits.
+    # Count = distinct visit start dates per visit type within the lookback window.
+    # end_date_col triggers additional LOS (length-of-stay) aggregate columns.
+    "visit_occurrence": {
+        "date_col":     "visit_start_date",
+        "concept_col":  "visit_concept_id",
+        "col_prefix":   "visit",
+        "vocab_filter": "AND domain_id = 'Visit'",
+        "end_date_col": "visit_end_date",   # enables _los_total_ and _los_max_ columns
     },
 }
 
@@ -665,24 +696,28 @@ class LabFeatureMatrix:
 # ---------------------------------------------------------------------------
 
 class LabExtractor:
-    """Extract per-lab numeric features from OMOP measurement.csv via DuckDB.
+    """Extract EHR features from OMOP CSVs via DuckDB.
 
     Args:
-        cohort       : path to cohort master CSV (default: standard INSPECT path)
-        measurement_csv : path to measurement.csv
-        concept_csv  : path to concept.csv
-        labels       : path to labels TSV (survival data)
-        verbose      : print progress messages
+        cohort                : path to cohort master CSV
+        measurement_csv       : path to measurement.csv
+        concept_csv           : path to concept.csv
+        concept_ancestor_csv  : path to concept_ancestor.csv (optional — needed only
+                                when use_concept_ancestor=True in build())
+        labels                : path to labels TSV (survival data)
+        person                : path to person.csv (optional — demographics)
+        verbose               : print progress messages
     """
 
     def __init__(
         self,
-        cohort:          Optional[str] = None,
-        measurement_csv: Optional[str] = None,
-        concept_csv:     Optional[str] = None,
-        labels:          Optional[str] = None,
-        person:          Optional[str] = None,
-        verbose:         bool = True,
+        cohort:                 Optional[str] = None,
+        measurement_csv:        Optional[str] = None,
+        concept_csv:            Optional[str] = None,
+        concept_ancestor_csv:   Optional[str] = None,
+        labels:                 Optional[str] = None,
+        person:                 Optional[str] = None,
+        verbose:                bool = True,
     ):
         self.cohort_path      = Path(cohort          or DEFAULT_COHORT     ).expanduser()
         self.measurement_path = Path(measurement_csv or DEFAULT_MEASUREMENT ).expanduser()
@@ -690,6 +725,9 @@ class LabExtractor:
         self.labels_path      = Path(labels          or DEFAULT_LABELS     ).expanduser()
         # Infer OMOP directory from measurement.csv path (used for count-feature CSVs)
         self.omop_dir         = self.measurement_path.parent
+        # concept_ancestor.csv — optional; defaults to same OMOP directory
+        _anc = concept_ancestor_csv or str(DEFAULT_CONCEPT_ANCESTOR)
+        self.concept_ancestor_path = Path(_anc).expanduser() if _anc else None
         # person.csv is optional — demographics are appended only if it exists
         _person = person or str(DEFAULT_PERSON)
         self.person_path = Path(_person).expanduser() if _person else None
@@ -1146,6 +1184,60 @@ class LabExtractor:
                 f"{part_df['impression_id'].nunique():,} studies)")
             parts.append(part_df)
 
+            # --- LOS columns (visit_occurrence only) ----------------------------
+            end_date_col = cfg.get("end_date_col")
+            if end_date_col:
+                self._log(f"    computing LOS features from {end_date_col} …")
+                los_sql = f"""
+                    SELECT
+                        a.impression_id,
+                        SUM(GREATEST(0, DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(t.{end_date_col} AS DATE)
+                        )))                                                 AS los_total,
+                        MAX(GREATEST(0, DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(t.{end_date_col} AS DATE)
+                        )))                                                 AS los_max,
+                        CAST(MAX(CAST(t.{date_col} AS DATE)) AS VARCHAR)   AS most_recent_date
+                    FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                    INNER JOIN anchors_tbl a
+                            ON CAST(t.person_id AS BIGINT) = a.person_id
+                    WHERE t.{date_col}     IS NOT NULL
+                      AND t.{end_date_col} IS NOT NULL
+                      AND DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                          ) BETWEEN 1 AND {window_days}
+                    GROUP BY a.impression_id
+                """
+                los_df = con.execute(los_sql).df()
+                if not los_df.empty:
+                    import pandas as _pd
+                    los_total_df = (
+                        los_df[["impression_id", "los_total", "most_recent_date"]]
+                        .rename(columns={"los_total": "day_count"})
+                        .assign(col_name=f"{col_prefix}:LOS/total_{window_days}d")
+                    )
+                    los_max_df = (
+                        los_df[["impression_id", "los_max", "most_recent_date"]]
+                        .rename(columns={"los_max": "day_count"})
+                        .assign(col_name=f"{col_prefix}:LOS/max_{window_days}d")
+                    )
+                    _los_cols = ["impression_id", "col_name", "day_count", "most_recent_date"]
+                    parts.append(los_total_df[_los_cols])
+                    parts.append(los_max_df[_los_cols])
+                    self._log(
+                        f"    LOS: {los_df['impression_id'].nunique():,} studies  "
+                        f"total_los range=[{los_df['los_total'].min():.0f}, "
+                        f"{los_df['los_total'].max():.0f}]  "
+                        f"max_los range=[{los_df['los_max'].min():.0f}, "
+                        f"{los_df['los_max'].max():.0f}]"
+                    )
+
         con.close()
 
         if not parts:
@@ -1225,34 +1317,221 @@ class LabExtractor:
 
         return X, columns, dates_wide
 
+    def _run_duckdb_ancestor_rollup(
+        self,
+        cohort_rows: list,
+        tables: list,
+        window_days_per_table: dict,
+        ancestor_levels: Optional[int] = None,
+    ) -> "pd.DataFrame":
+        """Roll up OMOP events to ancestor concepts via concept_ancestor.csv.
+
+        For each event table, collects the distinct descendant concept_ids
+        observed for the cohort within the lookback window, filters
+        concept_ancestor.csv to those descendants, then aggregates
+        COUNT DISTINCT event-days at the ancestor level.
+
+        Column names follow the pattern  ``{prefix}_anc:{vocab}/{code}_{N}d``,
+        e.g. ``diag_anc:SNOMED/59282003_365d``.
+
+        Parameters
+        ----------
+        cohort_rows         : from ``_read_cohort()``
+        tables              : OMOP table names (subset of ``_COUNT_TABLE_CONFIG``)
+        window_days_per_table : mapping table → lookback days
+        ancestor_levels     : maximum levels to climb in the hierarchy
+                              (None = all ancestors)
+
+        Returns
+        -------
+        pd.DataFrame with columns: impression_id, col_name, day_count, most_recent_date
+        """
+        if self.concept_ancestor_path is None or not self.concept_ancestor_path.exists():
+            self._log(
+                "  WARNING: concept_ancestor.csv not found — ancestor rollup skipped"
+            )
+            import pandas as pd
+            return pd.DataFrame(
+                columns=["impression_id", "col_name", "day_count", "most_recent_date"]
+            )
+
+        try:
+            import duckdb
+            import pandas as pd
+        except ImportError:
+            raise ImportError("pip install duckdb pandas")
+
+        anchors_df = pd.DataFrame(
+            [
+                (pid, anchor.isoformat(), imp)
+                for pid, anchor, imp, _split, _y in cohort_rows
+            ],
+            columns=["person_id", "anchor_time", "impression_id"],
+        )
+        anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+
+        con = duckdb.connect()
+        con.register("anchors_tbl", anchors_df)
+
+        parts = []
+        for tbl in tables:
+            cfg = _COUNT_TABLE_CONFIG.get(tbl)
+            if cfg is None:
+                continue
+            csv_path = self.omop_dir / f"{tbl}.csv"
+            if not csv_path.exists():
+                self._log(f"  WARNING: {tbl}.csv not found — ancestor rollup skipped for {tbl}")
+                continue
+
+            date_col    = cfg["date_col"]
+            concept_col = cfg["concept_col"]
+            col_prefix  = cfg["col_prefix"]   # e.g. "diag", "drug"
+            anc_prefix  = f"{col_prefix}_anc"  # e.g. "diag_anc"
+            window_days = window_days_per_table.get(tbl, 365)
+
+            self._log(f"  [ancestor] {tbl} → scanning events within {window_days} d …")
+
+            # Step 1: collect distinct descendant concept_ids active in cohort window
+            desc_sql = f"""
+                SELECT DISTINCT CAST(t.{concept_col} AS BIGINT) AS descendant_concept_id
+                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                INNER JOIN anchors_tbl a
+                        ON CAST(t.person_id AS BIGINT) = a.person_id
+                WHERE t.{date_col} IS NOT NULL
+                  AND DATEDIFF(
+                        'day',
+                        CAST(t.{date_col} AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      ) BETWEEN 1 AND {window_days}
+            """
+            desc_df = con.execute(desc_sql).df()
+            self._log(
+                f"    {len(desc_df):,} distinct descendant concept_ids in cohort window"
+            )
+            if desc_df.empty:
+                continue
+
+            con.register("_desc_ids", desc_df)
+
+            # Step 2: filter concept_ancestor to those descendants
+            levels_filter = (
+                f"AND min_levels_of_separation BETWEEN 1 AND {ancestor_levels}"
+                if ancestor_levels is not None
+                else "AND min_levels_of_separation >= 1"
+            )
+            anc_sql = f"""
+                SELECT
+                    CAST(ca.descendant_concept_id AS BIGINT) AS descendant_concept_id,
+                    CAST(ca.ancestor_concept_id   AS BIGINT) AS ancestor_concept_id
+                FROM read_csv_auto('{self.concept_ancestor_path}', ignore_errors=true) ca
+                INNER JOIN _desc_ids d
+                        ON CAST(ca.descendant_concept_id AS BIGINT) = d.descendant_concept_id
+                WHERE 1=1
+                  {levels_filter}
+            """
+            anc_pairs = con.execute(anc_sql).df()
+            self._log(f"    {len(anc_pairs):,} (descendant, ancestor) pairs loaded")
+            if anc_pairs.empty:
+                continue
+
+            con.register("_anc_pairs", anc_pairs)
+
+            # Step 3: join ancestor concept_ids → concept.csv for vocab/code
+            # Use the same concept.csv; ancestors may span multiple vocabularies
+            anc_concept_sql = f"""
+                SELECT DISTINCT
+                    p.descendant_concept_id,
+                    CAST(c.concept_id     AS BIGINT) AS ancestor_concept_id,
+                    c.vocabulary_id,
+                    c.concept_code
+                FROM _anc_pairs p
+                INNER JOIN read_csv_auto('{self.concept_path}', ignore_errors=true) c
+                        ON CAST(c.concept_id AS BIGINT) = p.ancestor_concept_id
+                WHERE c.concept_code IS NOT NULL
+            """
+            anc_concepts = con.execute(anc_concept_sql).df()
+            self._log(
+                f"    {anc_concepts['ancestor_concept_id'].nunique():,} distinct ancestor concepts"
+            )
+            if anc_concepts.empty:
+                continue
+
+            con.register("_anc_concepts", anc_concepts)
+
+            # Step 4: aggregate to ancestor level
+            rollup_sql = f"""
+                SELECT
+                    a.impression_id,
+                    '{anc_prefix}:' || ac.vocabulary_id || '/' || ac.concept_code
+                        || '_{window_days}d'                                    AS col_name,
+                    COUNT(DISTINCT CAST(t.{date_col} AS DATE))                  AS day_count,
+                    CAST(MAX(CAST(t.{date_col} AS DATE)) AS VARCHAR)            AS most_recent_date
+                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                INNER JOIN anchors_tbl a
+                        ON CAST(t.person_id AS BIGINT) = a.person_id
+                INNER JOIN _anc_concepts ac
+                        ON CAST(t.{concept_col} AS BIGINT) = ac.descendant_concept_id
+                WHERE t.{date_col} IS NOT NULL
+                  AND DATEDIFF(
+                        'day',
+                        CAST(t.{date_col} AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      ) BETWEEN 1 AND {window_days}
+                GROUP BY a.impression_id, ac.vocabulary_id, ac.concept_code
+            """
+            rollup_df = con.execute(rollup_sql).df()
+            self._log(
+                f"    {len(rollup_df):,} (study, ancestor) rows  "
+                f"({rollup_df['col_name'].nunique():,} distinct ancestor codes, "
+                f"{rollup_df['impression_id'].nunique():,} studies)"
+            )
+            parts.append(rollup_df)
+
+        con.close()
+
+        if not parts:
+            return pd.DataFrame(
+                columns=["impression_id", "col_name", "day_count", "most_recent_date"]
+            )
+        return pd.concat(parts, ignore_index=True)
+
     # -- public build -----------------------------------------------------
 
     def build(
         self,
-        task:               str,
-        windows_days:       list = None,
-        loinc_codes:        Optional[list] = None,
-        anchor:             Optional[str] = None,
-        min_studies_per_lab: int = 50,
-        feature_types:      Optional[list] = None,
-        count_window_days:  Optional[dict] = None,
+        task:                   str,
+        windows_days:           list = None,
+        loinc_codes:            Optional[list] = None,
+        anchor:                 Optional[str] = None,
+        min_studies_per_lab:    int = 50,
+        feature_types:          Optional[list] = None,
+        count_window_days:      Optional[dict] = None,
+        use_concept_ancestor:   bool = False,
+        ancestor_levels:        Optional[int] = None,
     ) -> LabFeatureMatrix:
         """Run the full extraction and return a LabFeatureMatrix.
 
         Args:
-            task            : INSPECT task name (e.g. "12_month_PH")
-            windows_days    : list of window edges in days before anchor
-                              (default: [2, 7, 30, 365])
-            loinc_codes     : list of LOINC concept_codes to include
-                              (default: None = all LOINC-coded measurements)
-            anchor          : "dx", "px", or None (auto from task name)
-            min_studies_per_lab : drop labs measured in fewer studies than this
-            feature_types   : which feature groups to extract; any combination of
-                              "labs", "diagnoses", "drugs", "procedures"
-                              (default: ["labs"] for backward compatibility)
-            count_window_days : dict mapping feature type → lookback days, e.g.
-                              {"diagnoses": 365, "drugs": 60, "procedures": 365}.
-                              Missing keys default to 365 days.
+            task                  : INSPECT task name (e.g. "12_month_PH")
+            windows_days          : list of window edges in days before anchor
+                                    (default: [2, 7, 30, 365])
+            loinc_codes           : list of LOINC concept_codes to include
+                                    (default: None = all LOINC-coded measurements)
+            anchor                : "dx", "px", or None (auto from task name)
+            min_studies_per_lab   : drop labs measured in fewer studies than this
+            feature_types         : which feature groups to extract; any combination of
+                                    "labs", "diagnoses", "drugs", "procedures",
+                                    "observations", "visits"
+                                    (default: ["labs"] for backward compatibility)
+            count_window_days     : dict mapping feature type → lookback days, e.g.
+                                    {"diagnoses": 365, "drugs": 60, "procedures": 365}.
+                                    Missing keys default to 365 days.
+            use_concept_ancestor  : if True, also roll up events to their OMOP ancestor
+                                    concepts using concept_ancestor.csv. Columns are
+                                    prefixed with ``{type}_anc:`` (e.g. ``diag_anc:``).
+            ancestor_levels       : maximum number of levels to climb in the hierarchy
+                                    (None = unlimited). Only used when
+                                    use_concept_ancestor=True.
         """
         if windows_days is None:
             windows_days = DEFAULT_WINDOWS
@@ -1263,9 +1542,11 @@ class LabExtractor:
 
         # Map human names → OMOP table names for count extraction
         _FT_TO_TABLE = {
-            "diagnoses":  "condition_occurrence",
-            "drugs":      "drug_exposure",
-            "procedures": "procedure_occurrence",
+            "diagnoses":    "condition_occurrence",
+            "drugs":        "drug_exposure",
+            "procedures":   "procedure_occurrence",
+            "observations": "observation",
+            "visits":       "visit_occurrence",
         }
         count_tables = [
             _FT_TO_TABLE[ft] for ft in feature_types if ft in _FT_TO_TABLE
@@ -1322,17 +1603,45 @@ class LabExtractor:
                 count_long, imp_ids, min_studies_per_lab)
             self._log(f"  count X shape: {X_count.shape}")
 
-        # 4. Combine feature matrices
-        X_parts = [m for m in [X_lab, X_count] if m.shape[1] > 0]
-        if X_parts:
-            X       = np.hstack(X_parts) if len(X_parts) > 1 else X_parts[0]
-            columns = columns_lab + columns_count
+        # 4. Concept-ancestor rollup (optional)
+        X_anc, columns_anc = np.zeros((len(imp_ids), 0), dtype=np.float32), []
+        count_dates_anc = None
+        if use_concept_ancestor and count_tables:
+            self._log("\n[concept_ancestor rollup]")
+            if ancestor_levels is not None:
+                self._log(f"  max levels: {ancestor_levels}")
+            anc_long = self._run_duckdb_ancestor_rollup(
+                cohort_rows, count_tables, count_window_per_table, ancestor_levels
+            )
+            if not anc_long.empty:
+                X_anc, columns_anc, count_dates_anc = self._pivot_counts(
+                    anc_long, imp_ids, min_studies_per_lab
+                )
+                self._log(f"  ancestor X shape: {X_anc.shape}")
+
+        # 5. Combine feature matrices
+        all_X       = [m for m in [X_lab, X_count, X_anc] if m.shape[1] > 0]
+        all_columns = columns_lab + columns_count + columns_anc
+        if all_X:
+            X       = np.hstack(all_X) if len(all_X) > 1 else all_X[0]
+            columns = all_columns
         else:
             X       = np.zeros((len(imp_ids), 0), dtype=np.float32)
             columns = []
         self._log(f"\n  combined X shape: {X.shape}")
 
-        # 5. Survival
+        # Merge count_dates from direct counts and ancestor rollup
+        if count_dates is not None and count_dates_anc is not None:
+            import pandas as _pd
+            count_dates = _pd.concat(
+                [count_dates.reset_index(drop=True),
+                 count_dates_anc.reset_index(drop=True)],
+                axis=1,
+            )
+        elif count_dates_anc is not None:
+            count_dates = count_dates_anc
+
+        # 6. Survival
         tte, event = self._read_survival(task, imp_ids)
 
         fm = LabFeatureMatrix(

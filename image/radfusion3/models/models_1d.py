@@ -163,13 +163,13 @@ class Model1D(nn.Module):
         if cfg.model.aggregation == "attention+max":
             cls_input_size = cls_input_size * 2
 
-        self.input_norm = nn.LayerNorm(seq_input_size)
+        #self.input_norm = nn.LayerNorm(seq_input_size)
         # self.batch_norm_layer = torch.nn.BatchNorm1d(cls_input_size)
         self.classifier = nn.Linear(cls_input_size, num_classes)
         self.cfg = cfg
 
     def forward(self, x, get_features=False, mask=None):
-        x = self.input_norm(x)
+        #x = self.input_norm(x)
         x = self.seq_encoder(x)
         x, w = self.aggregate(x, mask)
         # x = self.batch_norm_layer(x)

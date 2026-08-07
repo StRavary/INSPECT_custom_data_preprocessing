@@ -14,7 +14,7 @@ test_split: all
 batch_size: 256
 
 transform:
-    channels: repeat 
+    channels: window  # 3-window HU (lung/PE/mediastinal) — matches featurize script
     resize_size: 256
     crop_size: 224
     final_size: 224
