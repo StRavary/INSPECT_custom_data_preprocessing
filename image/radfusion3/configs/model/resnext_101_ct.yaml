@@ -2,4 +2,4 @@ type: model_2d
 model_name: resnext_101_ct
 pretrain_type: supervised
 num_class: 1
-checkpoint_path: "/data/processed/INSPECT/checkpoints/resnext101_rsna.ckpt"
+checkpoint_path: "/data/processed/INSPECT/checkpoints/classify_pe_present_on_image_2026-08-07_12:26:28/epoch=0-val/mean_auroc=0.920.ckpt"
