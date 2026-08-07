@@ -781,11 +781,13 @@ def main() -> None:  # pragma: no cover
                      "Diagnoses, Drugs, Procedures, Observations, and Visits.",
             )
             b_ancestor_levels = None
+            b_min_studies_anc = 100
+            b_max_anc_features = 2000
             if b_use_anc and _has_count_fts:
                 _use_level_limit = st.checkbox(
-                    "Limit ancestor levels", value=False, key="b_limit_anc_levels",
+                    "Limit ancestor levels", value=True, key="b_limit_anc_levels",
                     help="Restrict how many levels to climb in the OMOP hierarchy. "
-                         "Unchecked = all ancestors (broadest rollup)."
+                         "Unchecked = all ancestors (broadest rollup, slowest)."
                 )
                 if _use_level_limit:
                     b_ancestor_levels = int(st.number_input(
@@ -793,6 +795,23 @@ def main() -> None:  # pragma: no cover
                         step=1, key="b_ancestor_levels",
                         help="2 = include parent and grandparent concepts only."
                     ))
+
+                anc_col1, anc_col2 = st.columns(2)
+                b_min_studies_anc = int(anc_col1.number_input(
+                    "Min studies (ancestor)",
+                    min_value=10, max_value=None, value=100, step=10,
+                    key="b_min_studies_anc",
+                    help="Ancestor codes present in fewer studies than this are dropped. "
+                         "Set higher than the general threshold — ancestor codes are far "
+                         "more numerous and most cover only rare sub-populations.",
+                ))
+                b_max_anc_features = int(anc_col2.number_input(
+                    "Max ancestor features",
+                    min_value=100, max_value=None, value=2000, step=100,
+                    key="b_max_anc_features",
+                    help="Hard cap per event table. Keeps the highest-coverage ancestor "
+                         "codes. Lower = faster extraction and smaller matrix.",
+                ))
             else:
                 b_use_anc = False  # ensure False if no count tables
 
@@ -805,8 +824,10 @@ def main() -> None:  # pragma: no cover
             "loinc_codes":          b_loinc_codes,
             "count_window_days":    b_count_windows,   # dict: {feature_type: days}
             "min_studies_per_lab":  b_min_studies,
-            "use_concept_ancestor": b_use_anc,
-            "ancestor_levels":      b_ancestor_levels,
+            "use_concept_ancestor":  b_use_anc,
+            "ancestor_levels":       b_ancestor_levels,
+            "min_studies_ancestor":  b_min_studies_anc,
+            "max_ancestor_features": b_max_anc_features,
             "paths": {
                 "cohort":      cohort_path,
                 "measurement": str(b_measurement),

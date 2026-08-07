@@ -1323,43 +1323,59 @@ class LabExtractor:
         tables: list,
         window_days_per_table: dict,
         ancestor_levels: Optional[int] = None,
+        min_studies_ancestor: int = 100,
+        max_ancestor_features: int = 2000,
     ) -> "pd.DataFrame":
         """Roll up OMOP events to ancestor concepts via concept_ancestor.csv.
 
-        For each event table, collects the distinct descendant concept_ids
-        observed for the cohort within the lookback window, filters
-        concept_ancestor.csv to those descendants, then aggregates
-        COUNT DISTINCT event-days at the ancestor level.
+        Uses an on-disk DuckDB connection so large intermediate tables spill to
+        disk rather than exhausting RAM.  concept_ancestor.csv is loaded once
+        into a DuckDB temp table (filtered by level if requested).
+
+        To avoid the explosion of sparse ancestor codes, a two-pass approach is
+        used per event table:
+          Pass 1 — aggregate inside DuckDB, compute per-code coverage, keep only
+                   codes present in ≥ min_studies_ancestor distinct studies (up to
+                   max_ancestor_features codes ordered by descending coverage).
+          Pass 2 — re-aggregate over only the kept codes and return the trimmed
+                   long DataFrame to Python for pivoting.
 
         Column names follow the pattern  ``{prefix}_anc:{vocab}/{code}_{N}d``,
         e.g. ``diag_anc:SNOMED/59282003_365d``.
 
         Parameters
         ----------
-        cohort_rows         : from ``_read_cohort()``
-        tables              : OMOP table names (subset of ``_COUNT_TABLE_CONFIG``)
-        window_days_per_table : mapping table → lookback days
-        ancestor_levels     : maximum levels to climb in the hierarchy
-                              (None = all ancestors)
+        cohort_rows            : from ``_read_cohort()``
+        tables                 : OMOP table names (subset of ``_COUNT_TABLE_CONFIG``)
+        window_days_per_table  : mapping table → lookback days
+        ancestor_levels        : maximum levels to climb in the hierarchy
+                                 (None = all ancestors)
+        min_studies_ancestor   : drop ancestor codes present in fewer studies
+                                 (default 100; higher than the direct-code threshold
+                                 because ancestor codes are far more numerous)
+        max_ancestor_features  : hard cap on ancestor columns per event table,
+                                 keeping the highest-coverage codes (default 2000)
 
         Returns
         -------
         pd.DataFrame with columns: impression_id, col_name, day_count, most_recent_date
         """
+        import pandas as pd
+
         if self.concept_ancestor_path is None or not self.concept_ancestor_path.exists():
             self._log(
                 "  WARNING: concept_ancestor.csv not found — ancestor rollup skipped"
             )
-            import pandas as pd
             return pd.DataFrame(
                 columns=["impression_id", "col_name", "day_count", "most_recent_date"]
             )
 
         try:
             import duckdb
-            import pandas as pd
         except ImportError:
-            raise ImportError("pip install duckdb pandas")
+            raise ImportError("pip install duckdb")
+
+        import tempfile
 
         anchors_df = pd.DataFrame(
             [
@@ -1370,124 +1386,185 @@ class LabExtractor:
         )
         anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
 
-        con = duckdb.connect()
-        con.register("anchors_tbl", anchors_df)
+        # Use an on-disk DuckDB file so large temp tables can spill to disk
+        tmp_db = Path(tempfile.mktemp(suffix="_ancestor_rollup.duckdb"))
+        try:
+            con = duckdb.connect(str(tmp_db))
+            # Allow DuckDB to spill aggressively; temp dir = system default
+            con.execute("PRAGMA threads=4")
 
-        parts = []
-        for tbl in tables:
-            cfg = _COUNT_TABLE_CONFIG.get(tbl)
-            if cfg is None:
-                continue
-            csv_path = self.omop_dir / f"{tbl}.csv"
-            if not csv_path.exists():
-                self._log(f"  WARNING: {tbl}.csv not found — ancestor rollup skipped for {tbl}")
-                continue
+            con.register("anchors_tbl", anchors_df)
 
-            date_col    = cfg["date_col"]
-            concept_col = cfg["concept_col"]
-            col_prefix  = cfg["col_prefix"]   # e.g. "diag", "drug"
-            anc_prefix  = f"{col_prefix}_anc"  # e.g. "diag_anc"
-            window_days = window_days_per_table.get(tbl, 365)
-
-            self._log(f"  [ancestor] {tbl} → scanning events within {window_days} d …")
-
-            # Step 1: collect distinct descendant concept_ids active in cohort window
-            desc_sql = f"""
-                SELECT DISTINCT CAST(t.{concept_col} AS BIGINT) AS descendant_concept_id
-                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
-                INNER JOIN anchors_tbl a
-                        ON CAST(t.person_id AS BIGINT) = a.person_id
-                WHERE t.{date_col} IS NOT NULL
-                  AND DATEDIFF(
-                        'day',
-                        CAST(t.{date_col} AS DATE),
-                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                      ) BETWEEN 1 AND {window_days}
-            """
-            desc_df = con.execute(desc_sql).df()
-            self._log(
-                f"    {len(desc_df):,} distinct descendant concept_ids in cohort window"
-            )
-            if desc_df.empty:
-                continue
-
-            con.register("_desc_ids", desc_df)
-
-            # Step 2: filter concept_ancestor to those descendants
-            levels_filter = (
-                f"AND min_levels_of_separation BETWEEN 1 AND {ancestor_levels}"
-                if ancestor_levels is not None
-                else "AND min_levels_of_separation >= 1"
-            )
-            anc_sql = f"""
+            # ── Step 1: load concept.csv once ────────────────────────────────
+            self._log("  [ancestor] loading concept.csv → temp table …")
+            con.execute(f"""
+                CREATE TEMP TABLE _concept AS
                 SELECT
-                    CAST(ca.descendant_concept_id AS BIGINT) AS descendant_concept_id,
-                    CAST(ca.ancestor_concept_id   AS BIGINT) AS ancestor_concept_id
-                FROM read_csv_auto('{self.concept_ancestor_path}', ignore_errors=true) ca
-                INNER JOIN _desc_ids d
-                        ON CAST(ca.descendant_concept_id AS BIGINT) = d.descendant_concept_id
+                    CAST(concept_id AS BIGINT) AS concept_id,
+                    vocabulary_id,
+                    concept_code
+                FROM read_csv_auto('{self.concept_path}', ignore_errors=true)
+                WHERE concept_code IS NOT NULL
+            """)
+
+            # ── Step 2: load concept_ancestor once (filtered by level) ───────
+            levels_filter = (
+                f"AND CAST(min_levels_of_separation AS INTEGER) BETWEEN 1 AND {ancestor_levels}"
+                if ancestor_levels is not None
+                else "AND CAST(min_levels_of_separation AS INTEGER) >= 1"
+            )
+            self._log(
+                f"  [ancestor] loading concept_ancestor.csv "
+                f"({'all levels' if ancestor_levels is None else f'≤{ancestor_levels} levels'}) "
+                f"→ temp table …"
+            )
+            con.execute(f"""
+                CREATE TEMP TABLE _ca AS
+                SELECT
+                    CAST(descendant_concept_id AS BIGINT) AS descendant_concept_id,
+                    CAST(ancestor_concept_id   AS BIGINT) AS ancestor_concept_id
+                FROM read_csv_auto('{self.concept_ancestor_path}', ignore_errors=true)
                 WHERE 1=1
                   {levels_filter}
-            """
-            anc_pairs = con.execute(anc_sql).df()
-            self._log(f"    {len(anc_pairs):,} (descendant, ancestor) pairs loaded")
-            if anc_pairs.empty:
-                continue
+            """)
+            n_ca = con.execute("SELECT COUNT(*) FROM _ca").fetchone()[0]
+            self._log(f"    {n_ca:,} ancestor pairs retained after level filter")
 
-            con.register("_anc_pairs", anc_pairs)
+            # ── Step 3: per-event-table rollup ───────────────────────────────
+            parts = []
+            for tbl in tables:
+                cfg = _COUNT_TABLE_CONFIG.get(tbl)
+                if cfg is None:
+                    continue
+                csv_path = self.omop_dir / f"{tbl}.csv"
+                if not csv_path.exists():
+                    self._log(
+                        f"  WARNING: {tbl}.csv not found — ancestor rollup skipped for {tbl}"
+                    )
+                    continue
 
-            # Step 3: join ancestor concept_ids → concept.csv for vocab/code
-            # Use the same concept.csv; ancestors may span multiple vocabularies
-            anc_concept_sql = f"""
-                SELECT DISTINCT
-                    p.descendant_concept_id,
-                    CAST(c.concept_id     AS BIGINT) AS ancestor_concept_id,
-                    c.vocabulary_id,
-                    c.concept_code
-                FROM _anc_pairs p
-                INNER JOIN read_csv_auto('{self.concept_path}', ignore_errors=true) c
-                        ON CAST(c.concept_id AS BIGINT) = p.ancestor_concept_id
-                WHERE c.concept_code IS NOT NULL
-            """
-            anc_concepts = con.execute(anc_concept_sql).df()
-            self._log(
-                f"    {anc_concepts['ancestor_concept_id'].nunique():,} distinct ancestor concepts"
-            )
-            if anc_concepts.empty:
-                continue
+                date_col    = cfg["date_col"]
+                concept_col = cfg["concept_col"]
+                col_prefix  = cfg["col_prefix"]
+                anc_prefix  = f"{col_prefix}_anc"
+                window_days = window_days_per_table.get(tbl, 365)
 
-            con.register("_anc_concepts", anc_concepts)
+                self._log(f"  [ancestor] {tbl} → {window_days} d window …")
 
-            # Step 4: aggregate to ancestor level
-            rollup_sql = f"""
-                SELECT
-                    a.impression_id,
-                    '{anc_prefix}:' || ac.vocabulary_id || '/' || ac.concept_code
-                        || '_{window_days}d'                                    AS col_name,
-                    COUNT(DISTINCT CAST(t.{date_col} AS DATE))                  AS day_count,
-                    CAST(MAX(CAST(t.{date_col} AS DATE)) AS VARCHAR)            AS most_recent_date
-                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
-                INNER JOIN anchors_tbl a
-                        ON CAST(t.person_id AS BIGINT) = a.person_id
-                INNER JOIN _anc_concepts ac
-                        ON CAST(t.{concept_col} AS BIGINT) = ac.descendant_concept_id
-                WHERE t.{date_col} IS NOT NULL
-                  AND DATEDIFF(
-                        'day',
-                        CAST(t.{date_col} AS DATE),
-                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                      ) BETWEEN 1 AND {window_days}
-                GROUP BY a.impression_id, ac.vocabulary_id, ac.concept_code
-            """
-            rollup_df = con.execute(rollup_sql).df()
-            self._log(
-                f"    {len(rollup_df):,} (study, ancestor) rows  "
-                f"({rollup_df['col_name'].nunique():,} distinct ancestor codes, "
-                f"{rollup_df['impression_id'].nunique():,} studies)"
-            )
-            parts.append(rollup_df)
+                # 3a. Distinct descendant concept_ids seen in cohort window → temp table
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE _desc_ids AS
+                    SELECT DISTINCT CAST(t.{concept_col} AS BIGINT) AS descendant_concept_id
+                    FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                    INNER JOIN anchors_tbl a
+                            ON CAST(t.person_id AS BIGINT) = a.person_id
+                    WHERE t.{date_col} IS NOT NULL
+                      AND DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                          ) BETWEEN 1 AND {window_days}
+                """)
+                n_desc = con.execute("SELECT COUNT(*) FROM _desc_ids").fetchone()[0]
+                self._log(f"    {n_desc:,} distinct descendant concept_ids in window")
+                if n_desc == 0:
+                    continue
 
-        con.close()
+                # 3b. Ancestor concepts for those descendants → temp table
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE _anc_concepts AS
+                    SELECT DISTINCT
+                        d.descendant_concept_id,
+                        c.concept_id  AS ancestor_concept_id,
+                        c.vocabulary_id,
+                        c.concept_code
+                    FROM _desc_ids d
+                    INNER JOIN _ca ca
+                            ON ca.descendant_concept_id = d.descendant_concept_id
+                    INNER JOIN _concept c
+                            ON c.concept_id = ca.ancestor_concept_id
+                """)
+                n_anc = con.execute(
+                    "SELECT COUNT(DISTINCT ancestor_concept_id) FROM _anc_concepts"
+                ).fetchone()[0]
+                self._log(f"    {n_anc:,} distinct ancestor concepts")
+                if n_anc == 0:
+                    continue
+
+                # 3c. Pass 1 — coverage per ancestor code (fully inside DuckDB)
+                #     Keep only codes present in ≥ min_studies_ancestor studies,
+                #     capped at max_ancestor_features ordered by descending coverage.
+                self._log(
+                    f"    pass 1: computing per-ancestor coverage "
+                    f"(min={min_studies_ancestor} studies, cap={max_ancestor_features}) …"
+                )
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE _kept_anc AS
+                    SELECT
+                        '{anc_prefix}:' || ac.vocabulary_id || '/' || ac.concept_code
+                            || '_{window_days}d'                              AS col_name,
+                        COUNT(DISTINCT a.impression_id)                       AS n_studies
+                    FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                    INNER JOIN anchors_tbl a
+                            ON CAST(t.person_id AS BIGINT) = a.person_id
+                    INNER JOIN _anc_concepts ac
+                            ON CAST(t.{concept_col} AS BIGINT) = ac.descendant_concept_id
+                    WHERE t.{date_col} IS NOT NULL
+                      AND DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                          ) BETWEEN 1 AND {window_days}
+                    GROUP BY ac.vocabulary_id, ac.concept_code
+                    HAVING COUNT(DISTINCT a.impression_id) >= {min_studies_ancestor}
+                    ORDER BY n_studies DESC
+                    LIMIT {max_ancestor_features}
+                """)
+                n_kept = con.execute("SELECT COUNT(*) FROM _kept_anc").fetchone()[0]
+                self._log(f"    {n_kept:,} ancestor codes pass coverage filter")
+                if n_kept == 0:
+                    continue
+
+                # 3d. Pass 2 — fetch only kept codes (small result → Python)
+                self._log("    pass 2: fetching filtered ancestor rows …")
+                rollup_df = con.execute(f"""
+                    SELECT
+                        a.impression_id,
+                        '{anc_prefix}:' || ac.vocabulary_id || '/' || ac.concept_code
+                            || '_{window_days}d'                              AS col_name,
+                        COUNT(DISTINCT CAST(t.{date_col} AS DATE))            AS day_count,
+                        CAST(MAX(CAST(t.{date_col} AS DATE)) AS VARCHAR)      AS most_recent_date
+                    FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                    INNER JOIN anchors_tbl a
+                            ON CAST(t.person_id AS BIGINT) = a.person_id
+                    INNER JOIN _anc_concepts ac
+                            ON CAST(t.{concept_col} AS BIGINT) = ac.descendant_concept_id
+                    INNER JOIN _kept_anc k
+                            ON ('{anc_prefix}:' || ac.vocabulary_id || '/' || ac.concept_code
+                                || '_{window_days}d') = k.col_name
+                    WHERE t.{date_col} IS NOT NULL
+                      AND DATEDIFF(
+                            'day',
+                            CAST(t.{date_col} AS DATE),
+                            CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                          ) BETWEEN 1 AND {window_days}
+                    GROUP BY a.impression_id, ac.vocabulary_id, ac.concept_code
+                """).df()
+
+                self._log(
+                    f"    {len(rollup_df):,} (study, ancestor) rows  "
+                    f"({rollup_df['col_name'].nunique():,} distinct ancestor codes, "
+                    f"{rollup_df['impression_id'].nunique():,} studies)"
+                )
+                parts.append(rollup_df)
+
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+            if tmp_db.exists():
+                tmp_db.unlink(missing_ok=True)
 
         if not parts:
             return pd.DataFrame(
@@ -1508,6 +1585,8 @@ class LabExtractor:
         count_window_days:      Optional[dict] = None,
         use_concept_ancestor:   bool = False,
         ancestor_levels:        Optional[int] = None,
+        min_studies_ancestor:   int = 100,
+        max_ancestor_features:  int = 2000,
     ) -> LabFeatureMatrix:
         """Run the full extraction and return a LabFeatureMatrix.
 
@@ -1532,6 +1611,12 @@ class LabExtractor:
             ancestor_levels       : maximum number of levels to climb in the hierarchy
                                     (None = unlimited). Only used when
                                     use_concept_ancestor=True.
+            min_studies_ancestor  : ancestor codes present in fewer studies than this
+                                    are dropped (default 100; intentionally higher than
+                                    min_studies_per_lab because ancestor codes are far
+                                    more numerous and sparser).
+            max_ancestor_features : hard cap on ancestor feature columns per event table,
+                                    keeping the highest-coverage codes (default 2000).
         """
         if windows_days is None:
             windows_days = DEFAULT_WINDOWS
@@ -1611,7 +1696,10 @@ class LabExtractor:
             if ancestor_levels is not None:
                 self._log(f"  max levels: {ancestor_levels}")
             anc_long = self._run_duckdb_ancestor_rollup(
-                cohort_rows, count_tables, count_window_per_table, ancestor_levels
+                cohort_rows, count_tables, count_window_per_table,
+                ancestor_levels=ancestor_levels,
+                min_studies_ancestor=min_studies_ancestor,
+                max_ancestor_features=max_ancestor_features,
             )
             if not anc_long.empty:
                 X_anc, columns_anc, count_dates_anc = self._pivot_counts(
