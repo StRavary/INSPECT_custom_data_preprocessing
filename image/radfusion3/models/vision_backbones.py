@@ -14,6 +14,19 @@ class Identity(nn.Module):
         return x
 
 
+def resnext_101_imagenet(**kwargs):
+    """ResNeXt-101-32x8d with standard ImageNet pretrained weights.
+    Use this as the starting point for RSNA fine-tuning with channels=window.
+    Starting from a repeat-trained checkpoint with window inputs causes loss=0
+    because the backbone produces out-of-distribution features for the new input
+    format, collapsing gradients to zero.
+    """
+    model = model_2d.resnext101_32x8d(pretrained=True)
+    features_dims = model.fc.in_features  # 2048
+    model.fc = Identity()
+    return model, features_dims
+
+
 def resnext_101_sup_ct(**kwargs):
     model = model_2d.resnext101_32x8d(pretrained=True)
     features_dims = model.fc.in_features

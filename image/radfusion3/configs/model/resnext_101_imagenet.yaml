@@ -1,0 +1,8 @@
+type: model_2d
+model_name: resnext_101_imagenet
+pretrain_type: supervised
+num_class: 1
+# ResNeXt101-32x8d starting from standard ImageNet pretrained weights.
+# Use this as the starting point for RSNA fine-tuning with channels=window.
+# Do NOT use the repeat-trained resnext101_rsna.ckpt here — that checkpoint
+# learned features for a different input distribution and will cause loss=0.
