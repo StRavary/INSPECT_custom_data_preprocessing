@@ -1,6 +1,6 @@
 # INSPECT EHR Feature Extraction App — Overview
 
-The app (`Custom/app_feature_extraction.py`) is a Streamlit interface for extracting structured EHR features from the INSPECT dataset and exporting them as machine-learning-ready arrays. It is designed to let lab members run and share reproducible feature extractions without writing code, and to immediately inspect the resulting cohort before any modelling.
+The app (`Custom/app_feature_extraction.py`) is a Streamlit interface for extracting structured EHR features from the INSPECT dataset and exporting them as machine-learning-ready arrays. It queries raw OMOP CSVs via DuckDB (no large files loaded into RAM) and is designed to let lab members run and share reproducible feature extractions without writing code, then immediately inspect the resulting cohort before any modelling.
 
 Run it with:
 
@@ -16,7 +16,7 @@ The INSPECT dataset contains two complementary EHR data sources: a pre-processed
 
 ---
 
-## The seven tabs
+## The five tabs
 
 ### Tab 0 · Load
 
@@ -44,52 +44,40 @@ Configures the file paths the two extraction routes need. Each path has a text i
 
 ---
 
-### Tab 2 · Configure
+### Tab 2 · Extract
 
-Sets parameters that are shared between Route A and Route B:
+Configures and runs a DuckDB-based extraction from the raw OMOP CSVs. All parameters are set here; clicking **Run extraction** spawns a subprocess and streams the log live.
 
-**Task** — the prediction target. This must match a column name in the cohort file (e.g., `12_month_mortality`, `30_day_PE_recurrence`). The dropdown is populated from the cohort file automatically.
+**Task and anchor type** — the prediction target (must match a column in the cohort file) and anchor direction. `dx` anchors one day before study time (diagnostic tasks); `px` anchors at study time (prognostic tasks). See §3 of the EHR guide for details.
 
-**Anchor type** — controls where in time the feature window ends. `dx` anchors one day before the study time (information available at time of ordering); `px` anchors at the study time itself (information available after reading the scan). Most PE-outcome tasks should use `dx`.
+**Feature types** — six types can be selected independently via checkboxes:
 
----
+| feature type    | OMOP table              | value type | col prefix |
+|-----------------|-------------------------|------------|------------|
+| Labs            | `measurement.csv`       | float (real measurement values)   | `labs:`    |
+| Diagnoses       | `condition_occurrence`  | int (distinct event days)         | `diag:`    |
+| Drugs           | `drug_exposure`         | int (distinct event days)         | `drug:`    |
+| Procedures      | `procedure_occurrence`  | int (distinct event days)         | `proc:`    |
+| Observations    | `observation`           | int (distinct event days)         | `obs:`     |
+| Visits          | `visit_occurrence`      | int (distinct visit days + LOS)   | `visit:`   |
 
-### Tab 3 · Route A · FEMR
+**Lab windows** — cumulative lookback windows for lab features (e.g., `[2, 7, 30, 365]` days). For each lab × window, six aggregate columns are produced: `last`, `min`, `max`, `mean`, `n`, and `days_since`. Windows are cumulative: a measurement at day −5 appears in `_30d` and `_365d` but not `_2d`.
 
-Extracts count-based features from the FEMR patient timeline database. This is the same representation used in the published INSPECT baselines.
+**LOINC codes** — by default all LOINC-coded measurements are included. A text box restricts extraction to a specific panel (one code per line or comma-separated).
 
-**Feature groups** — each group covers a set of OMOP tables and can be toggled on or off. The available groups are:
+**Count windows** — each non-lab feature type has its own independent lookback window in days (e.g., diagnoses in the past year, drugs in the past 60 days). Only active feature types show a window input.
 
-- `vitals_labs` — measurements and observations (LOINC-coded labs and vitals)
-- `diag_proc` — diagnoses and procedures combined (ICD-10-CM, ICD-10-PCS, CPT4)
-- `diag` — diagnoses only (condition_occurrence)
-- `proc` — procedures and device exposures only
-- `drugs` — drug exposures (RxNorm ingredient-level)
-- `visits` — inpatient, outpatient, and emergency visits
+**Length-of-stay** — when Visits is selected, two LOS columns are automatically added alongside the visit-count columns: `visit:LOS/total_{N}d` (total inpatient days) and `visit:LOS/max_{N}d` (longest single admission) within the window.
 
-**Time windows (bins)** — each group can have independent time windows. A `[30, 365]` setting produces two non-overlapping bins: days 1–30 before anchor and days 31–365. Multiple windows allow the model to distinguish recent from distant history.
+**Min studies per feature** — labs or codes present in fewer than this many studies are dropped. Keeps the matrix width manageable and avoids near-empty columns.
 
-**Catch-all** — when enabled, any code that appears fewer than a threshold number of times is lumped into a single `other` column per vocabulary, preventing rare codes from creating millions of near-zero columns.
+**Concept ancestor rollup** (optional, collapsed by default) — when enabled, events are also rolled up to their OMOP ancestor concepts via `concept_ancestor.csv` (~1.7 GB). Ancestor columns are prefixed `{type}_anc:` (e.g. `diag_anc:`, `drug_anc:`). Three sub-options control the scope:
 
-**Number of threads** — controls FEMR's internal parallelism.
+- *Limit ancestor levels* (default on) — restrict how many levels to climb; 2 gives parent + grandparent
+- *Min studies (ancestor)* — coverage threshold for ancestor codes (default 100, intentionally higher than the direct-code threshold)
+- *Max ancestor features* — hard cap per table ordered by descending coverage (default 2000)
 
-Values in Route A are counts of distinct days on which a code appeared with a changed value (delta-encoding removes repeated identical measurements). The result is a sparse CSR matrix; most entries are zero.
-
-Clicking **Run extraction** spawns a subprocess (to avoid a Streamlit–multiprocessing deadlock), streams the log in real time, and caches the result to disk. A spec hash is computed from all parameters so that re-running with identical settings loads from cache instantly.
-
----
-
-### Tab 4 · Route B · Labs
-
-Extracts numerical lab-value features directly from `measurement.csv` using DuckDB, which scans the 22 GB file out-of-core without loading it into memory.
-
-**Time windows** — unlike Route A's non-overlapping bins, Route B windows are cumulative: a `30d` window collects measurements from days 1–30, a `365d` window from days 1–365. This means that for each lab, a single DuckDB scan is performed up to the maximum window, and the per-window statistics are computed in pandas afterwards.
-
-**LOINC codes** — by default, every LOINC-coded measurement in `concept.csv` is included. A text box allows restricting to a specific list of codes (one per line or comma-separated), which is useful for extracting a targeted panel (e.g., D-dimer, troponin I, BNP) quickly.
-
-**Minimum studies per lab** — labs measured in fewer than this many studies are excluded. Raising this threshold keeps only the most commonly ordered labs and reduces the feature matrix width.
-
-For each lab × window combination, Route B produces six aggregate columns: `last` (most recent value), `min`, `max`, `mean`, `n` (number of measurements), and `days_since` (days between the most recent measurement and the anchor). The result is a dense float32 matrix with NaN where a lab was not measured for a study. Column names follow the pattern `labs:LOINC/<code>_<agg>_<N>d`.
+The extraction is identified by a SHA-256 hash of its full specification; re-running with identical settings loads from cache instantly.
 
 ---
 
@@ -113,7 +101,7 @@ For Route A (sparse), age NaN is filled with the cohort median and binary NaN is
 
 ---
 
-### Tab 5 · Describe
+### Tab 3 · Describe
 
 A GDC-style cohort builder for inspecting a loaded feature matrix without running any models. The tab lets you define a cohort filter and one or two stratification variables, then shows a summary table and charts for the resulting slice.
 
@@ -127,7 +115,7 @@ A GDC-style cohort builder for inspecting a loaded feature matrix without runnin
 
 ---
 
-### Tab 6 · Export
+### Tab 4 · Export
 
 Writes the loaded feature matrix to a directory of flat files ready for modelling. All studies are exported together — train/test splitting is left to the downstream pipeline.
 
@@ -139,17 +127,18 @@ Writes the loaded feature matrix to a directory of flat files ready for modellin
 
 **Output files produced:**
 
-For Route B (dense):
-- `X.npy` — float32 array, shape (n_studies, n_features), NaN = not measured
-- `X_mask.npy` — uint8 array, 1 = value observed, 0 = missing
-- `y.npy` — binary task label
-- `tte.npy` / `event.npy` — survival outcome arrays (if available)
-- `metadata.csv` — impression_id, patient_id, anchor_time, y, and survival columns per row
-- `feature_names.csv` — raw and human-readable name for each column
-- `load_survival.py` — ready-to-run script showing how to load the arrays and apply a train/test split for lifelines or scikit-survival
-- `load_multimodal.py` — script showing how to join EHR features with imaging or NLP outputs using `impression_id`
+| file                | description                                                                                      |
+|---------------------|--------------------------------------------------------------------------------------------------|
+| `metadata.csv`      | One row per study: `impression_id`, `patient_id`, `anchor_time`, `y`, `tte_days`, `event`        |
+| `X.npy`             | float32 feature matrix, shape `(n_studies, n_features)`. Lab values: NaN = not measured; count features: 0 = not observed. Rows align with `metadata.csv` |
+| `X_mask.npy`        | uint8 observation mask, same shape. 1 = observed, 0 = missing. For imputation-aware models       |
+| `y.npy`             | Binary label array, length `n_studies`                                                           |
+| `tte.npy` / `event.npy` | Time-to-event (days) and event indicator; written only when survival columns are present      |
+| `feature_names.csv` | Two columns: `raw` (e.g. `drug:RxNorm/11289_60d`) and `human` (e.g. `drug:apixaban [RxNorm/11289]_60d`). Index aligns with `X.npy` columns |
+| `load_survival.py`  | Ready-to-run script: loads all arrays, applies train/test split, fits a survival model           |
+| `load_multimodal.py`| Script showing how to join EHR features with imaging or NLP outputs using `impression_id`        |
 
-For Route A (sparse), `X.npy` is replaced by `X_sparse.npz` (scipy CSR format).
+For legacy Route A (sparse) extractions, `X.npy` is replaced by `X_sparse.npz` (scipy CSR format).
 
 ---
 
@@ -162,8 +151,7 @@ Every extraction is identified by a SHA-256 hash of its full specification (task
 ## Typical workflow for a new lab-mate
 
 1. Open **Tab 1 · Data Sources** and validate each path (most will be pre-filled correctly for the INSPECT server).
-2. Open **Tab 2 · Configure**, select the task you care about, and confirm the anchor type.
-3. Run **Tab 3 · Route A** or **Tab 4 · Route B** (or both) and wait for the log to finish. Route A typically takes 5–30 minutes depending on thread count; Route B depends on which LOINC codes are requested and can range from a few minutes (targeted panel) to an hour (all labs).
-4. The extraction is now cached. Future sessions can skip steps 1–3 entirely and go straight to **Tab 0 · Load**.
-5. Use **Tab 5 · Describe** to sanity-check the cohort — check prevalence, demographic balance, and data density.
-6. Use **Tab 6 · Export** to write the arrays to a folder, then use the generated `load_survival.py` as a starting point for your model.
+2. Open **Tab 2 · Extract**, select the task and anchor type, check the feature types you want, set lookback windows, and click **Run extraction**. Extraction time ranges from a few minutes (targeted lab panel only) to tens of minutes (all feature types). Labs-only with `windows_days=[365]` is usually the fastest starting point.
+3. The extraction is now cached. Future sessions can skip steps 1–2 entirely and go straight to **Tab 0 · Load**.
+4. Use **Tab 3 · Describe** to sanity-check the cohort — check prevalence, demographic balance, and data density.
+5. Use **Tab 4 · Export** to write the arrays to a folder, then use the generated `load_survival.py` as a starting point for your model.

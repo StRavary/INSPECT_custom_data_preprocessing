@@ -14,3 +14,7 @@ metrics.csv
 *.ckpt
 *.log
 feature_ceiling.png
+
+# Understand-Anything knowledge graph tool data
+.ua/
+.understand-anything/

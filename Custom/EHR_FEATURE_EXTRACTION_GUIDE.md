@@ -42,8 +42,10 @@ directly.
 **Route B — the raw OMOP CSVs (`DATA_RAW/EHR_CSV/`).**
 Complete and unreduced. Use this when you need measurement *values*, true
 sampling frequency, or control over ontology expansion depth. The extractor
-(`route_b_labs.py`) queries `measurement.csv` via DuckDB — the full
-22.7 GB file is never loaded into RAM.  
+(`route_b_labs.py`) queries OMOP CSVs via DuckDB — large files are streamed
+out-of-core and never loaded into RAM. Supports labs (numeric values from
+`measurement.csv`), diagnoses, drugs, procedures, observations, and visits
+(event counts), plus optional concept ancestor rollup and LOS features.
 
 | table                | size    | est. rows |
 |----------------------|---------|-----------|
@@ -94,20 +96,15 @@ cd Custom
 ../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
 ```
 
-The app has seven tabs:
+The app has five tabs:
 
-| tab                    | purpose                                                                                         |
-|------------------------|-------------------------------------------------------------------------------------------------|
-| **0 · Load**           | Lists all saved extractions (both Route A and B). Load instantly — no reconfiguration needed. Start here.         |
-| **1 · Data sources**   | Validate file paths. Required: cohort + FEMR database (Route A) or cohort + OMOP dir (Route B).                  |
-| **2 · Configure**      | Preview windows, validate spec, download reproducible YAML. No data access.                         |
-| **3 · Route A · FEMR** | Run a new FEMR count-feature extraction. Subprocess-based; logs stream live.                        |
-| **4 · Route B · Labs** | Run a new OMOP lab-value extraction via DuckDB. Configure windows and LOINC filter.            |
-| **5 · Describe**       | GDC-style cohort builder — filter by label, survival event, sex, age band; browse individual cases. |
-| **6 · Export**         | Write split-ready files to disk (sparse NPZ for Route A, dense numpy for Route B).               |
-
-The Configure tab emits a YAML spec plus the equivalent Python call, so anything
-you build in the UI is reproducible without it.
+| tab                  | purpose                                                                                                   |
+|----------------------|-----------------------------------------------------------------------------------------------------------|
+| **0 · Load**         | Lists all saved extractions. Load instantly — no reconfiguration needed. Start here.                      |
+| **1 · Data sources** | Validate file paths: cohort, OMOP CSVs (`measurement`, `concept`, `person`), and labels.                  |
+| **2 · Extract**      | Choose feature types, set per-type lookback windows, run DuckDB extraction. Logs stream live.             |
+| **3 · Describe**     | GDC-style cohort builder — filter by label, survival event, sex, age band; browse individual cases.       |
+| **4 · Export**       | Write split-ready files to disk (`X.npy`, `y.npy`, `metadata.csv`, `feature_names.csv`, load scripts).   |
 
 ### Option B — the Python API (Route A)
 
@@ -138,12 +135,32 @@ print(ds.describe())
 ```python
 from Custom.route_b_labs import LabExtractor
 
-ex = LabExtractor()          # paths auto-resolve; person.csv appended automatically
+ex = LabExtractor()   # paths auto-resolve; person.csv appended automatically
 ds = ex.build(
     task="12_month_PH",
-    windows_days=[2, 7, 30, 365],   # window edges in days
+    windows_days=[2, 7, 30, 365],   # cumulative window edges for labs (days)
     loinc_codes=None,               # None = all LOINC-coded measurements
-    min_studies_per_lab=50,         # drop rarely-measured labs
+
+    # which feature types to extract
+    feature_types=["labs", "diagnoses", "drugs", "procedures",
+                   "observations", "visits"],
+
+    # per-type lookback windows for count features (days)
+    count_window_days={
+        "diagnoses":    365,
+        "drugs":         60,
+        "procedures":   365,
+        "observations": 365,
+        "visits":       365,
+    },
+
+    min_studies_per_lab=50,   # drop rare labs / count codes
+
+    # concept ancestor rollup (requires concept_ancestor.csv, ~1.7 GB)
+    use_concept_ancestor=False,
+    ancestor_levels=2,           # only used when use_concept_ancestor=True
+    min_studies_ancestor=100,    # separate threshold for ancestor columns
+    max_ancestor_features=2000,  # hard cap per event table
 )
 
 ds.X            # numpy float32 array, one row per study; NaN = not measured
@@ -207,12 +224,17 @@ Three consequences:
    permutation or grouped importance.
 3. The feature space is much wider than the number of distinct raw codes.
 
-### 5.2 Route B columns (OMOP lab-value features)
+### 5.2 Route B columns (OMOP feature types)
+
+Route B can extract six complementary feature types from different OMOP tables.
+Each type has its own column naming convention.
+
+#### 5.2.1 Lab features (`labs:`) — `measurement.csv`
 
 Each column is one **(LOINC code, aggregate, time-window)** triple. The value is
 a real-valued measurement from `measurement.value_as_number`, summarised over
 the window. NaN means the lab was not measured at all in that window — this is
-different from zero, which would mean a count of zero in Route A.
+different from zero, which means "not observed" for count features.
 
 Column names follow the pattern `labs:LOINC/<code>_<agg>_<N>d` where:
 
@@ -230,12 +252,70 @@ reading in the 30 days before the anchor. `labs:LOINC/2160-0_n_30d` is how
 many times creatinine was measured in that period.
 
 Windows are **cumulative**, not nested: `_2d` covers the last 2 days, `_30d`
-covers the last 30 days (including those 2), and so on. A patient with a
-creatinine at day −5 will appear in `_30d` and `_365d` but not `_2d`.
+covers the last 30 days (including those 2). A measurement at day −5 appears
+in `_30d` and `_365d` but not `_2d`.
 
-Route B currently extracts only LOINC-coded entries from `measurement.csv`.
-Vital signs recorded under other vocabularies are not included unless you pass
-their LOINC equivalents to `loinc_codes`.
+Route B extracts only LOINC-coded entries from `measurement.csv`. Vital signs
+recorded under other vocabularies are not included unless you pass their LOINC
+equivalents to `loinc_codes`.
+
+#### 5.2.2 Count features — diagnoses, drugs, procedures, observations, visits
+
+The remaining five feature types all follow the same pattern: a count of
+**distinct event days** within the lookback window, drawn from a single OMOP
+table. The value is 0 (not observed) rather than NaN (not measured), because
+absence is unambiguous for coded events.
+
+| feature_type   | OMOP table            | col prefix | vocabularies                          |
+|----------------|-----------------------|------------|---------------------------------------|
+| `diagnoses`    | `condition_occurrence`| `diag`     | ICD-10-CM, ICD-9-CM, SNOMED           |
+| `drugs`        | `drug_exposure`       | `drug`     | RxNorm, RxNorm Extension              |
+| `procedures`   | `procedure_occurrence`| `proc`     | CPT4, ICD-10-PCS, HCPCS, ICD-9-Proc  |
+| `observations` | `observation`         | `obs`      | OMOP Observation domain               |
+| `visits`       | `visit_occurrence`    | `visit`    | OMOP Visit domain                     |
+
+Column name pattern: `{prefix}:{vocabulary}/{concept_code}_{N}d`
+
+Examples:
+- `diag:ICD10CM/I26.90_365d` — days with a PE diagnosis in the past year
+- `drug:RxNorm/11289_60d` — days apixaban was dispensed in the past 60 days
+- `proc:CPT4/71275_365d` — days a CTPA was performed in the past year
+- `visit:Visit/9201_365d` — inpatient visit days in the past year
+
+Each feature type has its own independently configurable lookback window
+(`count_window_days` dict), so you can look back 365 days for diagnoses but
+only 60 days for drugs.
+
+#### 5.2.3 Length-of-stay (LOS) features — `visit_occurrence`
+
+When `visits` is selected, two LOS columns are automatically appended alongside
+the visit-count columns:
+
+| column pattern                  | meaning                                                         |
+|---------------------------------|-----------------------------------------------------------------|
+| `visit:LOS/total_{N}d`          | sum of `(visit_end_date − visit_start_date)` across all visits in window |
+| `visit:LOS/max_{N}d`            | maximum single-visit length of stay in window                   |
+
+Values are in days. These capture hospitalisation burden independently of visit
+count: a patient with one 30-day admission differs from one with 30 day visits.
+
+#### 5.2.4 Concept ancestor rollup (`{prefix}_anc:`) — optional
+
+When `use_concept_ancestor=True`, each event is also rolled up to its ancestor
+concepts in the OMOP hierarchy using `concept_ancestor.csv`. This creates
+additional columns grouped at a broader clinical level — e.g., all specific PE
+ICD codes roll up to the parent VTE category.
+
+Column name pattern: `{prefix}_anc:{vocabulary}/{concept_code}_{N}d`
+
+Examples:
+- `diag_anc:SNOMED/59282003_365d` — events under the SNOMED pulmonary embolism ancestor
+- `drug_anc:ATC/B01AF_60d` — days any direct oral anticoagulant was dispensed
+
+Because ancestor codes are far more numerous than direct codes, use stricter
+filtering: `min_studies_ancestor` (default 100) and `max_ancestor_features`
+(default 2000 per table). Setting `ancestor_levels=2` (parent and grandparent
+only) dramatically reduces the ancestor pair count relative to unlimited depth.
 
 ### 5.3 Demographic columns (both routes)
 
@@ -245,15 +325,15 @@ extraction automatically when `person.csv` is configured. They carry the prefix
 
 | column                                     | type     | encoding                                                      |
 |--------------------------------------------|----------|--------------------------------------------------------------|
-| `demo:age_years`                           | float    | true age at anchor in years — **not z-scored**, so you can choose your own normalisation. NaN if birth date is missing. |
-| `demo:is_female`                           | binary   | 1 = female (OMOP gender_concept_id 8532), 0 = male (8507), NaN = other or not recorded |
-| `demo:sex_unknown`                         | binary   | 1 if gender_concept_id is 0 or the patient is absent from person.csv |
-| `demo:is_hispanic`                         | binary   | 1 = Hispanic or Latino (OMOP 38003563), 0 = Not Hispanic or Latino (38003564), NaN = not recorded |
-| `demo:race_white`                          | binary   | 1 if race_concept_id = 8527 (White) |
-| `demo:race_black  `                        | binary   | 1 if race_concept_id = 8516 (Black or African American) |
-| `demo:race_asian`                          | binary   | 1 if race_concept_id = 8515 (Asian) |
-| `demo:race_other`                          | binary   | 1 if race is recorded but is not white, black, or Asian |
-| `demo:race_unknown`                        | binary   | 1 if race_concept_id = 0 or the patient is absent from person.csv |
+| `demo:age_years`   | float    | true age at anchor in years — **not z-scored**, so you can choose your own normalisation. NaN if birth date is missing. |
+| `demo:is_female`   | binary   | 1 = female (OMOP gender_concept_id 8532), 0 = male (8507), NaN = other or not recorded |
+| `demo:sex_unknown` | binary   | 1 if gender_concept_id is 0 or the patient is absent from person.csv |
+| `demo:is_hispanic` | binary   | 1 = Hispanic or Latino (OMOP 38003563), 0 = Not Hispanic or Latino (38003564), NaN = not recorded |
+| `demo:race_white`  | binary   | 1 if race_concept_id = 8527 (White) |
+| `demo:race_black`  | binary   | 1 if race_concept_id = 8516 (Black or African American) |
+| `demo:race_asian`  | binary   | 1 if race_concept_id = 8515 (Asian) |
+| `demo:race_other`  | binary   | 1 if race is recorded but is not white, black, or Asian |
+| `demo:race_unknown`| binary   | 1 if race_concept_id = 0 or the patient is absent from person.csv |
 
 **Sparse matrix note (Route A).** Scipy sparse matrices cannot store NaN, so
 before stacking the demographic columns `append_demographics()` fills age NaN
@@ -683,15 +763,23 @@ trop_30d = [c for c in fm.columns if "LOINC/10839-9" in c and "_30d" in c]
 
 The column format for each group is:
 
-| group                     | format                             | example raw name                                 |
-|---------------------------|------------------------------------|--------------------------------------------------|
-| Route A vitals/labs       | `<group>:LOINC/<code>_<timedelta>` | `vitals_labs:LOINC/2160-0_365 days, 0:00:00`     |
-| Route A diagnosis         | `diag:ICD10CM/<code>_<timedelta>`  | `diag:ICD10CM/I26.90_365 days, 0:00:00`          |
-| Route A procedure         | `proc:CPT4/<code>_<timedelta>`     | `proc:CPT4/71275_365 days, 0:00:00`              |
-| Route A drug              | `drugs:RxNorm/<id>_<timedelta>`    | `drugs:RxNorm/11289_30 days, 0:00:00`            |
-| Route A visit             | `visits:Visit/<id>_<timedelta>`    | `visits:Visit/9201_365 days, 0:00:00`            |
-| Route B lab               | `labs:LOINC/<code>_<agg>_<N>d`     | `labs:LOINC/2160-0_last_30d`                     |
-| Demographics              | `demo:<name>`                      | `demo:age_years`                                 |
+| group                         | format                                  | example raw name                                 |
+|-------------------------------|-----------------------------------------|--------------------------------------------------|
+| Route A vitals/labs           | `<group>:LOINC/<code>_<timedelta>`      | `vitals_labs:LOINC/2160-0_365 days, 0:00:00`     |
+| Route A diagnosis             | `diag:ICD10CM/<code>_<timedelta>`       | `diag:ICD10CM/I26.90_365 days, 0:00:00`          |
+| Route A procedure             | `proc:CPT4/<code>_<timedelta>`          | `proc:CPT4/71275_365 days, 0:00:00`              |
+| Route A drug                  | `drugs:RxNorm/<id>_<timedelta>`         | `drugs:RxNorm/11289_30 days, 0:00:00`            |
+| Route A visit                 | `visits:Visit/<id>_<timedelta>`         | `visits:Visit/9201_365 days, 0:00:00`            |
+| Route B lab                   | `labs:LOINC/<code>_<agg>_<N>d`          | `labs:LOINC/2160-0_last_30d`                     |
+| Route B diagnosis count       | `diag:<vocab>/<code>_<N>d`              | `diag:ICD10CM/I26.90_365d`                       |
+| Route B drug count            | `drug:<vocab>/<code>_<N>d`              | `drug:RxNorm/11289_60d`                          |
+| Route B procedure count       | `proc:<vocab>/<code>_<N>d`              | `proc:CPT4/71275_365d`                           |
+| Route B observation count     | `obs:<vocab>/<code>_<N>d`               | `obs:SNOMED/271649006_365d`                      |
+| Route B visit count           | `visit:<vocab>/<code>_<N>d`             | `visit:Visit/9201_365d`                          |
+| Route B LOS (total)           | `visit:LOS/total_<N>d`                  | `visit:LOS/total_365d`                           |
+| Route B LOS (max)             | `visit:LOS/max_<N>d`                    | `visit:LOS/max_365d`                             |
+| Route B ancestor rollup       | `{prefix}_anc:<vocab>/<code>_<N>d`      | `diag_anc:SNOMED/59282003_365d`                  |
+| Demographics                  | `demo:<name>`                           | `demo:age_years`                                 |
 
 Note that Route A window labels use Python `timedelta` format (`365 days, 0:00:00`),
 not the short `_365d` notation used by Route B. The `human_columns()` method

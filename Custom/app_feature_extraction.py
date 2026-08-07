@@ -1282,6 +1282,80 @@ def main() -> None:  # pragma: no cover
                     key="lf_download",
                 )
 
+            # ── Event timeline CSV ───────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("Event timeline CSV")
+            _ft = getattr(fm, "feature_types", None) or []
+            _cwd = getattr(fm, "count_window_days", None) or {}
+            st.caption(
+                "Raw individual event occurrences — one row per event, not per "
+                "aggregated feature. Includes the exact `event_date` and "
+                "`days_before_ctpa` for each lab measurement, diagnosis, drug "
+                "exposure, procedure, observation, or visit. For lab events the "
+                "`value` column contains the measured numeric value; for coded "
+                "events it is `NaN`.  \n\n"
+                "**Use this for longitudinal / sequence modelling** where you need "
+                "the full temporal structure, not just window aggregates.  \n\n"
+                "Re-queries the raw OMOP CSVs at export time — "
+                "expect a few minutes for large cohorts."
+            )
+            if not _ft:
+                st.warning(
+                    "Feature types not stored in this extraction (older pkl). "
+                    "Re-run the extraction to enable timeline export."
+                )
+            else:
+                _window_summary = []
+                if "labs" in _ft:
+                    _window_summary.append(f"labs ≤ {max(fm.windows_days)} d")
+                for _ft_key, _days in _cwd.items():
+                    _window_summary.append(f"{_ft_key} ≤ {_days} d")
+                st.info(
+                    f"Feature types: **{', '.join(_ft)}**  \n"
+                    f"Windows: {' · '.join(_window_summary)}"
+                )
+
+                if st.button("Build event timeline", key="tl_build"):
+                    from Custom.route_b_labs import build_event_timeline
+                    _omop_dir        = Path(omop_dir)
+                    _measurement_csv = _omop_dir / "measurement.csv"
+                    _concept_csv     = Path(concept_csv)
+                    with st.spinner(
+                        "Querying OMOP CSVs … this may take several minutes "
+                        "depending on which feature types are selected."
+                    ):
+                        tl_df = build_event_timeline(
+                            fm=fm,
+                            omop_dir=_omop_dir,
+                            measurement_path=_measurement_csv,
+                            concept_path=_concept_csv,
+                            verbose=True,
+                        )
+                    st.session_state["timeline_df"]      = tl_df
+                    st.session_state["timeline_df_task"] = fm.task
+
+                tl_df = st.session_state.get("timeline_df")
+                if tl_df is not None and st.session_state.get("timeline_df_task") != fm.task:
+                    tl_df = None
+                    st.session_state.pop("timeline_df", None)
+
+                if tl_df is not None:
+                    st.success(
+                        f"{len(tl_df):,} events · "
+                        f"{tl_df['impression_id'].nunique():,} studies · "
+                        f"{tl_df['event_type'].value_counts().to_dict()}"
+                    )
+                    st.dataframe(tl_df.head(200), use_container_width=True, hide_index=True)
+                    tl_buf = io.StringIO()
+                    tl_df.to_csv(tl_buf, index=False)
+                    st.download_button(
+                        "⬇️ Download event timeline CSV",
+                        tl_buf.getvalue(),
+                        file_name=f"{fm.task}_event_timeline.csv",
+                        mime="text/csv",
+                        key="tl_download",
+                    )
+
 
 if __name__ == "__main__":  # pragma: no cover
     main()

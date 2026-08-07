@@ -647,6 +647,10 @@ class LabFeatureMatrix:
     # Wide DataFrame indexed by impression position (0-based), columns = count feature
     # col names, values = ISO date strings or ''.  None for old pickled extractions.
     count_dates:   Optional[object] = None   # Optional[pd.DataFrame]
+    # Feature types extracted (e.g. ["labs", "diagnoses", "drugs"]) and their
+    # per-type lookback windows in days.  None for old pickled extractions.
+    feature_types:     Optional[object] = None   # Optional[list]
+    count_window_days: Optional[object] = None   # Optional[dict] {feature_type: days}
 
     def __len__(self) -> int:
         return len(self.y)
@@ -689,6 +693,198 @@ class LabFeatureMatrix:
                 f"({float(np.nanmean(self.event)):.1%});  "
                 f"median tte {float(np.nanmedian(self.tte)):.1f} d")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Event timeline builder — raw individual events (not aggregated)
+# ---------------------------------------------------------------------------
+
+# Maps feature_type key → (OMOP table name, date_col, concept_col, event_type_label, value_expr)
+_TIMELINE_TABLE_CONFIG: dict = {
+    "diagnoses":    ("condition_occurrence", "condition_start_date",      "condition_concept_id",  "diagnosis",   "NULL"),
+    "drugs":        ("drug_exposure",        "drug_exposure_start_date",  "drug_concept_id",       "drug",        "NULL"),
+    "procedures":   ("procedure_occurrence", "procedure_date",            "procedure_concept_id",  "procedure",   "NULL"),
+    "observations": ("observation",          "observation_date",          "observation_concept_id","observation", "CAST(t.value_as_number AS DOUBLE)"),
+    "visits":       ("visit_occurrence",     "visit_start_date",          "visit_concept_id",      "visit",       "NULL"),
+}
+
+
+def build_event_timeline(
+    fm: "LabFeatureMatrix",
+    omop_dir: "Path",
+    measurement_path: "Path",
+    concept_path: "Path",
+    loinc_codes: Optional[list] = None,
+    verbose: bool = True,
+) -> "pd.DataFrame":
+    """Return a raw event timeline — one row per individual event occurrence.
+
+    This re-queries the raw OMOP CSVs using DuckDB. The lookback window for each
+    feature type is taken from ``fm.feature_types`` and ``fm.count_window_days``
+    (set automatically during extraction). Labs use ``max(fm.windows_days)``.
+
+    Parameters
+    ----------
+    fm              : loaded LabFeatureMatrix (must have feature_types set)
+    omop_dir        : directory containing OMOP CSV files
+    measurement_path: path to measurement.csv
+    concept_path    : path to concept.csv
+    loinc_codes     : optional list of LOINC codes to restrict lab events
+                      (None = all LOINC-coded measurements)
+    verbose         : print progress
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        impression_id, patient_id, anchor_time, y,
+        event_type, vocabulary, concept_code, concept_name,
+        event_date, days_before_ctpa, value
+    """
+    import pandas as pd
+
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    try:
+        import duckdb
+    except ImportError:
+        raise ImportError("pip install duckdb")
+
+    feature_types     = list(getattr(fm, "feature_types", None) or [])
+    count_window_days = dict(getattr(fm, "count_window_days", None) or {})
+    windows_days      = list(fm.windows_days) if fm.windows_days else [365]
+
+    # Build anchors table
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+        "y":             fm.y.astype(float),
+    })
+
+    con = duckdb.connect()
+    con.register("anchors_tbl", anchors_df)
+
+    # Load concept.csv once — vocabulary_id, concept_code, concept_name
+    _log("[timeline] loading concept.csv …")
+    con.execute(f"""
+        CREATE TEMP TABLE _concept AS
+        SELECT
+            CAST(concept_id AS BIGINT) AS concept_id,
+            vocabulary_id,
+            concept_code,
+            concept_name
+        FROM read_csv_auto('{concept_path}', ignore_errors=true)
+        WHERE concept_id IS NOT NULL
+    """)
+
+    parts = []
+
+    # ── Labs ────────────────────────────────────────────────────────────────
+    if "labs" in feature_types:
+        max_window = max(windows_days)
+        loinc_filter = ""
+        if loinc_codes:
+            codes_sql = ", ".join(f"'{c}'" for c in loinc_codes)
+            loinc_filter = f"AND c.concept_code IN ({codes_sql})"
+        _log(f"[timeline] labs: scanning measurement.csv (window={max_window} d) …")
+        lab_df = con.execute(f"""
+            SELECT
+                a.impression_id,
+                CAST(a.y AS DOUBLE)                                          AS y,
+                'lab'                                                         AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                          AS vocabulary,
+                COALESCE(c.concept_code,  '')                                 AS concept_code,
+                COALESCE(c.concept_name,  '')                                 AS concept_name,
+                CAST(t.measurement_date AS DATE)                              AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))           AS days_before_ctpa,
+                CAST(t.value_as_number AS DOUBLE)                             AS value
+            FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.measurement_concept_id AS BIGINT) = c.concept_id
+            WHERE t.measurement_date IS NOT NULL
+              AND CAST(t.measurement_concept_id AS BIGINT) != 0
+              {loinc_filter}
+              AND DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {max_window}
+        """).df()
+        _log(f"  {len(lab_df):,} lab event rows")
+        parts.append(lab_df)
+
+    # ── Count feature types ──────────────────────────────────────────────────
+    for ft, (tbl, date_col, concept_col, label, value_expr) in _TIMELINE_TABLE_CONFIG.items():
+        if ft not in feature_types:
+            continue
+        csv_path = Path(omop_dir) / f"{tbl}.csv"
+        if not csv_path.exists():
+            _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
+            continue
+        window_days = count_window_days.get(ft, 365)
+        _log(f"[timeline] {ft}: scanning {tbl}.csv (window={window_days} d) …")
+        part_df = con.execute(f"""
+            SELECT
+                a.impression_id,
+                CAST(a.y AS DOUBLE)                                          AS y,
+                '{label}'                                                     AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                          AS vocabulary,
+                COALESCE(c.concept_code,  '')                                 AS concept_code,
+                COALESCE(c.concept_name,  '')                                 AS concept_name,
+                CAST(t.{date_col} AS DATE)                                    AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))           AS days_before_ctpa,
+                {value_expr}                                                   AS value
+            FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.{concept_col} AS BIGINT) = c.concept_id
+            WHERE t.{date_col} IS NOT NULL
+              AND CAST(t.{concept_col} AS BIGINT) != 0
+              AND DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {window_days}
+        """).df()
+        _log(f"  {len(part_df):,} {ft} event rows")
+        parts.append(part_df)
+
+    con.close()
+
+    if not parts:
+        return pd.DataFrame(columns=[
+            "impression_id", "patient_id", "anchor_time", "y",
+            "event_type", "vocabulary", "concept_code", "concept_name",
+            "event_date", "days_before_ctpa", "value",
+        ])
+
+    timeline = pd.concat(parts, ignore_index=True)
+
+    # Join patient_id and anchor_time back from fm
+    meta = pd.DataFrame({
+        "impression_id": fm.impression_ids,
+        "patient_id":    fm.patient_ids,
+        "anchor_time":   fm.anchor_times,
+    })
+    timeline = timeline.merge(meta, on="impression_id", how="left")
+
+    out_cols = [
+        "impression_id", "patient_id", "anchor_time", "y",
+        "event_type", "vocabulary", "concept_code", "concept_name",
+        "event_date", "days_before_ctpa", "value",
+    ]
+    return (
+        timeline[out_cols]
+        .sort_values(["impression_id", "event_date", "event_type"])
+        .reset_index(drop=True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1733,19 +1929,21 @@ class LabExtractor:
         tte, event = self._read_survival(task, imp_ids)
 
         fm = LabFeatureMatrix(
-            X              = X,
-            columns        = columns,
-            y              = y,
-            tte            = tte,
-            event          = event,
-            patient_ids    = pat_ids,
-            impression_ids = np.array(imp_ids, dtype=object),
-            split          = splits,
-            anchor_times   = anchors,
-            task           = task,
-            anchor_kind    = anchor_kind,
-            windows_days   = sorted(windows_days),
-            count_dates    = count_dates,
+            X                 = X,
+            columns           = columns,
+            y                 = y,
+            tte               = tte,
+            event             = event,
+            patient_ids       = pat_ids,
+            impression_ids    = np.array(imp_ids, dtype=object),
+            split             = splits,
+            anchor_times      = anchors,
+            task              = task,
+            anchor_kind       = anchor_kind,
+            windows_days      = sorted(windows_days),
+            count_dates       = count_dates,
+            feature_types     = list(feature_types),
+            count_window_days = dict(count_window_days),
         )
 
         # Append demographics if person.csv is available
