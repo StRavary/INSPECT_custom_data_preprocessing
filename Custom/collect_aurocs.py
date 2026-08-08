@@ -57,7 +57,7 @@ for run_dir in ckpt_dir.iterdir():
         if task in name:
             # Extract timestamp suffix for comparison
             ts = name.split(task + "_")[-1] if task in name else ""
-            if ts > latest[task][0]:
+            if latest[task][0] is None or ts > latest[task][0]:
                 latest[task] = (ts, pred_file)
 
 print(f"\n{'Task':<25} {'Our AUROC':>10} {'Paper AUROC':>12} {'Gap':>8}  {'Run'}")
