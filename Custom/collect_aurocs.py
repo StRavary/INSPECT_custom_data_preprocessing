@@ -28,14 +28,14 @@ TASKS = [
 ]
 
 PAPER_AUROCS = {
-    "pe_positive_nlp":    0.931,
-    "1_month_mortality":  0.740,
-    "6_month_mortality":  0.721,
-    "12_month_mortality": 0.712,
-    "1_month_readmission":  0.613,
-    "6_month_readmission":  0.619,
-    "12_month_readmission": 0.607,
-    "12_month_PH":        0.782,
+    "pe_positive_nlp":      0.721,
+    "1_month_mortality":    0.794,
+    "6_month_mortality":    0.755,
+    "12_month_mortality":   0.748,
+    "1_month_readmission":  0.549,
+    "6_month_readmission":  0.515,
+    "12_month_readmission": 0.525,
+    "12_month_PH":          0.661,
 }
 
 parser = argparse.ArgumentParser()
