@@ -8,12 +8,17 @@
 #   /data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_uncompressed.hdf5
 # Change RUN_NAME to avoid overwriting previous embeddings.
 RUN_NAME="resnext_window"
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+FEATURES_DIR="/data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_${TIMESTAMP}"
 
 python run_featurize.py model=resnext_101_ct \
 	dataset=stanford \
 	dataset.transform.final_size=224 \
 	dataset.batch_size=256 \
 	dataset.transform.channels=window \
+	dataset.output_dir=${FEATURES_DIR} \
 	exp.name=${RUN_NAME}
 
-python convert_to_hdf5.py --run_name ${RUN_NAME}
+python convert_to_hdf5.py \
+	--input_dir ${FEATURES_DIR} \
+	--output_path /data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_uncompressed.hdf5
