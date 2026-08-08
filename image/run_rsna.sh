@@ -9,10 +9,9 @@
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2 dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4
 
-# Use resnext_101_imagenet (ImageNet pretrained, no checkpoint) as the starting
-# point — NOT the repeat-trained resnext101_rsna.ckpt. Starting from the
-# repeat-trained checkpoint with window inputs collapses gradients to zero.
-CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_imagenet dataset=rsna \
+# Use resnext_101_ct_pretrain (CT-pretrained checkpoint, no RSNA fine-tuning yet)
+# as the starting point with channels=window.
+CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct_pretrain dataset=rsna \
     dataset.transform.final_size=224 \
     dataset.batch_size=256 \
     trainer.accumulate_grad_batches=1 \
