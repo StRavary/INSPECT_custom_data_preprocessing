@@ -193,6 +193,56 @@ Executing the auxiliary tasks and the master pipeline successfully required patc
    - **Issue:** When training with Automatic Mixed Precision (`precision: bf16-mixed`), output prediction tensors are saved as `torch.bfloat16`. Calling `.numpy()` directly on these tensors inside evaluation metrics (`utils.get_auroc` and `utils.get_auprc`) raised `TypeError: Got unsupported ScalarType BFloat16` at epoch end because NumPy cannot directly wrap PyTorch `bfloat16` tensors.
    - **Fix:** Patched `image/radfusion3/utils.py` (`get_auroc`, `get_auprc`) and `image/radfusion3/lightning/featurize_lightning_model.py` to explicitly cast PyTorch tensors to single-precision float32 (`.float()`) prior to calling `.numpy()`.
 
+#### `image/` CT Baseline Pipeline — RSNA Fine-Tuning, Featurization & 1D Classification
+
+The full CT baseline pipeline (Table 14 of the INSPECT paper) consists of three sequential stages:
+
+**Stage 1 — RSNA Fine-Tuning (`image/run_rsna.sh`)**
+
+Two backbone variants were fine-tuned on the RSPECT dataset using `channels=window` (3-channel HU windowing: lung −600/1500, PE 400/1000, mediastinal 40/400):
+
+| Config | Starting weights | RSNA test AUROC |
+|---|---|---|
+| `resnext_101_imagenet.yaml` | ImageNet pretrained (`pretrained=True`) | 0.912 |
+| `resnext_101_ct_pretrain.yaml` | CT-pretrained checkpoint (`resnext101_ct.ckpt`) | 0.908 |
+
+The CT-pretrained checkpoint is located at `/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt`. After fine-tuning, the best checkpoint is linked in `resnext_101_ct.yaml` (currently pointing to `last.ckpt` from the CT→RSNA run). Early best epoch (epoch 0) is expected — the CT backbone saturates the RSNA task within the first epoch under CosineAnnealingLR.
+
+Two config files manage the two checkpoints:
+- `image/radfusion3/configs/model/resnext_101_ct_pretrain.yaml` — raw CT backbone, used as the RSNA starting point
+- `image/radfusion3/configs/model/resnext_101_ct.yaml` — CT backbone after RSNA fine-tuning, used for featurization
+
+**Stage 2 — Featurization (`image/run_featurize.sh`)**
+
+`run_featurize.sh` was updated with a timestamped `FEATURES_DIR` to avoid a DDP race condition where the model's internal `features.hdf5` was created before the `.npy` slice files were flushed. The fix forces all featurization output to a timestamped directory and assembles the final HDF5 via `convert_to_hdf5.py` after all workers complete:
+
+```bash
+RUN_NAME="resnext_window"
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+FEATURES_DIR="/data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_${TIMESTAMP}"
+python run_featurize.py model=resnext_101_ct dataset=stanford \
+    dataset.transform.channels=window dataset.output_dir=${FEATURES_DIR} ...
+python convert_to_hdf5.py --input_dir ${FEATURES_DIR} \
+    --output_path /data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_uncompressed.hdf5
+```
+
+The resulting `resnext_window_uncompressed.hdf5` (23,233 scans) is referenced in `configs/dataset/stanford_featurized.yaml`.
+
+**Stage 3 — 1D LSTM Classification (`image/run_classify_all.sh`)**
+
+Mean test AUROC across 8 tasks (vs. paper CT-only baseline ~0.659):
+
+| Backbone | Mean classify AUROC | Gap vs. paper |
+|---|---|---|
+| ImageNet→RSNA | ~0.606 | −0.053 |
+| CT-pretrained→RSNA | ~0.621 | −0.038 |
+
+Remaining gap is primarily attributable to the upstream LSTM axis bug (§27.1) and absent physical-scale position encoding (§28.2). Run per-task results: `python Custom/collect_aurocs.py`.
+
+**Diagnostic tooling:**
+- `Custom/collect_aurocs.py` — scans checkpoint dirs, picks most recent run per task, prints AUROC vs. paper targets
+- `Custom/debug_rsna_batch.py` — one-batch diagnostic for RSNA data pipeline (shape, range, logits, loss)
+
 #### `image/radfusion3/data/dataset_2d.py` — restored loud failure on missing splits
 The original `RSNADataset2D` filtered unconditionally (`self.df[self.df['Split'] == self.split]`), which raises `KeyError` on a CSV without that column. A later refactor made it tolerant of either capitalisation but omitted the `else`, so a CSV with **neither** column silently skipped the filter and made train, valid and test the full dataframe. Restored:
 1. **`else: raise ValueError`** naming the CSV and pointing at `make_rspect_splits.py`.

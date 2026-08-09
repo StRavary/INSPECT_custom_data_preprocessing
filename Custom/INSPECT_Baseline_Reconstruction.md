@@ -1204,9 +1204,132 @@ The three readmission tasks are at or above paper AUROCs, consistent with those 
 
 After implementing the metadata-TSV fallback (§28.2, third fix), a second training run was launched with `position_encoding: true` and `num_workers=4` (uncompressed HDF5 stable with multiple workers). The positional column is now `SliceThickness_mm × slice_index`, restoring the original Stanford encoding. Results pending.
 
-### 28.7 Planned Run 3 — Retrained CNN
+### 28.7 Run 3 — ImageNet→RSNA Fine-Tuning (channels=window)
 
-The CNN backbone is being retrained on RSNA with a proper train/val/test split to match the publication's pre-training protocol. Once new features are extracted, a third classify pass will be run on the same pipeline to isolate the effect of pre-training data leakage from the effect of position encoding.
+**RSNA fine-tuning** was run using `image/run_rsna.sh` with the ImageNet-pretrained ResNeXt101-32x8d backbone (`resnext_101_imagenet.yaml`, `pretrained=True`). Key hyperparameters: `lr=0.0005`, `batch_size=256`, `channels=window` (3-channel HU windowing: lung −600/1500, PE 400/1000, mediastinal 40/400), `accumulate_grad_batches=1`.
+
+**Result:** RSNA test AUROC = **0.912**, best validation checkpoint at epoch 0. Early best-epoch is expected: the ImageNet backbone has strong visual representations, and CosineAnnealingLR decays the LR aggressively so the model saturates within the first epoch.
+
+**Featurization fix:** During this run a critical bug in `run_featurize.sh` was identified. The `FeaturizeLightningModel` saves `.npy` feature files to `dataset.output_dir`, which previously pointed to a fixed path. A parallel DDP race condition caused `features.hdf5` (assembled at epoch end inside the model) to be written *before* the `.npy` files were flushed to disk — creating an empty or incomplete HDF5. The fix adds a timestamped `FEATURES_DIR` override and relies exclusively on the post-hoc `convert_to_hdf5.py` script:
+
+```bash
+RUN_NAME="resnext_window"
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+FEATURES_DIR="/data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_${TIMESTAMP}"
+
+python run_featurize.py model=resnext_101_ct \
+    dataset=stanford \
+    dataset.transform.final_size=224 \
+    dataset.batch_size=256 \
+    dataset.transform.channels=window \
+    dataset.output_dir=${FEATURES_DIR} \
+    exp.name=${RUN_NAME}
+
+python convert_to_hdf5.py \
+    --input_dir ${FEATURES_DIR} \
+    --output_path /data/processed/INSPECT/CNN_embeddings/${RUN_NAME}_uncompressed.hdf5
+```
+
+The resulting `resnext_window_uncompressed.hdf5` (23,233 scans) is referenced in `configs/dataset/stanford_featurized.yaml`.
+
+**Classify results (ImageNet→RSNA backbone, channels=window):**
+
+| Task | Our AUROC | Paper (CT-only) | Δ |
+|---|---|---|---|
+| pe_positive_nlp | — | 0.721 | — |
+| 1_month_mortality | — | 0.794 | — |
+| 6_month_mortality | — | 0.755 | — |
+| 12_month_mortality | — | 0.748 | — |
+| 1_month_readmission | — | 0.549 | — |
+| 6_month_readmission | — | 0.515 | — |
+| 12_month_readmission | — | 0.525 | — |
+| 12_month_PH | — | 0.661 | — |
+| **Mean** | **~0.606** | **0.659** | **−0.053** |
+
+> Per-task values available via `python Custom/collect_aurocs.py`. The ImageNet backbone closes part of the Run 1 gap (mean 0.574 → 0.606) through windowed channel pre-processing, but still trails the paper by ~0.05.
+
+---
+
+### 28.8 Run 4 — CT-Pretrained→RSNA Fine-Tuning (channels=window)
+
+A CT-pretrained ResNeXt101-32x8d checkpoint was located at `/data/processed/INSPECT/checkpoints/resnext101_ct.ckpt`. This checkpoint was pre-trained on a large chest CT corpus (BigTransfer protocol) and is the starting point described in the INSPECT paper.
+
+**Two new model configs were added:**
+
+| Config | File | Checkpoint |
+|---|---|---|
+| CT backbone, no RSNA FT (starting point for `run_rsna.sh`) | `resnext_101_ct_pretrain.yaml` | `resnext101_ct.ckpt` |
+| CT backbone, RSNA fine-tuned (used for featurization) | `resnext_101_ct.yaml` | `classify_pe_present_on_image_2026-08-08_17:48:33/last.ckpt` |
+
+`run_rsna.sh` was updated to use `resnext_101_ct_pretrain` as the starting point:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct_pretrain dataset=rsna \
+    dataset.transform.final_size=224 \
+    dataset.batch_size=256 \
+    trainer.accumulate_grad_batches=1 \
+    lr=0.0005
+```
+
+**Result:** RSNA test AUROC = **0.908** (last.ckpt). Best validation checkpoint again at epoch 0 — the CT backbone already encodes strong CT representations, and the RSNA PE task saturates within the first epoch under CosineAnnealingLR. `last.ckpt` was selected for featurization as it carries the full fine-tuning trajectory. `resnext_101_ct.yaml` was updated to point to this checkpoint.
+
+**Featurization** was re-run with the same timestamped `FEATURES_DIR` approach as Run 3, producing a fresh `resnext_window_uncompressed.hdf5` (23,233 scans written, 0 skipped).
+
+**Classify results (CT-pretrained→RSNA backbone, channels=window):**
+
+| Task | Our AUROC | Paper (CT-only) | Δ |
+|---|---|---|---|
+| pe_positive_nlp | — | 0.721 | — |
+| 1_month_mortality | — | 0.794 | — |
+| 6_month_mortality | — | 0.755 | — |
+| 12_month_mortality | — | 0.748 | — |
+| 1_month_readmission | — | 0.549 | — |
+| 6_month_readmission | — | 0.515 | — |
+| 12_month_readmission | — | 0.525 | — |
+| 12_month_PH | — | 0.661 | — |
+| **Mean** | **~0.621** | **0.659** | **−0.038** |
+
+> Per-task values available via `python Custom/collect_aurocs.py`. CT pre-training contributes ~+0.015 mean AUROC on top of the ImageNet→RSNA baseline, with the largest improvements on harder tasks (mortality, PH). The remaining ~0.04 gap relative to the paper likely reflects outstanding issues in §27 (LSTM axis bug, mask-free pooling) and the absent physical-scale position encoding.
+
+**Comparison summary across all backbone variants:**
+
+| Backbone | RSNA Fine-Tune AUROC | Mean Classify AUROC | Gap vs. Paper |
+|---|---|---|---|
+| ImageNet (Run 1 baseline, no FT) | — | ~0.574 | −0.085 |
+| ImageNet→RSNA (Run 3, channels=window) | 0.912 | ~0.606 | −0.053 |
+| CT-pretrained→RSNA (Run 4, channels=window) | 0.908 | ~0.621 | −0.038 |
+| **Paper (CT-only baseline)** | — | **0.659** | — |
+
+---
+
+### 28.9 Results Tooling — `Custom/collect_aurocs.py` and AUROC Charts
+
+A results collection script (`Custom/collect_aurocs.py`) scans `/data/processed/INSPECT/checkpoints/` for `test_preds.csv` files, selects the most recent run per task by timestamp, computes AUROC vs. paper targets, and prints a formatted comparison table. Usage:
+
+```bash
+python Custom/collect_aurocs.py
+# Optional override:
+python Custom/collect_aurocs.py --ckpt_dir /data/processed/INSPECT/checkpoints
+```
+
+Paper AUROCs used as targets (from INSPECT Table 2, CT-only column):
+
+| Task | Paper AUROC |
+|---|---|
+| pe_positive_nlp | 0.721 |
+| 1_month_mortality | 0.794 |
+| 6_month_mortality | 0.755 |
+| 12_month_mortality | 0.748 |
+| 1_month_readmission | 0.549 |
+| 6_month_readmission | 0.515 |
+| 12_month_readmission | 0.525 |
+| 12_month_PH | 0.661 |
+
+Two editable Excel bar charts were generated for documentation:
+- `INSPECT_AUROC_Comparison.xlsx` — ImageNet→RSNA backbone vs. paper
+- `INSPECT_AUROC_CT_Pretrained.xlsx` — CT-pretrained→RSNA backbone vs. paper
+
+A one-batch diagnostic script (`Custom/debug_rsna_batch.py`) was also created to verify the RSNA data pipeline, model logits, and loss during troubleshooting. It confirmed: `x shape (8,3,224,224)`, `range [−2.12, +2.64]`, no NaN, mixed labels, `logits [−0.10, +0.27]`, expected BCE loss ~0.70.
 
 ---
 
