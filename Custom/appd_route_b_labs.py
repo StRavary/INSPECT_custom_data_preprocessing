@@ -1282,6 +1282,205 @@ class LabExtractor:
         X = wide.to_numpy(dtype=np.float32)
         return X, columns
 
+    # -- DuckDB-native pivot (replaces _run_duckdb + _pivot in build()) ---
+
+    def _run_duckdb_and_pivot(
+        self,
+        cohort_rows: list,
+        windows_days: list,
+        loinc_codes: Optional[list],
+        min_studies: int,
+        all_impression_ids: list,
+    ) -> tuple:
+        """Scan measurement.csv, aggregate per window, filter, and pivot lab
+        features — all inside DuckDB with an on-disk connection.
+
+        Replaces the ``_run_duckdb()`` + ``_pivot()`` pair used in ``build()``.
+        Intermediate tables (raw scan, per-window aggregates, long-format
+        feature table) live in a temporary DuckDB file and can spill to disk,
+        so peak Python RAM equals the final float32 array only rather than the
+        3–4× overhead that arises from long_df → melt → pivot_table in pandas.
+
+        Requires DuckDB ≥ 0.8.0 (PIVOT statement).
+
+        Returns
+        -------
+        X       : float32 ndarray, shape (n_studies, n_features)
+                  NaN = not measured in that window
+        columns : list[str] feature names aligned to X columns
+        """
+        import duckdb
+        import pandas as pd
+        import tempfile
+
+        windows_days = sorted(windows_days)
+        max_window   = max(windows_days)
+
+        anchors_df = pd.DataFrame(
+            [(pid, anchor.isoformat(), imp)
+             for pid, anchor, imp, _, _ in cohort_rows],
+            columns=["person_id", "anchor_time", "impression_id"],
+        )
+        anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+
+        tmp_db = Path(tempfile.mktemp(suffix="_lab_pivot.duckdb"))
+        try:
+            con = duckdb.connect(str(tmp_db))
+            con.register("anchors_tbl", anchors_df)
+
+            # ── 1. Load LOINC concept IDs ────────────────────────────────────
+            loinc_filter = (
+                f"AND concept_code IN ({', '.join(repr(c) for c in loinc_codes)})"
+                if loinc_codes else ""
+            )
+            self._log("  loading LOINC concepts …")
+            con.execute(f"""
+                CREATE TEMP TABLE _loinc AS
+                SELECT CAST(concept_id AS BIGINT) AS concept_id, concept_code
+                FROM read_csv_auto('{self.concept_path}', ignore_errors=true)
+                WHERE vocabulary_id = 'LOINC'
+                  {loinc_filter}
+            """)
+            n_loinc = con.execute("SELECT COUNT(*) FROM _loinc").fetchone()[0]
+            self._log(f"  {n_loinc:,} LOINC concepts loaded")
+            if n_loinc == 0:
+                raise RuntimeError(
+                    "No LOINC concepts found in concept.csv. "
+                    "Check vocabulary_id='LOINC' rows exist.")
+
+            # ── 2. Scan measurement.csv → on-disk temp table ─────────────────
+            #  No .df() here — result stays inside DuckDB and can spill to disk
+            self._log(
+                f"  scanning measurement.csv (max window={max_window} d) …")
+            con.execute(f"""
+                CREATE TEMP TABLE _raw AS
+                SELECT
+                    a.impression_id,
+                    lc.concept_code                   AS loinc_code,
+                    CAST(m.value_as_number AS DOUBLE)  AS value,
+                    CAST(DATEDIFF(
+                        'day',
+                        CAST(COALESCE(
+                            TRY_CAST(m.measurement_datetime AS TIMESTAMP),
+                            TRY_CAST(m.measurement_date     AS TIMESTAMP)
+                        ) AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                    ) AS INTEGER)                     AS days_before
+                FROM read_csv_auto('{self.measurement_path}', ignore_errors=true) m
+                INNER JOIN anchors_tbl a
+                        ON CAST(m.person_id AS BIGINT) = a.person_id
+                INNER JOIN _loinc lc
+                        ON CAST(m.measurement_concept_id AS BIGINT) = lc.concept_id
+                WHERE m.value_as_number IS NOT NULL
+                  AND DATEDIFF('day',
+                        CAST(COALESCE(
+                            TRY_CAST(m.measurement_datetime AS TIMESTAMP),
+                            TRY_CAST(m.measurement_date     AS TIMESTAMP)
+                        ) AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      ) BETWEEN 1 AND {max_window}
+            """)
+            n_raw, n_codes, n_stud = con.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT loinc_code), "
+                "COUNT(DISTINCT impression_id) FROM _raw"
+            ).fetchone()
+            self._log(
+                f"  {n_raw:,} measurements  "
+                f"({n_codes:,} LOINC codes, {n_stud:,} studies)")
+
+            # ── 3. Coverage filter inside DuckDB ─────────────────────────────
+            con.execute(f"""
+                CREATE TEMP TABLE _kept_loinc AS
+                SELECT loinc_code
+                FROM _raw
+                GROUP BY loinc_code
+                HAVING COUNT(DISTINCT impression_id) >= {min_studies}
+            """)
+            n_kept = con.execute("SELECT COUNT(*) FROM _kept_loinc").fetchone()[0]
+            self._log(
+                f"  {n_kept:,} labs kept (≥{min_studies} studies); "
+                f"{n_codes - n_kept:,} dropped")
+            if n_kept == 0:
+                raise RuntimeError(
+                    "No labs passed the min_studies filter — lower "
+                    "min_studies_per_lab or broaden the LOINC filter.")
+
+            # ── 4. Per-window aggregate tables (all on-disk) ──────────────────
+            #  FIRST(value ORDER BY days_before ASC) = value of the most recent
+            #  measurement (days_before=1 is closest to anchor)
+            agg_defs = [
+                ("last_val",       "FIRST(value ORDER BY days_before ASC)"),
+                ("min_val",        "MIN(value)"),
+                ("max_val",        "MAX(value)"),
+                ("mean_val",       "AVG(value)"),
+                ("n_val",          "COUNT(*)"),
+                ("days_since_val", "MIN(days_before)"),
+            ]
+            agg_select_sql = ",\n                    ".join(
+                f"{expr} AS {alias}" for alias, expr in agg_defs
+            )
+            for w in windows_days:
+                con.execute(f"""
+                    CREATE TEMP TABLE _agg_{w}d AS
+                    SELECT
+                        impression_id,
+                        loinc_code,
+                        {agg_select_sql}
+                    FROM _raw
+                    INNER JOIN _kept_loinc USING (loinc_code)
+                    WHERE days_before <= {w}
+                    GROUP BY impression_id, loinc_code
+                """)
+
+            # ── 5. Long-format col_name table: UNION ALL across windows/aggs ──
+            agg_tags = [
+                ("last_val",       "last"),
+                ("min_val",        "min"),
+                ("max_val",        "max"),
+                ("mean_val",       "mean"),
+                ("n_val",          "n"),
+                ("days_since_val", "days_since"),
+            ]
+            union_parts = [
+                f"SELECT impression_id, "
+                f"'labs:LOINC/' || loinc_code || '_{tag}_{w}d' AS col_name, "
+                f"CAST({col} AS DOUBLE) AS value FROM _agg_{w}d"
+                for w in windows_days
+                for col, tag in agg_tags
+            ]
+            union_sql = "\nUNION ALL\n".join(union_parts)
+            self._log("  building long-format feature table …")
+            con.execute(f"CREATE TEMP TABLE _long AS\n{union_sql}")
+
+            # ── 6. PIVOT inside DuckDB ─────────────────────────────────────────
+            #  Single .df() call on the already-pivoted result; no pandas
+            #  pivot_table, no intermediate melt DataFrame.
+            self._log("  pivoting inside DuckDB …")
+            wide_df = con.execute(
+                "PIVOT _long ON col_name USING FIRST(value) GROUP BY impression_id"
+            ).df()
+
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+            if tmp_db.exists():
+                tmp_db.unlink(missing_ok=True)
+
+        # ── 7. Align to cohort order, sort columns, extract numpy ─────────────
+        #  Sorting columns gives deterministic alphabetical order matching the
+        #  old pandas pivot_table output.
+        wide_df = wide_df.set_index("impression_id").reindex(all_impression_ids)
+        columns = sorted(wide_df.columns)
+        X = wide_df[columns].to_numpy(dtype=np.float32)
+        del wide_df   # release DataFrame immediately after numpy extraction
+
+        self._log(
+            f"  lab X shape: {X.shape}  "
+            f"({(~np.isnan(X)).mean():.1%} of cells observed)")
+        return X, columns
+
     # -- count feature extraction (diagnoses / drugs / procedures) --------
 
     def _run_duckdb_counts(
@@ -1872,16 +2071,14 @@ class LabExtractor:
         y           = np.array([r[4] for r in cohort_rows], dtype=np.float32)
 
         # 2. Lab features (measurement.csv via DuckDB)
+        #    _run_duckdb_and_pivot() keeps all intermediates inside an on-disk
+        #    DuckDB file so they can spill beyond RAM; only the final float32
+        #    array is materialised in Python.
         X_lab, columns_lab = np.zeros((len(imp_ids), 0), dtype=np.float32), []
         if extract_labs:
-            max_window = max(windows_days)
-            long_df    = self._run_duckdb(cohort_rows, max_window, loinc_codes)
-            self._log("  pivoting lab features to wide matrix …")
-            X_lab, columns_lab = self._pivot(
-                long_df, windows_days, imp_ids, min_studies_per_lab)
-            self._log(
-                f"  lab X shape: {X_lab.shape}  "
-                f"({(~np.isnan(X_lab)).mean():.1%} of cells observed)")
+            X_lab, columns_lab = self._run_duckdb_and_pivot(
+                cohort_rows, windows_days, loinc_codes,
+                min_studies_per_lab, imp_ids)
 
         # 3. Count features (condition_occurrence / drug_exposure / procedure_occurrence)
         X_count, columns_count = np.zeros((len(imp_ids), 0), dtype=np.float32), []

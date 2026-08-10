@@ -14,7 +14,7 @@ a candidate observation for that analysis; attach a performance metric per slice
 and you have a (descriptors -> performance) dataset.
 
     from Custom.temporal_features import TemporalFeatureExtractor, DIAG_PROC
-    from Custom.context_descriptors import ContextDescriber
+    from Custom.appd_context_descriptors import ContextDescriber
 
     fm = TemporalFeatureExtractor().build("12_month_PH", [DIAG_PROC(bins=[365, 1825])])
 

@@ -5,7 +5,7 @@ Route A (FEMR) has been retired. All shared constants and utilities have moved
 to Custom/route_b_labs.py. This shim re-exports them so any existing scripts
 that import from here continue to work.
 """
-from Custom.route_b_labs import (  # noqa: F401  (re-export)
+from Custom.appd_route_b_labs import (  # noqa: F401  (re-export)
     DX_TASKS,
     PX_TASKS,
     SURVIVAL_COLUMNS,

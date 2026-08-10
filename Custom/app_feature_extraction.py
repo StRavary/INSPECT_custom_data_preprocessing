@@ -45,7 +45,7 @@ OMOP_EXPECTED = [
 ]
 
 CACHE_DIR             = DATA_ROOT / "DATA_PROCESSED" / "femr_cache"
-ROUTE_B_WORKER_SCRIPT = SCRIPT_DIR / "_route_b_worker.py"
+ROUTE_B_WORKER_SCRIPT = SCRIPT_DIR / "appd_route_b_worker.py"
 
 DATA_SOURCES = {
     "cohort": (
@@ -221,7 +221,7 @@ def _default_concept_csv(omop_path: str) -> Path:
 
 def _load_concept_map_cached(concept_csv: str, st):
     """Streamlit-cached wrapper around route_b_labs.load_concept_map."""
-    from Custom.route_b_labs import load_concept_map
+    from Custom.appd_route_b_labs import load_concept_map
 
     @st.cache_resource(show_spinner="Loading OMOP concept names …")
     def _load(path: str):
@@ -232,7 +232,7 @@ def _load_concept_map_cached(concept_csv: str, st):
 
 def _load_concept_id_map_cached(concept_csv: str, st):
     """Streamlit-cached wrapper around route_b_labs.load_concept_id_map."""
-    from Custom.route_b_labs import load_concept_id_map
+    from Custom.appd_route_b_labs import load_concept_id_map
 
     @st.cache_resource(show_spinner="Loading concept ID map …")
     def _load(path: str):
@@ -267,7 +267,7 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     """
     import pandas as pd
     import numpy as np
-    from Custom.route_b_labs import humanize_column
+    from Custom.appd_route_b_labs import humanize_column
 
     import re
 
@@ -540,7 +540,7 @@ def main() -> None:  # pragma: no cover
     import pandas as pd
     import streamlit as st
 
-    from Custom.route_b_labs import DX_TASKS, PX_TASKS
+    from Custom.appd_route_b_labs import DX_TASKS, PX_TASKS
 
     st.set_page_config(page_title="INSPECT Feature Extraction", layout="wide")
     st.title("🧪 INSPECT EHR Feature Extraction")
@@ -910,10 +910,10 @@ def main() -> None:  # pragma: no cover
             st.info("Load an extraction first (tab 0 · Load, or run one in the Extract tab).")
         else:
             import pandas as pd
-            from Custom.route_b_labs import (
+            from Custom.appd_route_b_labs import (
                 query_events_stack, DX_TASKS as _DX, PX_TASKS as _PX,
             )
-            from Custom.context_descriptors import GENDER, AGE_BANDS, _age_band
+            from Custom.appd_context_descriptors import GENDER, AGE_BANDS, _age_band
 
             omop_dir    = st.session_state.get("path_omop",
                             str(DATA_SOURCES["omop"][2]))
@@ -1132,7 +1132,7 @@ def main() -> None:  # pragma: no cover
                         f"Querying {', '.join(table_choices)} for "
                         f"{len(selected_imps)} study/studies …"):
                         try:
-                            from Custom.route_b_labs import query_events_stack
+                            from Custom.appd_route_b_labs import query_events_stack
                             ev_df = query_events_stack(
                                 omop_dir       = omop_dir,
                                 selected_impressions = selected_imps,
@@ -1316,7 +1316,7 @@ def main() -> None:  # pragma: no cover
                 )
 
                 if st.button("Build event timeline", key="tl_build"):
-                    from Custom.route_b_labs import build_event_timeline
+                    from Custom.appd_route_b_labs import build_event_timeline
                     _omop_dir        = Path(omop_dir)
                     _measurement_csv = _omop_dir / "measurement.csv"
                     _concept_csv     = Path(concept_csv)

@@ -59,7 +59,7 @@ def main() -> None:
         print(f"[route_b_worker] min_studies_ancestor: {min_studies_ancestor}",     flush=True)
         print(f"[route_b_worker] max_ancestor_feats  : {max_ancestor_features}",    flush=True)
 
-    from Custom.route_b_labs import LabExtractor
+    from Custom.appd_route_b_labs import LabExtractor
 
     ex = LabExtractor(
         cohort=pth.get("cohort"),
