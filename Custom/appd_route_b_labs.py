@@ -911,6 +911,207 @@ def build_event_timeline(
     )
 
 
+def build_event_timeline_streamed(
+    fm: "LabFeatureMatrix",
+    omop_dir: "Path",
+    measurement_path: "Path",
+    concept_path: "Path",
+    out_path,
+    loinc_codes: Optional[list] = None,
+    verbose: bool = True,
+) -> int:
+    """Same output as build_event_timeline, written directly to a CSV file
+    via DuckDB's own out-of-core ``COPY (...) TO`` instead of being pulled
+    into a pandas DataFrame first.
+
+    build_event_timeline queries raw individual events — one row per lab
+    measurement / diagnosis / drug / procedure / observation / visit
+    occurrence, *not* aggregated — so for a wide window over a large cohort
+    this can be more rows than the aggregated feature matrix has columns.
+    The original implementation pulls every per-feature-type query into
+    memory via ``.df()``, concatenates them, merges in patient_id /
+    anchor_time, then sorts — each step a full-size copy stacked on the
+    last. This version instead has DuckDB do the filtering, joining,
+    ordering, and CSV writing entirely inside its own engine (which already
+    spills to disk for larger-than-memory results), so Python never holds
+    more than a small, fixed amount of data at any point — there is no
+    per-study chunking here because none is needed; DuckDB's ``COPY`` is
+    already streaming.
+
+    One consequence of building `patient_id`/`anchor_time` from the SQL
+    query directly instead of a pandas merge: `anchor_time` in the output
+    is DuckDB's string cast of the anchor timestamp rather than however
+    pandas would format the original datetime object — functionally the
+    same value, cosmetically it may differ in a trailing `:00` or similar.
+
+    Parameters
+    ----------
+    fm, omop_dir, measurement_path, concept_path, loinc_codes, verbose :
+        see `build_event_timeline`
+    out_path : destination CSV path (parent directory created if needed)
+
+    Returns
+    -------
+    int : total number of rows written, counted from the output file
+          itself (not re-queried from DuckDB, so the source CSVs — up to
+          22+ GB for measurement.csv — are only scanned once).
+    """
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    try:
+        import duckdb
+    except ImportError:
+        raise ImportError("pip install duckdb")
+    import pandas as pd
+
+    feature_types     = list(getattr(fm, "feature_types", None) or [])
+    count_window_days = dict(getattr(fm, "count_window_days", None) or {})
+    windows_days      = list(fm.windows_days) if fm.windows_days else [365]
+
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+        "y":             fm.y.astype(float),
+    })
+
+    con = duckdb.connect()
+    con.register("anchors_tbl", anchors_df)
+
+    _log("[timeline] loading concept.csv …")
+    con.execute(f"""
+        CREATE TEMP TABLE _concept AS
+        SELECT
+            CAST(concept_id AS BIGINT) AS concept_id,
+            vocabulary_id,
+            concept_code,
+            concept_name
+        FROM read_csv_auto('{concept_path}', ignore_errors=true)
+        WHERE concept_id IS NOT NULL
+    """)
+
+    parts_sql: list = []
+    params: list = []
+
+    # ── Labs ────────────────────────────────────────────────────────────────
+    if "labs" in feature_types:
+        max_window = max(windows_days)
+        loinc_filter = ""
+        if loinc_codes:
+            loinc_filter = f"AND c.concept_code IN ({', '.join('?' * len(loinc_codes))})"
+            params.extend(loinc_codes)
+        _log(f"[timeline] labs: scanning measurement.csv (window={max_window} d) …")
+        parts_sql.append(f"""
+            SELECT
+                a.impression_id,
+                a.person_id                                                              AS patient_id,
+                a.anchor_time,
+                CAST(a.y AS DOUBLE)                                                      AS y,
+                'lab'                                                                     AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.measurement_datetime AS TIMESTAMP),
+                    CAST(t.measurement_date AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.measurement_date AS DATE)                                          AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa,
+                CAST(t.value_as_number AS DOUBLE)                                         AS value
+            FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.measurement_concept_id AS BIGINT) = c.concept_id
+            WHERE t.measurement_date IS NOT NULL
+              AND CAST(t.measurement_concept_id AS BIGINT) != 0
+              {loinc_filter}
+              AND DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {max_window}
+        """)
+
+    # ── Count feature types ──────────────────────────────────────────────────
+    for ft, (tbl, date_col, datetime_col, concept_col, label, value_expr) in _TIMELINE_TABLE_CONFIG.items():
+        if ft not in feature_types:
+            continue
+        csv_path = Path(omop_dir) / f"{tbl}.csv"
+        if not csv_path.exists():
+            _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
+            continue
+        window_days = count_window_days.get(ft, 365)
+        _log(f"[timeline] {ft}: scanning {tbl}.csv (window={window_days} d) …")
+        parts_sql.append(f"""
+            SELECT
+                a.impression_id,
+                a.person_id                                                              AS patient_id,
+                a.anchor_time,
+                CAST(a.y AS DOUBLE)                                                      AS y,
+                '{label}'                                                                 AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.{datetime_col} AS TIMESTAMP),
+                    CAST(t.{date_col} AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.{date_col} AS DATE)                                                AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa,
+                {value_expr}                                                               AS value
+            FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.{concept_col} AS BIGINT) = c.concept_id
+            WHERE t.{date_col} IS NOT NULL
+              AND CAST(t.{concept_col} AS BIGINT) != 0
+              AND DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {window_days}
+        """)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not parts_sql:
+        con.close()
+        out_path.write_text(
+            "impression_id,patient_id,anchor_time,y,event_type,vocabulary,"
+            "concept_code,concept_name,event_datetime,event_date,"
+            "days_before_ctpa,value\n"
+        )
+        return 0
+
+    union_sql = "\nUNION ALL\n".join(parts_sql)
+    _log(f"[timeline] writing directly to {out_path} …")
+    # POSIX path with single quotes escaped, matching how paths are quoted
+    # elsewhere in this file's f-string SQL.
+    escaped_out = str(out_path).replace("'", "''")
+    con.execute(f"""
+        COPY (
+            {union_sql}
+            ORDER BY impression_id, event_datetime, event_type
+        ) TO '{escaped_out}' (HEADER, DELIMITER ',')
+    """, params)
+    con.close()
+
+    # Row count from the file itself rather than re-querying DuckDB, so the
+    # (potentially 22+ GB) source CSVs are only scanned once.
+    with open(out_path, "rb") as f:
+        n_rows = sum(1 for _ in f) - 1   # minus header
+    n_rows = max(n_rows, 0)
+    _log(f"[timeline] {n_rows:,} rows written")
+    return n_rows
+
+
 # ---------------------------------------------------------------------------
 # LabExtractor — the extraction pipeline
 # ---------------------------------------------------------------------------

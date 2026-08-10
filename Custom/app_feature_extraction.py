@@ -1743,15 +1743,53 @@ def main() -> None:  # pragma: no cover
                     )
                     st.dataframe(tl_df.head(200), use_container_width=True, hide_index=True,
                                  column_config=_glossary_column_config(tl_df))
-                    tl_buf = io.StringIO()
-                    tl_df.to_csv(tl_buf, index=False)
                     st.download_button(
                         "⬇️ Download event timeline CSV",
-                        tl_buf.getvalue(),
+                        tl_df.to_csv(index=False),
                         file_name=f"{fm.task}_event_timeline.csv",
                         mime="text/csv",
                         key="tl_download",
                     )
+
+                st.markdown("**Too large for the table above?**")
+                st.caption(
+                    "This queries *raw individual events* — one row per lab "
+                    "measurement / diagnosis / drug / procedure / "
+                    "observation / visit, not aggregated — so for a wide "
+                    "window over a large cohort it's often even bigger than "
+                    "the long-format export above. This writes straight to "
+                    "a CSV file using DuckDB's own out-of-core query "
+                    "engine — Python never holds the full result, so "
+                    "there's no size cap and no separate chunk size to "
+                    "tune (DuckDB streams this on its own)."
+                )
+                tl_stream_path = st.text_input(
+                    "Output CSV path",
+                    value=str(DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task
+                              / f"{fm.task}_event_timeline.csv"),
+                    key="tl_stream_path",
+                )
+                if st.button("💾 Stream full event timeline CSV to disk", key="tl_stream_build"):
+                    from Custom.appd_route_b_labs import build_event_timeline_streamed
+                    _omop_dir        = Path(omop_dir)
+                    _measurement_csv = _omop_dir / "measurement.csv"
+                    _concept_csv     = Path(concept_csv)
+                    with st.spinner(
+                        "Querying and writing via DuckDB … this can take "
+                        "several minutes for a wide window over a large "
+                        "cohort — progress isn't shown mid-query since "
+                        "DuckDB runs this as a single streaming statement."
+                    ):
+                        n_events = build_event_timeline_streamed(
+                            fm=fm,
+                            omop_dir=_omop_dir,
+                            measurement_path=_measurement_csv,
+                            concept_path=_concept_csv,
+                            out_path=tl_stream_path,
+                            verbose=True,
+                        )
+                    st.success(f"✅ Wrote {n_events:,} rows to:")
+                    st.code(tl_stream_path)
 
 
 if __name__ == "__main__":  # pragma: no cover
