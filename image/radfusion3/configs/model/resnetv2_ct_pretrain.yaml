@@ -1,0 +1,10 @@
+type: model_2d
+model_name: resnetv2_101_ct
+pretrain_type: supervised
+num_class: 1
+checkpoint_path: "/data/processed/INSPECT/checkpoints/resnetv2_ct.ckpt"
+# Official StanfordShahLab/resnetv2_ct checkpoint from HuggingFace
+# (config.json: model_name=resnetv2_101_ct, matches this repo's naming
+# exactly). Use this as the starting point for RSNA/RSPECT fine-tuning with
+# channels=window (see run_rsna.sh). After fine-tuning, copy the best
+# checkpoint to resnetv2_ct.yaml's checkpoint_path.

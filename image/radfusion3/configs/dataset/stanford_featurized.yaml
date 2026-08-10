@@ -8,12 +8,14 @@ target: 12_month_mortality
 contextualize_slice: False # To test
 sample_strategy: fix
 num_slices: 250
-feature_size: 2048
+feature_size: 6144
 weighted_sample: true
 batch_size: 32
+# TODO: still points at the old resnext (2048-d) embeddings — update once
+# resnetv2_ct featurization finishes and the new HDF5 file/path is known.
 hdf5_path: /data/processed/INSPECT/CNN_embeddings/resnext_window_uncompressed.hdf5
 
 pretrain_args:
-  model_type: resnext_101_ct
+  model_type: resnetv2_101_ct
   input_size: 256
   channel_type: window
