@@ -350,19 +350,39 @@ def _load_concept_id_map_cached(concept_csv: str, st):
 # Long-format (melted) export helper
 # ---------------------------------------------------------------------------
 
+# Hard cap on the number of (study × feature) cells _build_long_df will
+# materialise when observed_only=False. A wide extraction easily has
+# 20,000+ feature columns; at 22,457 studies that's 450M+ cells if every one
+# is kept — enough to exhaust RAM and freeze the machine building it. There
+# is no such cap when observed_only=True (the default) because that path
+# never builds the dense matrix in the first place — see below.
+_LONG_DF_MAX_CELLS = 20_000_000
+
+
 def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.DataFrame":
-    """Melt a LabFeatureMatrix to one row per (impression × feature).
+    """Melt a LabFeatureMatrix to one row per (impression × observed feature).
 
     Metadata columns (impression_id, patient_id, anchor_time, y, tte_days, event,
     sex, age_years) are repeated on every row.  Demo features (demo:*) are
     extracted into those metadata columns and excluded from the feature rows.
 
+    Unlike a naive ``DataFrame.melt()``, this never materialises a dense
+    (n_studies × n_features) frame. It finds the cells to keep with
+    ``np.nonzero()`` directly on ``fm.X`` *before* building any DataFrame, so
+    peak memory scales with the number of kept values, not the size of the
+    matrix — melting first and filtering to observed_only afterward (the
+    previous implementation) built the full dense table regardless of
+    ``observed_only``, which is what was freezing the app on wide
+    extractions.
+
     Parameters
     ----------
     fm            : LabFeatureMatrix
     concept_map   : {VOCAB/code: human_name} from load_concept_map()
-    observed_only : if True, drop rows where value is NaN or 0
-                    (keeps file small; uncheck to get a complete matrix)
+    observed_only : if True (default), drop rows where value is NaN or 0.
+                    This is also what keeps memory bounded — building the
+                    complete matrix (False) is refused past
+                    `_LONG_DF_MAX_CELLS` cells (see the raised MemoryError).
 
     Returns
     -------
@@ -392,7 +412,7 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     sex  = np.where(np.isnan(is_f), "unknown",
            np.where(is_f == 1.0,    "female",  "male"))
 
-    # ── metadata DataFrame ───────────────────────────────────────────────────
+    # ── metadata ─────────────────────────────────────────────────────────────
     meta = fm.to_frame().reset_index(drop=True)   # impression_id, patient_id, …
     meta["sex"]       = sex
     meta["age_years"] = _get_demo("demo:age_years")
@@ -403,75 +423,97 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     id_vars = ["impression_id", "patient_id", "anchor_time", "y",
                "tte_days", "event", "sex", "age_years"]
 
-    # ── feature sub-matrix (exclude demo: columns) ───────────────────────────
-    feat_idx  = [i for i, c in enumerate(col_list) if not c.startswith("demo:")]
-    feat_cols = [col_list[i] for i in feat_idx]
-
-    # ── record-date lookup for each feature column ───────────────────────────
-    # Labs: record_date = anchor_time - days_since  (already in the matrix)
-    # Count features: record_date from fm.count_dates (most-recent event date)
-    _LAB_COL_PAT     = re.compile(r'^(labs:[^_]+(?:_[^_]+)*)_([^_]+)_(\d+d)$')
-    _DAYS_SINCE_PAT  = re.compile(r'^(labs:.+)_days_since_(\d+d)$')
-
-    # Build {(base, window) → col_idx} for days_since columns
-    days_since_map: dict = {}
-    for i, c in enumerate(col_list):
-        m = _DAYS_SINCE_PAT.match(c)
-        if m:
-            days_since_map[(m.group(1), m.group(2))] = i
-
-    anchor_dt = pd.to_datetime([str(a) for a in fm.anchor_times])
-    count_dates = getattr(fm, "count_dates", None)   # None for old pickles
-
-    # Build record_date matrix (n_impressions × n_feat_cols), values = ISO date str or ''
-    n_imp = len(fm.impression_ids)
-    record_date_arr = np.full((n_imp, len(feat_cols)), "", dtype=object)
-
-    for j, col in enumerate(feat_cols):
-        if col.startswith("labs:"):
-            m = _LAB_COL_PAT.match(col)
-            if m:
-                base, _agg, window = m.group(1), m.group(2), m.group(3)
-                ds_idx = days_since_map.get((base, window))
-                if ds_idx is not None:
-                    ds_vals = fm.X[:, ds_idx].astype(float)
-                    valid   = ~np.isnan(ds_vals)
-                    dates   = anchor_dt - pd.to_timedelta(
-                        np.where(valid, ds_vals, 0), unit="d")
-                    record_date_arr[valid, j] = (
-                        dates[valid].strftime("%Y-%m-%d").values)
-        elif count_dates is not None and col in count_dates.columns:
-            # Covers diag:, drug:, proc:, obs:, visit:, and _anc: variants
-            record_date_arr[:, j] = (
-                count_dates[col].fillna("").astype(str).values)
-
-    # ── build wide feature DataFrame and melt ────────────────────────────────
-    wide = pd.DataFrame(fm.X[:, feat_idx], columns=feat_cols)
-    for col in id_vars:
-        wide[col] = meta[col].values
-
-    long = wide.melt(
-        id_vars   = id_vars,
-        var_name  = "feature",
-        value_name = "value",
-    )
-
-    # Melt the record_date array in the same column order → same row order as long
-    rd_wide = pd.DataFrame(record_date_arr, columns=feat_cols)
-    rd_long = rd_wide.melt(var_name="feature", value_name="record_date")
-    long["record_date"] = rd_long["record_date"].values
-
-    if observed_only:
-        long = long[long["value"].notna() & (long["value"] != 0.0)].copy()
-
-    # ── human-readable feature names ─────────────────────────────────────────
-    long["feature_human_readable"] = long["feature"].map(
-        lambda c: humanize_column(c, concept_map)
-    )
-
     out_cols = ["impression_id", "patient_id", "anchor_time", "y",
                 "tte_days", "event", "sex", "age_years",
                 "feature", "record_date", "feature_human_readable", "value"]
+
+    # ── feature sub-matrix (exclude demo: columns) ───────────────────────────
+    feat_idx  = [i for i, c in enumerate(col_list) if not c.startswith("demo:")]
+    feat_cols = np.array([col_list[i] for i in feat_idx], dtype=object)
+    X_feat    = fm.X[:, feat_idx]
+    n_imp, n_feat = X_feat.shape
+
+    # ── decide which (study, feature) cells to keep — BEFORE building any
+    #    DataFrame, so a dense n_imp × n_feat frame is never allocated ───────
+    if observed_only:
+        keep_mask = ~np.isnan(X_feat) & (X_feat != 0.0)
+    else:
+        n_cells = n_imp * n_feat
+        if n_cells > _LONG_DF_MAX_CELLS:
+            raise MemoryError(
+                f"Complete long-format table would have {n_cells:,} rows "
+                f"({n_imp:,} studies × {n_feat:,} features) — refusing to "
+                f"build it, this is what has frozen machines before. "
+                f"Check 'Observed features only' instead (keeps just "
+                f"non-missing cells — usually 10-100x fewer rows), or "
+                f"narrow the extraction (fewer feature types / windows) "
+                f"and re-run.")
+        keep_mask = np.ones((n_imp, n_feat), dtype=bool)
+
+    row_idx, col_pos = np.nonzero(keep_mask)
+    n_kept = row_idx.size
+    if n_kept == 0:
+        return pd.DataFrame(columns=out_cols)
+
+    # ── gather metadata + feature + value directly via fancy indexing ───────
+    long = pd.DataFrame({c: meta[c].to_numpy()[row_idx] for c in id_vars})
+    long["feature"] = feat_cols[col_pos]
+    long["value"]   = X_feat[row_idx, col_pos]
+
+    # ── record_date, computed only for the kept cells ────────────────────────
+    # Labs: record_date = anchor_time - days_since  (already in the matrix)
+    # Count features: record_date from fm.count_dates (most-recent event date)
+    _LAB_COL_PAT    = re.compile(r'^(labs:[^_]+(?:_[^_]+)*)_([^_]+)_(\d+d)$')
+    _DAYS_SINCE_PAT = re.compile(r'^(labs:.+)_days_since_(\d+d)$')
+
+    ds_local_idx: dict = {}   # (base, window) -> position of the days_since column
+    for j, c in enumerate(feat_cols):
+        m = _DAYS_SINCE_PAT.match(c)
+        if m:
+            ds_local_idx[(m.group(1), m.group(2))] = j
+
+    ds_source = np.full(len(feat_cols), -1, dtype=np.int64)
+    for j, c in enumerate(feat_cols):
+        if c.startswith("labs:"):
+            m = _LAB_COL_PAT.match(c)
+            if m:
+                ds_source[j] = ds_local_idx.get((m.group(1), m.group(3)), -1)
+
+    count_dates = getattr(fm, "count_dates", None)   # None for old pickles
+    count_dates_cols = set(count_dates.columns) if count_dates is not None else set()
+
+    anchor_dt   = pd.to_datetime([str(a) for a in fm.anchor_times]).to_numpy()
+    record_date = np.full(n_kept, "", dtype=object)
+
+    # Group kept cells by feature column (via argsort, not a python loop over
+    # cells) so each column's date logic runs once as one vectorised op,
+    # touching only the cells we actually kept for that column.
+    order          = np.argsort(col_pos, kind="stable")
+    col_pos_sorted = col_pos[order]
+    boundaries     = np.flatnonzero(np.diff(col_pos_sorted)) + 1
+    for positions in np.split(order, boundaries):
+        j    = col_pos[positions[0]]
+        rows = row_idx[positions]
+        c    = feat_cols[j]
+        if ds_source[j] != -1:
+            ds_vals = X_feat[rows, ds_source[j]].astype(float)
+            valid   = ~np.isnan(ds_vals)
+            if valid.any():
+                dates = anchor_dt[rows[valid]] - pd.to_timedelta(
+                    ds_vals[valid], unit="d")
+                record_date[positions[valid]] = (
+                    pd.DatetimeIndex(dates).strftime("%Y-%m-%d"))
+        elif c in count_dates_cols:
+            col_arr = count_dates[c].fillna("").astype(str).to_numpy()
+            record_date[positions] = col_arr[rows]
+
+    long["record_date"] = record_date
+
+    # ── human-readable feature names, computed once per distinct feature ────
+    uniq_features = pd.unique(long["feature"])
+    name_map = {f: humanize_column(f, concept_map) for f in uniq_features}
+    long["feature_human_readable"] = long["feature"].map(name_map)
+
     return (
         long[out_cols]
         .sort_values(["impression_id", "feature"])
@@ -1381,9 +1423,14 @@ def main() -> None:  # pragma: no cover
                         _load_concept_map_cached(concept_csv, st)
                         if Path(concept_csv).exists() else {}
                     )
-                    ldf = _build_long_df(fm, concept_map_lf, observed_only=lf_obs_only)
-                st.session_state["long_df"]      = ldf
-                st.session_state["long_df_task"] = fm.task
+                    try:
+                        ldf = _build_long_df(fm, concept_map_lf, observed_only=lf_obs_only)
+                    except MemoryError as e:
+                        st.error(f"⚠️ {e}")
+                        ldf = None
+                if ldf is not None:
+                    st.session_state["long_df"]      = ldf
+                    st.session_state["long_df_task"] = fm.task
 
             ldf = st.session_state.get("long_df")
             # Invalidate cached table when a different extraction is loaded
