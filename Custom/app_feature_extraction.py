@@ -350,56 +350,36 @@ def _load_concept_id_map_cached(concept_csv: str, st):
 # Long-format (melted) export helper
 # ---------------------------------------------------------------------------
 
-# Hard cap on the number of (study × feature) cells _build_long_df will
-# materialise when observed_only=False. A wide extraction easily has
+# Hard cap on the number of (study × feature) cells the in-memory long-format
+# builder (_build_long_df) will materialise. A wide extraction easily has
 # 20,000+ feature columns; at 22,457 studies that's 450M+ cells if every one
-# is kept — enough to exhaust RAM and freeze the machine building it. There
-# is no such cap when observed_only=True (the default) because that path
-# never builds the dense matrix in the first place — see below.
+# is kept — enough to exhaust RAM and freeze the machine building it. This
+# applies to observed_only=True as well as False: a wide window (e.g. 365d)
+# means most labs really are observed for most studies, so "observed only"
+# alone can still leave tens/hundreds of millions of rows.
+#
+# This cap does NOT apply to _build_long_df_streamed — that path writes to
+# disk one study-chunk at a time, so its peak memory is bounded by one chunk
+# regardless of the total row count. Use it for extractions too large for
+# the in-memory path (see the app's "Stream full CSV to disk" button).
 _LONG_DF_MAX_CELLS = 20_000_000
 
 
-def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.DataFrame":
-    """Melt a LabFeatureMatrix to one row per (impression × observed feature).
+def _prep_long_df(fm, concept_map: dict):
+    """Shared setup for _build_long_df / _build_long_df_streamed: everything
+    that's O(n_studies) or O(n_features) — cheap regardless of extraction
+    size — and independent of which studies are being melted right now.
 
-    Metadata columns (impression_id, patient_id, anchor_time, y, tte_days, event,
-    sex, age_years) are repeated on every row.  Demo features (demo:*) are
-    extracted into those metadata columns and excluded from the feature rows.
-
-    Unlike a naive ``DataFrame.melt()``, this never materialises a dense
-    (n_studies × n_features) frame. It finds the cells to keep with
-    ``np.nonzero()`` directly on ``fm.X`` *before* building any DataFrame, so
-    peak memory scales with the number of kept values, not the size of the
-    matrix — melting first and filtering to observed_only afterward (the
-    previous implementation) built the full dense table regardless of
-    ``observed_only``, which is what was freezing the app on wide
-    extractions.
-
-    Parameters
-    ----------
-    fm            : LabFeatureMatrix
-    concept_map   : {VOCAB/code: human_name} from load_concept_map()
-    observed_only : if True (default), drop rows where value is NaN or 0.
-                    This is also what keeps memory bounded — building the
-                    complete matrix (False) is refused past
-                    `_LONG_DF_MAX_CELLS` cells (see the raised MemoryError).
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        impression_id | patient_id | anchor_time | y | tte_days | event |
-        sex | age_years | feature | feature_human_readable | value
+    Returns a dict consumed by _melt_batch and both builders above it.
     """
     import pandas as pd
     import numpy as np
     from Custom.appd_route_b_labs import humanize_column
-
     import re
 
     col_list = list(fm.columns)
     col_idx  = {c: i for i, c in enumerate(col_list)}
 
-    # ── extract demographics as metadata ────────────────────────────────────
     def _get_demo(name):
         if name in col_idx:
             return fm.X[:, col_idx[name]].copy()
@@ -409,10 +389,9 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     # Lowercase to match the GENDER-derived "female"/"male"/"unknown" labels used
     # elsewhere in the app (Describe tab, ContextDescriber) — keeps `sex` values
     # joinable/comparable across the long-format export and the cohort table.
-    sex  = np.where(np.isnan(is_f), "unknown",
-           np.where(is_f == 1.0,    "female",  "male"))
+    sex = np.where(np.isnan(is_f), "unknown",
+          np.where(is_f == 1.0,    "female",  "male"))
 
-    # ── metadata ─────────────────────────────────────────────────────────────
     meta = fm.to_frame().reset_index(drop=True)   # impression_id, patient_id, …
     meta["sex"]       = sex
     meta["age_years"] = _get_demo("demo:age_years")
@@ -422,47 +401,14 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
 
     id_vars = ["impression_id", "patient_id", "anchor_time", "y",
                "tte_days", "event", "sex", "age_years"]
+    out_cols = id_vars + ["feature", "record_date", "feature_human_readable", "value"]
 
-    out_cols = ["impression_id", "patient_id", "anchor_time", "y",
-                "tte_days", "event", "sex", "age_years",
-                "feature", "record_date", "feature_human_readable", "value"]
-
-    # ── feature sub-matrix (exclude demo: columns) ───────────────────────────
     feat_idx  = [i for i, c in enumerate(col_list) if not c.startswith("demo:")]
     feat_cols = np.array([col_list[i] for i in feat_idx], dtype=object)
     X_feat    = fm.X[:, feat_idx]
-    n_imp, n_feat = X_feat.shape
 
-    # ── decide which (study, feature) cells to keep — BEFORE building any
-    #    DataFrame, so a dense n_imp × n_feat frame is never allocated ───────
-    if observed_only:
-        keep_mask = ~np.isnan(X_feat) & (X_feat != 0.0)
-    else:
-        n_cells = n_imp * n_feat
-        if n_cells > _LONG_DF_MAX_CELLS:
-            raise MemoryError(
-                f"Complete long-format table would have {n_cells:,} rows "
-                f"({n_imp:,} studies × {n_feat:,} features) — refusing to "
-                f"build it, this is what has frozen machines before. "
-                f"Check 'Observed features only' instead (keeps just "
-                f"non-missing cells — usually 10-100x fewer rows), or "
-                f"narrow the extraction (fewer feature types / windows) "
-                f"and re-run.")
-        keep_mask = np.ones((n_imp, n_feat), dtype=bool)
-
-    row_idx, col_pos = np.nonzero(keep_mask)
-    n_kept = row_idx.size
-    if n_kept == 0:
-        return pd.DataFrame(columns=out_cols)
-
-    # ── gather metadata + feature + value directly via fancy indexing ───────
-    long = pd.DataFrame({c: meta[c].to_numpy()[row_idx] for c in id_vars})
-    long["feature"] = feat_cols[col_pos]
-    long["value"]   = X_feat[row_idx, col_pos]
-
-    # ── record_date, computed only for the kept cells ────────────────────────
-    # Labs: record_date = anchor_time - days_since  (already in the matrix)
-    # Count features: record_date from fm.count_dates (most-recent event date)
+    # Labs: record_date = anchor_time - days_since (already in the matrix).
+    # Count features: record_date from fm.count_dates (most-recent event date).
     _LAB_COL_PAT    = re.compile(r'^(labs:[^_]+(?:_[^_]+)*)_([^_]+)_(\d+d)$')
     _DAYS_SINCE_PAT = re.compile(r'^(labs:.+)_days_since_(\d+d)$')
 
@@ -481,13 +427,57 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
 
     count_dates = getattr(fm, "count_dates", None)   # None for old pickles
     count_dates_cols = set(count_dates.columns) if count_dates is not None else set()
+    anchor_dt = pd.to_datetime([str(a) for a in fm.anchor_times]).to_numpy()
 
-    anchor_dt   = pd.to_datetime([str(a) for a in fm.anchor_times]).to_numpy()
+    # Human-readable names computed once for every feature column up front —
+    # O(n_features), shared across every study-chunk that gets melted.
+    name_map = {c: humanize_column(c, concept_map) for c in feat_cols}
+
+    return dict(
+        meta=meta, feat_cols=feat_cols, X_feat=X_feat, ds_source=ds_source,
+        count_dates=count_dates, count_dates_cols=count_dates_cols,
+        anchor_dt=anchor_dt, name_map=name_map, id_vars=id_vars,
+        out_cols=out_cols, n_imp=X_feat.shape[0], n_feat=X_feat.shape[1],
+    )
+
+
+def _melt_batch(prep: dict, batch_rows, observed_only: bool) -> "pd.DataFrame":
+    """Melt one chunk of studies (`batch_rows`, an int array of row indices
+    into fm's study axis) to long format. `batch_rows` can be all studies
+    (one shot, from _build_long_df) or a few thousand at a time (streamed,
+    from _build_long_df_streamed) — either way, peak memory here scales with
+    `len(batch_rows) × n_features`, never the full matrix at once unless the
+    caller passes all rows in a single batch.
+    """
+    import pandas as pd
+    import numpy as np
+
+    meta, feat_cols, X_feat = prep["meta"], prep["feat_cols"], prep["X_feat"]
+    ds_source, count_dates  = prep["ds_source"], prep["count_dates"]
+    count_dates_cols        = prep["count_dates_cols"]
+    anchor_dt, name_map     = prep["anchor_dt"], prep["name_map"]
+    id_vars, out_cols       = prep["id_vars"], prep["out_cols"]
+
+    Xb = X_feat[batch_rows]
+    if observed_only:
+        keep_mask = ~np.isnan(Xb) & (Xb != 0.0)
+    else:
+        keep_mask = np.ones_like(Xb, dtype=bool)
+
+    r_local, col_pos = np.nonzero(keep_mask)
+    if r_local.size == 0:
+        return pd.DataFrame(columns=out_cols)
+    row_idx = np.asarray(batch_rows)[r_local]
+    n_kept  = row_idx.size
+
+    long = pd.DataFrame({c: meta[c].to_numpy()[row_idx] for c in id_vars})
+    long["feature"] = feat_cols[col_pos]
+    long["value"]   = Xb[r_local, col_pos]
+
     record_date = np.full(n_kept, "", dtype=object)
-
     # Group kept cells by feature column (via argsort, not a python loop over
     # cells) so each column's date logic runs once as one vectorised op,
-    # touching only the cells we actually kept for that column.
+    # touching only the cells kept for that column in this batch.
     order          = np.argsort(col_pos, kind="stable")
     col_pos_sorted = col_pos[order]
     boundaries     = np.flatnonzero(np.diff(col_pos_sorted)) + 1
@@ -506,19 +496,132 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
         elif c in count_dates_cols:
             col_arr = count_dates[c].fillna("").astype(str).to_numpy()
             record_date[positions] = col_arr[rows]
-
     long["record_date"] = record_date
 
-    # ── human-readable feature names, computed once per distinct feature ────
-    uniq_features = pd.unique(long["feature"])
-    name_map = {f: humanize_column(f, concept_map) for f in uniq_features}
     long["feature_human_readable"] = long["feature"].map(name_map)
+    return long[out_cols]
 
-    return (
-        long[out_cols]
-        .sort_values(["impression_id", "feature"])
-        .reset_index(drop=True)
-    )
+
+def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.DataFrame":
+    """Melt a LabFeatureMatrix to one row per (impression × observed feature),
+    entirely in memory. See module docstring on `_LONG_DF_MAX_CELLS` for why
+    this refuses very large extractions — use `_build_long_df_streamed` for
+    those instead.
+
+    Metadata columns (impression_id, patient_id, anchor_time, y, tte_days, event,
+    sex, age_years) are repeated on every row.  Demo features (demo:*) are
+    extracted into those metadata columns and excluded from the feature rows.
+
+    Parameters
+    ----------
+    fm            : LabFeatureMatrix
+    concept_map   : {VOCAB/code: human_name} from load_concept_map()
+    observed_only : if True (default), drop rows where value is NaN or 0.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        impression_id | patient_id | anchor_time | y | tte_days | event |
+        sex | age_years | feature | feature_human_readable | value
+    """
+    import pandas as pd
+    import numpy as np
+
+    prep = _prep_long_df(fm, concept_map)
+    n_imp, n_feat = prep["n_imp"], prep["n_feat"]
+
+    # ── cheap pre-check: know the output row count before building anything ─
+    if observed_only:
+        keep_mask = ~np.isnan(prep["X_feat"]) & (prep["X_feat"] != 0.0)
+        n_kept = int(keep_mask.sum())
+        del keep_mask
+        if n_kept > _LONG_DF_MAX_CELLS:
+            pct = 100 * n_kept / (n_imp * n_feat) if n_imp * n_feat else 0
+            raise MemoryError(
+                f"Long-format table would still have {n_kept:,} observed "
+                f"rows ({n_imp:,} studies × {n_feat:,} features, "
+                f"{pct:.0f}% observed) — refusing to build it in memory, "
+                f"this is what has frozen machines before. A wide lookback "
+                f"window means most labs really are observed for most "
+                f"studies, so 'Observed features only' alone doesn't "
+                f"shrink this enough. Use 'Stream full CSV to disk' "
+                f"instead — it writes the same {n_kept:,} rows a chunk of "
+                f"studies at a time with no such cap — or narrow the "
+                f"extraction (fewer feature types, a narrower window, "
+                f"specific LOINC codes instead of 'all LOINC').")
+    else:
+        n_cells = n_imp * n_feat
+        if n_cells > _LONG_DF_MAX_CELLS:
+            raise MemoryError(
+                f"Complete long-format table would have {n_cells:,} rows "
+                f"({n_imp:,} studies × {n_feat:,} features) — refusing to "
+                f"build it in memory, this is what has frozen machines "
+                f"before. Use 'Stream full CSV to disk' instead (no cap), "
+                f"check 'Observed features only' (usually 10-100x fewer "
+                f"rows), or narrow the extraction and re-run.")
+        n_kept = n_cells
+
+    if n_kept == 0:
+        return pd.DataFrame(columns=prep["out_cols"])
+
+    long = _melt_batch(prep, np.arange(n_imp), observed_only)
+    return long.sort_values(["impression_id", "feature"]).reset_index(drop=True)
+
+
+def _build_long_df_streamed(
+    fm, concept_map: dict, out_path, observed_only: bool = True,
+    chunk_studies: int = 2000, on_progress=None,
+) -> int:
+    """Same output as _build_long_df, written straight to a CSV file on disk
+    `chunk_studies` studies at a time instead of held in memory all at once.
+
+    Peak memory scales with one chunk (`chunk_studies × n_features`), not
+    the full result, so there is no `_LONG_DF_MAX_CELLS`-style cap here —
+    this is the path for extractions too large for the in-memory builder
+    (e.g. the full cohort, labs only, 365-day window, no LOINC filter).
+
+    The output is written grouped by chunk (i.e. by the extraction's
+    original study order) rather than globally sorted by impression_id —
+    sorting the whole file would need the whole file in memory, defeating
+    the point. Each chunk is internally sorted by `["impression_id",
+    "feature"]` for local readability.
+
+    Parameters
+    ----------
+    fm, concept_map, observed_only : see _build_long_df
+    out_path      : destination CSV path (parent dir created if needed)
+    chunk_studies : studies processed per chunk. Lower this if a single
+                    chunk is still too large for a very wide extraction
+                    (many feature types × many windows).
+    on_progress   : optional callable(studies_done, studies_total) invoked
+                    after each chunk — wire to st.progress() for a live bar.
+
+    Returns
+    -------
+    int : total number of rows written.
+    """
+    import numpy as np
+    from pathlib import Path as _Path
+
+    prep  = _prep_long_df(fm, concept_map)
+    n_imp = prep["n_imp"]
+
+    out_path = _Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_rows = 0
+    with open(out_path, "w", newline="") as fh:
+        for start in range(0, n_imp, chunk_studies):
+            batch_rows = np.arange(start, min(start + chunk_studies, n_imp))
+            chunk_df = _melt_batch(prep, batch_rows, observed_only)
+            if not chunk_df.empty:
+                chunk_df = chunk_df.sort_values(["impression_id", "feature"])
+            chunk_df.to_csv(fh, index=False, header=(start == 0))
+            total_rows += len(chunk_df)
+            if on_progress:
+                on_progress(min(start + chunk_studies, n_imp), n_imp)
+
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1445,15 +1548,54 @@ def main() -> None:  # pragma: no cover
                     f"{ldf['feature'].nunique():,} unique features")
                 st.dataframe(ldf.head(200), use_container_width=True, hide_index=True,
                              column_config=_glossary_column_config(ldf))
-                lf_buf = io.StringIO()
-                ldf.to_csv(lf_buf, index=False)
                 st.download_button(
+                    # ldf.to_csv() with no path returns the CSV text directly —
+                    # avoids the extra StringIO buffer + .getvalue() copy,
+                    # which for a large ldf meant up to 3 simultaneous
+                    # full-size copies of the same data in memory.
                     "⬇️ Download long-format CSV",
-                    lf_buf.getvalue(),
+                    ldf.to_csv(index=False),
                     file_name=f"{fm.task}_long.csv",
                     mime="text/csv",
                     key="lf_download",
                 )
+
+            st.markdown("**Too large for the table above?**")
+            st.caption(
+                "Writes the same long-format rows straight to a CSV file on "
+                "disk, a few thousand studies at a time, instead of holding "
+                "everything in memory at once — so there's no size cap. Use "
+                "this when 'Build long-format table' raises a memory error "
+                "above (e.g. the full cohort, labs only, a wide window, no "
+                "LOINC filter). Rows are grouped by study-processing order "
+                "rather than globally sorted by impression_id, since "
+                "sorting the whole file would need the whole file in memory."
+            )
+            lf_stream_path = st.text_input(
+                "Output CSV path",
+                value=str(Path(export_dir) / f"{fm.task}_long.csv"),
+                key="lf_stream_path",
+            )
+            if st.button("💾 Stream full long-format CSV to disk", key="lf_stream_build"):
+                concept_map_lf = (
+                    _load_concept_map_cached(concept_csv, st)
+                    if Path(concept_csv).exists() else {}
+                )
+                progress = st.progress(0.0, text="Starting …")
+
+                def _on_progress(done, total):
+                    progress.progress(
+                        done / total if total else 1.0,
+                        text=f"{done:,} / {total:,} studies …")
+
+                with st.spinner("Streaming to disk …"):
+                    n_rows = _build_long_df_streamed(
+                        fm, concept_map_lf, lf_stream_path,
+                        observed_only=lf_obs_only, on_progress=_on_progress,
+                    )
+                progress.empty()
+                st.success(f"✅ Wrote {n_rows:,} rows to:")
+                st.code(lf_stream_path)
 
             # ── Event timeline CSV ───────────────────────────────────────────
             st.markdown("---")
