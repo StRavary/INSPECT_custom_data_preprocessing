@@ -699,13 +699,15 @@ class LabFeatureMatrix:
 # Event timeline builder — raw individual events (not aggregated)
 # ---------------------------------------------------------------------------
 
-# Maps feature_type key → (OMOP table name, date_col, concept_col, event_type_label, value_expr)
+# Maps feature_type key →
+#   (OMOP table name, date_col, datetime_col, concept_col, event_type_label, value_expr)
+# datetime_col is preferred over date_col when non-null (sub-day resolution).
 _TIMELINE_TABLE_CONFIG: dict = {
-    "diagnoses":    ("condition_occurrence", "condition_start_date",      "condition_concept_id",  "diagnosis",   "NULL"),
-    "drugs":        ("drug_exposure",        "drug_exposure_start_date",  "drug_concept_id",       "drug",        "NULL"),
-    "procedures":   ("procedure_occurrence", "procedure_date",            "procedure_concept_id",  "procedure",   "NULL"),
-    "observations": ("observation",          "observation_date",          "observation_concept_id","observation", "CAST(t.value_as_number AS DOUBLE)"),
-    "visits":       ("visit_occurrence",     "visit_start_date",          "visit_concept_id",      "visit",       "NULL"),
+    "diagnoses":    ("condition_occurrence", "condition_start_date",     "condition_start_datetime",     "condition_concept_id",   "diagnosis",   "NULL"),
+    "drugs":        ("drug_exposure",        "drug_exposure_start_date", "drug_exposure_start_datetime", "drug_concept_id",        "drug",        "NULL"),
+    "procedures":   ("procedure_occurrence", "procedure_date",           "procedure_datetime",           "procedure_concept_id",   "procedure",   "NULL"),
+    "observations": ("observation",          "observation_date",         "observation_datetime",         "observation_concept_id", "observation", "CAST(t.value_as_number AS DOUBLE)"),
+    "visits":       ("visit_occurrence",     "visit_start_date",        "visit_start_datetime",         "visit_concept_id",       "visit",       "NULL"),
 }
 
 
@@ -792,16 +794,20 @@ def build_event_timeline(
         lab_df = con.execute(f"""
             SELECT
                 a.impression_id,
-                CAST(a.y AS DOUBLE)                                          AS y,
-                'lab'                                                         AS event_type,
-                COALESCE(c.vocabulary_id, 'Unknown')                          AS vocabulary,
-                COALESCE(c.concept_code,  '')                                 AS concept_code,
-                COALESCE(c.concept_name,  '')                                 AS concept_name,
-                CAST(t.measurement_date AS DATE)                              AS event_date,
+                CAST(a.y AS DOUBLE)                                                      AS y,
+                'lab'                                                                     AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.measurement_datetime AS TIMESTAMP),
+                    CAST(t.measurement_date AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.measurement_date AS DATE)                                          AS event_date,
                 -DATEDIFF('day',
                     CAST(t.measurement_date AS DATE),
-                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))           AS days_before_ctpa,
-                CAST(t.value_as_number AS DOUBLE)                             AS value
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa,
+                CAST(t.value_as_number AS DOUBLE)                                         AS value
             FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
             INNER JOIN anchors_tbl a
                     ON CAST(t.person_id AS BIGINT) = a.person_id
@@ -819,7 +825,7 @@ def build_event_timeline(
         parts.append(lab_df)
 
     # ── Count feature types ──────────────────────────────────────────────────
-    for ft, (tbl, date_col, concept_col, label, value_expr) in _TIMELINE_TABLE_CONFIG.items():
+    for ft, (tbl, date_col, datetime_col, concept_col, label, value_expr) in _TIMELINE_TABLE_CONFIG.items():
         if ft not in feature_types:
             continue
         csv_path = Path(omop_dir) / f"{tbl}.csv"
@@ -831,16 +837,20 @@ def build_event_timeline(
         part_df = con.execute(f"""
             SELECT
                 a.impression_id,
-                CAST(a.y AS DOUBLE)                                          AS y,
-                '{label}'                                                     AS event_type,
-                COALESCE(c.vocabulary_id, 'Unknown')                          AS vocabulary,
-                COALESCE(c.concept_code,  '')                                 AS concept_code,
-                COALESCE(c.concept_name,  '')                                 AS concept_name,
-                CAST(t.{date_col} AS DATE)                                    AS event_date,
+                CAST(a.y AS DOUBLE)                                                      AS y,
+                '{label}'                                                                 AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.{datetime_col} AS TIMESTAMP),
+                    CAST(t.{date_col} AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.{date_col} AS DATE)                                                AS event_date,
                 -DATEDIFF('day',
                     CAST(t.{date_col} AS DATE),
-                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))           AS days_before_ctpa,
-                {value_expr}                                                   AS value
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa,
+                {value_expr}                                                               AS value
             FROM read_csv_auto('{csv_path}', ignore_errors=true) t
             INNER JOIN anchors_tbl a
                     ON CAST(t.person_id AS BIGINT) = a.person_id
@@ -862,7 +872,7 @@ def build_event_timeline(
         return pd.DataFrame(columns=[
             "impression_id", "patient_id", "anchor_time", "y",
             "event_type", "vocabulary", "concept_code", "concept_name",
-            "event_date", "days_before_ctpa", "value",
+            "event_datetime", "event_date", "days_before_ctpa", "value",
         ])
 
     timeline = pd.concat(parts, ignore_index=True)
@@ -878,11 +888,11 @@ def build_event_timeline(
     out_cols = [
         "impression_id", "patient_id", "anchor_time", "y",
         "event_type", "vocabulary", "concept_code", "concept_name",
-        "event_date", "days_before_ctpa", "value",
+        "event_datetime", "event_date", "days_before_ctpa", "value",
     ]
     return (
         timeline[out_cols]
-        .sort_values(["impression_id", "event_date", "event_type"])
+        .sort_values(["impression_id", "event_datetime", "event_type"])
         .reset_index(drop=True)
     )
 
