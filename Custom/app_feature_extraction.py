@@ -1084,6 +1084,23 @@ def main() -> None:  # pragma: no cover
             "Min studies per feature", 10, 500, 50, key="b_min_studies",
             help="Features (labs or codes) present in fewer studies than this are dropped.")
 
+        b_one_per_patient_label = st.selectbox(
+            "Studies per patient",
+            ["All studies", "First study only", "Last study only"],
+            key="b_one_per_patient",
+            help="Some patients have multiple studies in the cohort. Restricting to "
+                 "one per patient shrinks the cohort — and every downstream cost "
+                 "(extraction time, matrix rows, long-format/timeline export size) "
+                 "roughly proportionally — and avoids one patient contributing "
+                 "multiple correlated rows if that matters for how you're using "
+                 "the data. 'First'/'Last' is by anchor time, not upload order.",
+        )
+        b_one_per_patient = {
+            "All studies":       None,
+            "First study only":  "first",
+            "Last study only":   "last",
+        }[b_one_per_patient_label]
+
         # ── Concept-ancestor rollup ──────────────────────────────────────────
         with st.expander("🧬 Concept ancestor rollup (optional)", expanded=False):
             st.caption(
@@ -1153,6 +1170,7 @@ def main() -> None:  # pragma: no cover
             "ancestor_levels":       b_ancestor_levels,
             "min_studies_ancestor":  b_min_studies_anc,
             "max_ancestor_features": b_max_anc_features,
+            "one_study_per_patient": b_one_per_patient,
             "paths": {
                 "cohort":      cohort_path,
                 "measurement": str(b_measurement),

@@ -1234,8 +1234,24 @@ class LabExtractor:
 
     # -- cohort -----------------------------------------------------------
 
-    def _read_cohort(self, task: str, anchor_kind: str) -> list:
-        """Returns list of (person_id, anchor_dt, impression_id, split, y)."""
+    def _read_cohort(
+        self, task: str, anchor_kind: str,
+        one_per_patient: Optional[str] = None,
+    ) -> list:
+        """Returns list of (person_id, anchor_dt, impression_id, split, y).
+
+        one_per_patient : None/"all" (default) keeps every labelled study.
+                           "first" keeps only the earliest-anchor study per
+                           patient; "last" keeps only the latest. Patients
+                           with one study are unaffected either way. Reduces
+                           every downstream cost proportionally (extraction
+                           time, matrix rows, long-format/timeline export
+                           size) — the most direct lever if a cohort's
+                           volume, not its width, is what's causing memory
+                           pressure. It also removes the correlated-studies
+                           issue of one patient contributing multiple rows
+                           if that matters for how you're using the data.
+        """
         offset = datetime.timedelta(days=1) if anchor_kind == "dx" else datetime.timedelta(0)
         rows, skipped = [], 0
 
@@ -1269,6 +1285,22 @@ class LabExtractor:
         self._log(
             f"cohort: {len(rows):,} labelled rows  "
             f"({skipped:,} censored/missing skipped)")
+
+        if one_per_patient in ("first", "last"):
+            n_before = len(rows)
+            # Sort by anchor time first so a plain "keep the first (or last)
+            # occurrence per key" dict pass gives the earliest/latest row —
+            # dicts preserve insertion order, so this needs no extra bookkeeping.
+            rows.sort(key=lambda r: r[1], reverse=(one_per_patient == "last"))
+            by_patient: dict = {}
+            for r in rows:
+                by_patient.setdefault(r[0], r)
+            rows = list(by_patient.values())
+            self._log(
+                f"  {one_per_patient}-study-per-patient: {n_before:,} -> "
+                f"{len(rows):,} rows ({n_before - len(rows):,} dropped, "
+                f"{len(rows):,} unique patients)")
+
         return rows
 
     # -- survival ---------------------------------------------------------
@@ -2035,6 +2067,7 @@ class LabExtractor:
         ancestor_levels:        Optional[int] = None,
         min_studies_ancestor:   int = 100,
         max_ancestor_features:  int = 2000,
+        one_study_per_patient:  Optional[str] = None,
     ) -> LabFeatureMatrix:
         """Run the full extraction and return a LabFeatureMatrix.
 
@@ -2065,6 +2098,13 @@ class LabExtractor:
                                     more numerous and sparser).
             max_ancestor_features : hard cap on ancestor feature columns per event table,
                                     keeping the highest-coverage codes (default 2000).
+            one_study_per_patient : None/"all" (default) keeps every labelled study.
+                                    "first" or "last" keeps only the earliest/latest
+                                    study per patient — reduces the cohort (and every
+                                    downstream cost: extraction time, matrix rows,
+                                    long-format/timeline export size) proportionally
+                                    to how many patients have multiple studies. See
+                                    `_read_cohort` for the tie-breaking rule.
         """
         if windows_days is None:
             windows_days = DEFAULT_WINDOWS
@@ -2106,7 +2146,7 @@ class LabExtractor:
             self._log(f"  count tables: {count_tables}  windows: {count_window_per_table}")
 
         # 1. Read cohort
-        cohort_rows = self._read_cohort(task, anchor_kind)
+        cohort_rows = self._read_cohort(task, anchor_kind, one_study_per_patient)
         imp_ids     = [r[2] for r in cohort_rows]
         pat_ids     = np.array([r[0] for r in cohort_rows], dtype=np.int64)
         anchors     = np.array([r[1] for r in cohort_rows], dtype=object)
