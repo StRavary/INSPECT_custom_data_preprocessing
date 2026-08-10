@@ -75,6 +75,15 @@ _RACE_WHITE          = 8527
 _RACE_BLACK          = 8516
 _RACE_ASIAN          = 8515
 
+# Canonical {gender_concept_id (str) -> label} map. This is the single source
+# of truth for OMOP gender decoding — appd_context_descriptors.py and the
+# Streamlit app both import it rather than redefining their own copy, so the
+# concept-id -> label mapping and its casing ("female"/"male") can't diverge.
+GENDER = {
+    str(_GENDER_MALE):   "male",
+    str(_GENDER_FEMALE): "female",
+}
+
 PATIENT_ID_CANDIDATES = ("patient_id", "PatientID", "person_id")
 TIME_COLUMN           = "StudyTime"
 IMPRESSION_COLUMN     = "impression_id"
@@ -672,12 +681,14 @@ class LabFeatureMatrix:
         return pd.DataFrame(d)
 
     def human_columns(self, concept_map: dict) -> list:
-        from Custom.temporal_features import humanize_column
         return [humanize_column(c, concept_map) for c in self.columns]
 
     def describe(self) -> str:
         measured = float((~np.isnan(self.X)).mean())
-        n_labs   = len({c.rsplit("_", 2)[0] for c in self.columns})
+        # Only "labs:" columns follow the "..._<agg>_<window>d" naming scheme that
+        # rsplit assumes here; count-feature (diag:/drug:/proc:/...) and demo:
+        # columns don't, so they must be excluded or this overcounts distinct labs.
+        n_labs = len({c.rsplit("_", 2)[0] for c in self.columns if c.startswith("labs:")})
         lines = [
             f"route=B  task={self.task}  anchor={self.anchor_kind}  "
             f"rows={len(self):,}  cols={len(self.columns):,}  labs={n_labs:,}",
@@ -786,10 +797,13 @@ def build_event_timeline(
     # ── Labs ────────────────────────────────────────────────────────────────
     if "labs" in feature_types:
         max_window = max(windows_days)
+        # Bind LOINC codes (free-typed by the user in the app) as query
+        # parameters rather than splicing them into the SQL string.
         loinc_filter = ""
+        loinc_params: list = []
         if loinc_codes:
-            codes_sql = ", ".join(f"'{c}'" for c in loinc_codes)
-            loinc_filter = f"AND c.concept_code IN ({codes_sql})"
+            loinc_filter = f"AND c.concept_code IN ({', '.join('?' * len(loinc_codes))})"
+            loinc_params = list(loinc_codes)
         _log(f"[timeline] labs: scanning measurement.csv (window={max_window} d) …")
         lab_df = con.execute(f"""
             SELECT
@@ -820,7 +834,7 @@ def build_event_timeline(
                     CAST(t.measurement_date AS DATE),
                     CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
                   ) BETWEEN 1 AND {max_window}
-        """).df()
+        """, loinc_params).df()
         _log(f"  {len(lab_df):,} lab event rows")
         parts.append(lab_df)
 
@@ -1057,232 +1071,7 @@ class LabExtractor:
                       "have no matching survival entry")
         return tte, event
 
-    # -- DuckDB query -----------------------------------------------------
-
-    def _run_duckdb(
-        self,
-        cohort_rows: list,
-        max_window: int,
-        loinc_codes: Optional[list],
-    ):
-        """Scan measurement.csv once via DuckDB. Returns long-format DataFrame.
-
-        Columns: impression_id, loinc_code, lab_name, value_as_number,
-                 days_before_anchor  (days between measurement date and anchor;
-                 minimum 1, maximum max_window).
-        """
-        try:
-            import duckdb
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pip install duckdb pandas  (Route B requires these packages)")
-
-        self._log(f"  registering {len(cohort_rows):,} anchor rows …")
-
-        anchors_df = pd.DataFrame(
-            [
-                (pid, anchor.isoformat(), imp)
-                for pid, anchor, imp, _split, _y in cohort_rows
-            ],
-            columns=["person_id", "anchor_time", "impression_id"],
-        )
-        anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
-
-        con = duckdb.connect()
-        con.register("anchors_tbl", anchors_df)
-
-        # Load LOINC concept IDs (concept.csv is 1.1 GB but DuckDB filters in-scan)
-        self._log("  loading LOINC concept IDs from concept.csv …")
-        loinc_filter_clause = (
-            f"AND concept_code IN ({', '.join(repr(c) for c in loinc_codes)})"
-            if loinc_codes else ""
-        )
-        concepts_df = con.execute(f"""
-            SELECT
-                CAST(concept_id AS BIGINT) AS concept_id,
-                concept_code,
-                concept_name
-            FROM read_csv_auto('{self.concept_path}', ignore_errors=true)
-            WHERE vocabulary_id = 'LOINC'
-              {loinc_filter_clause}
-        """).df()
-        self._log(f"  {len(concepts_df):,} LOINC concepts loaded")
-
-        if concepts_df.empty:
-            raise RuntimeError(
-                "No LOINC concepts found in concept.csv. "
-                "Check that vocabulary_id='LOINC' rows exist.")
-        con.register("loinc_concepts", concepts_df)
-
-        # Scan measurement.csv — DuckDB pushes person_id and concept_id filters
-        # into the CSV scan, so it does not materialise the full 22.7 GB.
-        self._log(
-            f"  scanning measurement.csv (may take a few minutes for {max_window}d window) …")
-
-        sql = f"""
-            SELECT
-                a.impression_id,
-                lc.concept_code  AS loinc_code,
-                lc.concept_name  AS lab_name,
-                m.value_as_number,
-                CAST(
-                    DATEDIFF(
-                        'day',
-                        CAST(
-                            COALESCE(
-                                TRY_CAST(m.measurement_datetime AS TIMESTAMP),
-                                TRY_CAST(m.measurement_date AS TIMESTAMP)
-                            ) AS DATE
-                        ),
-                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                    )
-                AS INTEGER) AS days_before_anchor
-            FROM read_csv_auto('{self.measurement_path}', ignore_errors=true) m
-            INNER JOIN anchors_tbl  a
-                    ON CAST(m.person_id              AS BIGINT) = a.person_id
-            INNER JOIN loinc_concepts lc
-                    ON CAST(m.measurement_concept_id AS BIGINT) = lc.concept_id
-            WHERE m.value_as_number IS NOT NULL
-              AND COALESCE(
-                    TRY_CAST(m.measurement_datetime AS TIMESTAMP),
-                    TRY_CAST(m.measurement_date     AS TIMESTAMP)
-                  ) < CAST(a.anchor_time AS TIMESTAMP)
-              AND DATEDIFF(
-                    'day',
-                    CAST(
-                        COALESCE(
-                            TRY_CAST(m.measurement_datetime AS TIMESTAMP),
-                            TRY_CAST(m.measurement_date     AS TIMESTAMP)
-                        ) AS DATE
-                    ),
-                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                  ) BETWEEN 1 AND {max_window}
-            ORDER BY a.impression_id, lc.concept_code, days_before_anchor ASC
-        """
-
-        long_df = con.execute(sql).df()
-        con.close()
-
-        self._log(f"  {len(long_df):,} measurements retrieved "
-                  f"({long_df['loinc_code'].nunique():,} distinct LOINC codes, "
-                  f"{long_df['impression_id'].nunique():,} studies)")
-        return long_df
-
-    # -- per-window aggregation ------------------------------------------
-
-    @staticmethod
-    def _agg_window(df, window_days: int):
-        """Compute aggregates for measurements within window_days of anchor.
-
-        Input df must be sorted by (impression_id, loinc_code, days_before_anchor ASC)
-        so that groupby().first() gives the MOST RECENT value.
-        """
-        sub = df[df["days_before_anchor"] <= window_days]
-        if sub.empty:
-            return None
-
-        agg = (
-            sub.groupby(["impression_id", "loinc_code", "lab_name"],
-                        sort=False)["value_as_number"]
-            .agg(
-                last_val="first",   # most recent (df sorted ASC by days_before)
-                min_val="min",
-                max_val="max",
-                mean_val="mean",
-                n_meas="count",
-            )
-            .reset_index()
-        )
-        # days_since_last = minimum days_before_anchor in this window per group
-        days_since = (
-            sub.groupby(["impression_id", "loinc_code"], sort=False)
-            ["days_before_anchor"]
-            .min()
-            .reset_index()
-            .rename(columns={"days_before_anchor": "days_since_last"})
-        )
-        agg = agg.merge(days_since, on=["impression_id", "loinc_code"], how="left")
-        agg["window_days"] = window_days
-        return agg
-
-    # -- pivot to wide feature matrix ------------------------------------
-
-    def _pivot(
-        self,
-        long_df,
-        windows_days: list,
-        all_impression_ids: list,
-        min_studies: int,
-    ) -> tuple:
-        """Returns (X: np.ndarray, columns: list) aligned to all_impression_ids."""
-        import pandas as pd
-
-        # Collect per-window aggregations
-        parts = []
-        for w in sorted(windows_days):
-            agg = self._agg_window(long_df, w)
-            if agg is not None:
-                parts.append(agg)
-
-        if not parts:
-            raise RuntimeError("No measurements found in any of the requested windows.")
-
-        all_agg = pd.concat(parts, ignore_index=True)
-        self._log(f"  aggregations: {len(all_agg):,} (study, lab, window) rows")
-
-        # Filter: keep only labs measured in at least `min_studies` distinct studies
-        if min_studies > 0:
-            coverage = (
-                all_agg.groupby("loinc_code")["impression_id"]
-                .nunique()
-            )
-            keep = set(coverage[coverage >= min_studies].index)
-            n_before = all_agg["loinc_code"].nunique()
-            all_agg  = all_agg[all_agg["loinc_code"].isin(keep)]
-            n_after  = all_agg["loinc_code"].nunique()
-            self._log(
-                f"  {n_after} labs kept (≥{min_studies} studies); "
-                f"{n_before - n_after} dropped")
-
-        # Build column-name columns and melt to (impression_id, col_name, value)
-        agg_col_map = {
-            "last_val":      "last",
-            "min_val":       "min",
-            "max_val":       "max",
-            "mean_val":      "mean",
-            "n_meas":        "n",
-            "days_since_last": "days_since",
-        }
-        melted_parts = []
-        for src_col, agg_tag in agg_col_map.items():
-            tmp = all_agg[["impression_id", "loinc_code", "window_days", src_col]].copy()
-            tmp["col_name"] = (
-                "labs:LOINC/" + tmp["loinc_code"] + "_" + agg_tag + "_"
-                + tmp["window_days"].astype(str) + "d"
-            )
-            tmp = tmp[["impression_id", "col_name", src_col]].rename(
-                columns={src_col: "value"})
-            melted_parts.append(tmp)
-
-        melted = pd.concat(melted_parts, ignore_index=True)
-
-        # Pivot: rows = impression_id, cols = col_name
-        wide = melted.pivot_table(
-            index="impression_id",
-            columns="col_name",
-            values="value",
-            aggfunc="first",
-        )
-        wide.columns.name = None
-
-        # Reindex to cohort order (NaN = not measured in that window)
-        wide = wide.reindex(all_impression_ids)
-        columns = list(wide.columns)
-        X = wide.to_numpy(dtype=np.float32)
-        return X, columns
-
-    # -- DuckDB-native pivot (replaces _run_duckdb + _pivot in build()) ---
+    # -- DuckDB-native scan + pivot ----------------------------------------
 
     def _run_duckdb_and_pivot(
         self,
@@ -1329,10 +1118,14 @@ class LabExtractor:
             con.register("anchors_tbl", anchors_df)
 
             # ── 1. Load LOINC concept IDs ────────────────────────────────────
-            loinc_filter = (
-                f"AND concept_code IN ({', '.join(repr(c) for c in loinc_codes)})"
-                if loinc_codes else ""
-            )
+            # Bind LOINC codes (free-typed by the user in the app) as query
+            # parameters rather than splicing them into the SQL string.
+            loinc_params: list = []
+            if loinc_codes:
+                loinc_filter = f"AND concept_code IN ({', '.join('?' * len(loinc_codes))})"
+                loinc_params = list(loinc_codes)
+            else:
+                loinc_filter = ""
             self._log("  loading LOINC concepts …")
             con.execute(f"""
                 CREATE TEMP TABLE _loinc AS
@@ -1340,7 +1133,7 @@ class LabExtractor:
                 FROM read_csv_auto('{self.concept_path}', ignore_errors=true)
                 WHERE vocabulary_id = 'LOINC'
                   {loinc_filter}
-            """)
+            """, loinc_params)
             n_loinc = con.execute("SELECT COUNT(*) FROM _loinc").fetchone()[0]
             self._log(f"  {n_loinc:,} LOINC concepts loaded")
             if n_loinc == 0:

@@ -48,12 +48,15 @@ from typing import Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 
+# Canonical OMOP gender-concept-id -> label map, shared with the rest of the
+# pipeline (see Custom.appd_route_b_labs.GENDER) so "female"/"male" labels and
+# their casing can't drift between this module and the Streamlit app.
+from Custom.appd_route_b_labs import GENDER
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_PERSON = DATA_ROOT / "DATA_RAW" / "EHR_CSV" / "person.csv"
 
-# OMOP standard concept ids for the common gender values
-GENDER = {"8507": "male", "8532": "female"}
 AGE_BANDS = [(0, 40), (40, 55), (55, 65), (65, 75), (75, 85), (85, 200)]
 
 # column-name prefix -> vocabulary, e.g. "diag_proc:ICD10CM/I26.0_365 days..."

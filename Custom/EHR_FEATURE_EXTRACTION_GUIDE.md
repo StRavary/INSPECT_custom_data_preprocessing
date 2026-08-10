@@ -32,6 +32,19 @@ Paths are relative to the repository's parent directory.
 
 ## 2. Two routes into the data
 
+> **Route A's Python wrapper has been retired.** `TemporalFeatureExtractor`,
+> `FeatureMatrix`, and the `VITALS_LABS` / `DIAG_PROC` / `DRUGS` featurizer
+> groups no longer exist in `Custom/temporal_features.py` — that file is now
+> just a compatibility shim re-exporting shared constants/helpers for Route
+> B (see `Custom/_femr_worker.py`, which is now a stub that raises
+> `SystemExit("Route A / FEMR extraction has been retired.")`). The raw FEMR
+> extract is still on disk and still reachable directly via
+> `femr.datasets.PatientDatabase` (`.venv_legacy` still has `femr`
+> installed), but nothing in `Custom/` calls it anymore, and the app's
+> **Tab 0 · Load** only lists Route B extractions. §4 Option B, §5.1,
+> §6.1–6.3, and §7's example below describe the retired wrapper and are kept
+> for historical/interpretive reference — **for new work, use Route B.**
+
 **Route A — the FEMR database (`DATA_RAW/EHR_FEMR_DB/extract/`).**
 Pre-processed, indexed by patient, with the OMOP concept hierarchy materialised.
 This is what the published INSPECT baselines use, so results from it are
@@ -42,7 +55,7 @@ directly.
 **Route B — the raw OMOP CSVs (`DATA_RAW/EHR_CSV/`).**
 Complete and unreduced. Use this when you need measurement *values*, true
 sampling frequency, or control over ontology expansion depth. The extractor
-(`route_b_labs.py`) queries OMOP CSVs via DuckDB — large files are streamed
+(`appd_route_b_labs.py`) queries OMOP CSVs via DuckDB — large files are streamed
 out-of-core and never loaded into RAM. Supports labs (numeric values from
 `measurement.csv`), diagnoses, drugs, procedures, observations, and visits
 (event counts), plus optional concept ancestor rollup and LOS features.
@@ -93,7 +106,10 @@ the offset only in its PE branch.
 
 ```bash
 cd Custom
-../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
+pip install -r extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
+streamlit run app_feature_extraction.py
+# or, with the bundled legacy venv (already has these installed):
+../../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
 ```
 
 The app has five tabs:
@@ -106,34 +122,28 @@ The app has five tabs:
 | **3 · Describe**     | GDC-style cohort builder — filter by label, survival event, sex, age band; browse individual cases.       |
 | **4 · Export**       | Write split-ready files to disk (`X.npy`, `y.npy`, `metadata.csv`, `feature_names.csv`, load scripts).   |
 
-### Option B — the Python API (Route A)
+### Option B — the Python API (Route A) — retired
 
-```python
-from Custom.temporal_features import (
-    TemporalFeatureExtractor, VITALS_LABS, DIAG_PROC, DRUGS,
-)
+`TemporalFeatureExtractor`, `FeatureMatrix`, and the `VITALS_LABS` /
+`DIAG_PROC` / `DRUGS` featurizer groups shown in earlier versions of this
+guide have been removed from `Custom/temporal_features.py`; it is now a thin
+re-export shim (task lists, `load_concept_map`, `humanize_column`, a few
+constants) kept for Route B's benefit, not a Route A extraction API.
 
-ex = TemporalFeatureExtractor()          # paths auto-resolve
-ds = ex.build(
-    task="12_month_PH",
-    groups=[VITALS_LABS(bins=[2, 30, 365]),      # window edges in days
-            DIAG_PROC(bins=[365, 1825]),
-            DRUGS(bins=[30, 365])],
-)
+If you specifically need FEMR's delta-encoded count features (§5.1/§6.1),
+the only remaining path is calling `femr.datasets.PatientDatabase` and
+FEMR's own featurizers directly against `DATA_RAW/EHR_FEMR_DB/extract/` —
+`.venv_legacy` still has `femr` installed. There is no supported wrapper for
+this in `Custom/` anymore; `Custom/x_generate_binned_features.py` is the
+last surviving example of calling FEMR directly, kept for reference.
 
-ds.X            # scipy sparse CSR, one row per study
-ds.columns      # column names aligned to X
-ds.y            # binary label
-ds.tte, ds.event   # survival: days to event, 1 = observed / 0 = censored
-ds.split        # 'train' / 'valid' / 'test'
-ds.to_frame()   # metadata as a DataFrame
-print(ds.describe())
-```
+For everything else — including reproducing what this section used to do,
+just with real values instead of delta-encoded counts — use Route B below.
 
 ### Option C — the Python API (Route B)
 
 ```python
-from Custom.route_b_labs import LabExtractor
+from Custom.appd_route_b_labs import LabExtractor
 
 ex = LabExtractor()   # paths auto-resolve; person.csv appended automatically
 ds = ex.build(
@@ -172,7 +182,9 @@ ds.to_frame()
 print(ds.describe())
 ```
 
-Requires `pip install duckdb` in the venv (not bundled by default).
+Requires the packages in `Custom/extract_requirements.txt`
+(`pip install -r Custom/extract_requirements.txt`) — duckdb, streamlit,
+numpy, pandas, scipy.
 
 ### Available tasks
 
@@ -190,7 +202,11 @@ genuine per-patient right-censoring, not one administrative horizon.
 
 ## 5. What the columns mean
 
-### 5.1 Route A columns (FEMR count features)
+### 5.1 Route A columns (FEMR count features) — historical reference
+
+Route A's wrapper is retired (§2); this describes columns from old cached
+extractions or from calling FEMR directly. Nothing in `Custom/` produces
+these today — skip to §5.2 for what the app actually generates now.
 
 Each column is one **(code, time-window)** pair. The value is the count of
 qualifying events for that code inside that window, counted backwards from the
@@ -335,7 +351,10 @@ extraction automatically when `person.csv` is configured. They carry the prefix
 | `demo:race_other`  | binary   | 1 if race is recorded but is not white, black, or Asian |
 | `demo:race_unknown`| binary   | 1 if race_concept_id = 0 or the patient is absent from person.csv |
 
-**Sparse matrix note (Route A).** Scipy sparse matrices cannot store NaN, so
+**Sparse matrix note (Route A, historical).** `append_demographics()` still
+branches on route internally, but since Route A extractions can no longer be
+produced (§2), every extraction going through the app today takes the dense
+Route B path below. Scipy sparse matrices cannot store NaN, so
 before stacking the demographic columns `append_demographics()` fills age NaN
 with the cohort median age, and fills is_female / is_hispanic NaN with 0. Use
 the `demo:sex_unknown` and `demo:race_unknown` columns to recover the
@@ -357,6 +376,14 @@ A typical extraction produces tens of thousands of columns. The tables below
 give the vocabulary format, clinical meaning, and key examples for every column
 type you will encounter. Use `fm.human_columns(concept_map)` to resolve raw
 codes to readable names in bulk (see §5.5).
+
+The group names below (`vitals_labs`, `diag_proc`, `drugs`, `visits`) and the
+ontology-expansion behaviour are Route A's retired scheme (§5.1). The
+underlying vocabularies and code meanings are unchanged, though — the same
+LOINC / ICD-10 / RxNorm / Visit codes below apply directly to Route B's
+`labs:` / `diag:` / `drug:` / `proc:` / `obs:` / `visit:` columns (§5.2),
+just without automatic ancestor expansion unless you turn on concept
+ancestor rollup (§5.2.4).
 
 ---
 
@@ -789,6 +816,11 @@ converts them to the short form for display.
 
 ## 6. Caveats that will hinder you
 
+§§6.1–6.3 describe the retired Route A wrapper (§2) — relevant if you're
+interpreting an old cached extraction or calling FEMR directly, not
+something you can hit through the app today. §6.4–6.7 apply to Route B, the
+current path.
+
 ### 6.1 The FEMR extract is de-duplicated
 
 Building it dropped **72,508,452** events via `delta_encode` and 130,015 via
@@ -810,28 +842,33 @@ modelling. Use Route B for anything temporal.
 than the last bin edge land in a bucket that is never written out.
 
 `bins=[1825]` therefore **discards everything beyond five years without warning**.
-`temporal_features.py` appends a 100-year catch-all bin by default; pass
-`catch_all=False` only if you mean to truncate.
+The retired `TemporalFeatureExtractor` wrapper appended a 100-year catch-all
+bin by default to guard against this; if you're calling FEMR's
+`CountFeaturizer` directly (§4 Option B), you must add that catch-all bin
+yourself.
 
 ### 6.3 Unsorted bins mislabel columns (Route A)
 
 `featurize()` sorts `time_bins` internally, but `get_column_name()` indexes the
-original list. Unsorted bins produce mislabelled columns. The API always sorts
-first — if you call FEMR directly, sort them yourself.
+original list. Unsorted bins produce mislabelled columns. The retired
+wrapper always sorted first — if you call FEMR directly, sort them yourself.
 
 ### 6.4 Missingness is informative
 
 "Lab not drawn" is a clinical decision, not absent data. Encode presence
 explicitly rather than imputing. Measurements cluster during instability and
 vanish otherwise, so the sampling process is not missing-at-random. Route B's
-`demo:n_Nd` columns capture measurement frequency; the NaN in value columns
+`labs:LOINC/<code>_n_<N>d` columns (the `n` aggregate, §5.2.1) capture
+measurement frequency; the NaN in the `last`/`min`/`max`/`mean` value columns
 captures absence.
 
 ### 6.5 `concept_id = 0`
 
-In OMOP this means "no matching concept". Route B filters it automatically
-(`measurement_concept_id != 0` in the DuckDB query). If you write your own SQL,
-add this filter or it becomes a large junk column.
+In OMOP this means "no matching concept". Route B filters it automatically —
+count-feature queries exclude `concept_id = 0` with an explicit predicate;
+lab queries exclude it implicitly by inner-joining only to known LOINC
+`concept_id`s, so a `0` never matches. If you write your own SQL, add an
+explicit filter or it becomes a large junk column.
 
 ### 6.6 Route B windows are cumulative, not nested
 
@@ -857,10 +894,10 @@ the unit of analysis is the slice, not the patient. `ContextDescriber` produces
 one row per slice with properties that might explain performance variation.
 
 ```python
-from Custom.context_descriptors import ContextDescriber
+from Custom.appd_context_descriptors import ContextDescriber
 
 cd = ContextDescriber(ds, demographics="auto",
-                      key_columns=["labs:LOINC/2160-0_30 days, 0:00:00"])
+                      key_columns=["labs:LOINC/2160-0_last_30d"])
 table = cd.describe(by=["split", "sex", "age_band", "density_quartile"])
 table = cd.attach_performance(table,
                               {"train": 0.91, "valid": 0.86, "test": 0.85},
@@ -878,9 +915,6 @@ Descriptors produced per slice:
 | vocabulary         | `vocab_share_ICD10CM`, `vocab_share_LOINC`, … (shares sum to 1)                                   |
 | missingness        | `missing_<column>` for each nominated key column                                                  |
 | history proxy      | `frac_with_oldest_window_events`                                                                  |
-| vocabulary         | `vocab_share_ICD10CM`, `vocab_share_LOINC`, … (shares sum to 1) |
-| missingness        | `missing_<column>` for each nominated key column |
-| history proxy      | `frac_with_oldest_window_events` |
 
 Built-in slicers: `all`, `split`, `density_quartile`, `age_band`, `sex`,
 `race_concept_id`, `ethnicity_concept_id`, `care_site_id`. Pass
@@ -897,10 +931,15 @@ genuine temporal descriptors.
 
 ## 8. Reproducibility rules
 
-**Keep the FEMR path frozen.** The published INSPECT baselines are reproduced
-through Route A to within +0.013 mean AUROC across eight tasks. Any change to
-the feature source breaks that comparability. Build Route B work as a clearly
-labelled parallel track.
+**Keep the FEMR comparison frozen.** The published INSPECT baselines are
+reproduced through Route A to within +0.013 mean AUROC across eight tasks —
+that comparison point is a fixed historical reference regardless of what
+happens to the code. Since the `TemporalFeatureExtractor` wrapper is retired
+(§2), actually re-running that reproduction today means calling
+`femr.datasets.PatientDatabase` and FEMR's featurizers directly rather than
+through anything in `Custom/`. Build Route B work as a clearly labelled
+parallel track; don't treat it as a drop-in replacement for the Route A
+numbers without re-validating.
 
 **Features must be strictly pre-anchor.** The extractor enforces this, but if
 you write your own SQL, `e.dt < a.anchor` is not optional.
@@ -950,13 +989,14 @@ Things not yet settled, flagged so you do not assume they are:
 
 | file                               | purpose |
 |------------------------------------|---------|
-| `Custom/app_feature_extraction.py` | Streamlit interface — 7-tab UI over Route A, Route B, Cohort Builder, and Export |
-| `Custom/temporal_features.py`      | Route A extraction API (`TemporalFeatureExtractor`, `FeatureMatrix`) |
-| `Custom/route_b_labs.py`   | Route B extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` used by both routes |
-| `Custom/_femr_worker.py`           | Subprocess worker for Route A (avoids Streamlit multiprocessing deadlock) |
-| `Custom/_route_b_worker.py`        | Subprocess worker for Route B |
-| `Custom/context_descriptors.py`    | Per-slice descriptor tables (`ContextDescriber`) |
-| `Custom/x_generate_binned_features.py` | Earlier CLI version (superseded) |
+| `Custom/app_feature_extraction.py` | Streamlit interface — 5-tab UI (Load, Data sources, Extract, Describe, Export) over Route B and its Cohort Builder / export tooling. No Route A UI remains. |
+| `Custom/temporal_features.py`      | Compatibility shim — re-exports shared constants/helpers (task lists, `load_concept_map`, `humanize_column`, …) from `appd_route_b_labs.py`. The Route A `TemporalFeatureExtractor`/`FeatureMatrix` classes it used to hold are retired (§2). |
+| `Custom/appd_route_b_labs.py`   | Route B extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` |
+| `Custom/_femr_worker.py`           | Retired — now a stub that raises `SystemExit("Route A / FEMR extraction has been retired.")`. Kept only so old cached `spec.json` files referencing it don't error on load. |
+| `Custom/appd_route_b_worker.py`        | Subprocess worker for Route B extraction, spawned by the Streamlit app |
+| `Custom/appd_context_descriptors.py`    | Per-slice descriptor tables (`ContextDescriber`) |
+| `Custom/extract_requirements.txt`  | Pip requirements for `app_feature_extraction.py` and the `appd_*` modules (duckdb, streamlit, numpy, pandas, scipy) |
+| `Custom/x_generate_binned_features.py` | Earlier CLI version calling FEMR directly (superseded by the app; still functional since it doesn't depend on the retired wrapper) |
 | `Custom/extract_temporal_features.py` | Long-format event extraction with signed day windows |
 | `Custom/9a_run_baseline_benchmark.py` | Generates `labeled_patients.csv` per task |
 | `Custom/INSPECT_Baseline_Reconstruction.md` | Full methods and findings record |

@@ -12,8 +12,11 @@ Tabs
   3 · Describe      Filter cohort + browse per-impression event history
   4 · Export        Write flat arrays and long-format CSV ready for modelling
 
-Run:
-    ../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
+Run (from the Custom/ directory):
+    pip install -r extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
+    streamlit run app_feature_extraction.py
+    # or, with the bundled legacy venv (already has these installed):
+    ../../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
 """
 
 from __future__ import annotations
@@ -44,6 +47,11 @@ OMOP_EXPECTED = [
     "procedure_occurrence", "concept", "person",
 ]
 
+# Cached extractions are loaded with pickle.load() below (tab 0 · Load, and the
+# Extract/Re-run flow). pickle.load() executes arbitrary code for a maliciously
+# crafted file, so this is only safe as long as CACHE_DIR is writable solely by
+# this tool/user — do not point it at shared or network storage with looser
+# permissions than the rest of the repo.
 CACHE_DIR             = DATA_ROOT / "DATA_PROCESSED" / "femr_cache"
 ROUTE_B_WORKER_SCRIPT = SCRIPT_DIR / "appd_route_b_worker.py"
 
@@ -281,8 +289,11 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
         return np.full(len(fm.impression_ids), np.nan, dtype=np.float32)
 
     is_f = _get_demo("demo:is_female")
-    sex  = np.where(np.isnan(is_f), "Unknown",
-           np.where(is_f == 1.0,    "Female",  "Male"))
+    # Lowercase to match the GENDER-derived "female"/"male"/"unknown" labels used
+    # elsewhere in the app (Describe tab, ContextDescriber) — keeps `sex` values
+    # joinable/comparable across the long-format export and the cohort table.
+    sex  = np.where(np.isnan(is_f), "unknown",
+           np.where(is_f == 1.0,    "female",  "male"))
 
     # ── metadata DataFrame ───────────────────────────────────────────────────
     meta = fm.to_frame().reset_index(drop=True)   # impression_id, patient_id, …
@@ -866,6 +877,13 @@ def main() -> None:  # pragma: no cover
 
             if still_running:
                 st.info(f"⏳ Running (PID {pid}) — refreshes every 5 s …")
+                # NOTE: this blocks the Streamlit server thread handling this
+                # session for the full 5s on every poll. Fine for the single-user
+                # local usage this app is built for; if this is ever run as a
+                # shared/multi-user deployment, one user's running extraction
+                # will stall every other session and this should be replaced
+                # with a non-blocking poll (e.g. st.fragment + a short timer, or
+                # an autorefresh component) instead of time.sleep().
                 time.sleep(5)
                 st.rerun()
             else:
