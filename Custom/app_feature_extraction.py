@@ -599,17 +599,36 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     return long.sort_values(["impression_id", "feature"]).reset_index(drop=True)
 
 
+# Target size, in cells (studies × features), for one chunk's dense
+# (batch_rows × n_features) slice inside _melt_batch — i.e. the actual thing
+# that determines a chunk's memory footprint. A *fixed row-count* chunk
+# silently stops bounding anything once the extraction is wide: "all LOINC,
+# labs only" with no filter easily produces 50,000-150,000+ columns, at
+# which point even a modest few thousand studies per chunk is hundreds of
+# MB to multiple GB — this is what was still freezing the app despite
+# chunking existing. Sizing by cells instead means chunk_studies shrinks
+# automatically for wide extractions instead of stopping being a bound at
+# all. ~2M cells × 4 bytes (float32 slice) + 1 byte (bool mask) ≈ 10 MB of
+# actual matrix data per chunk — deliberately conservative headroom, since
+# the melted output rows add more on top depending on density.
+_STREAM_CHUNK_CELLS = 2_000_000
+
+
 def _build_long_df_streamed(
     fm, concept_map: dict, out_path, observed_only: bool = True,
-    chunk_studies: int = 2000, on_progress=None,
+    chunk_studies: "int | None" = None, on_progress=None,
 ) -> int:
     """Same output as _build_long_df, written straight to a CSV file on disk
-    `chunk_studies` studies at a time instead of held in memory all at once.
+    a bounded-memory chunk of studies at a time instead of held in memory
+    all at once — one file, written progressively; there's no separate
+    "fuse the chunks together" step because each chunk is appended directly
+    to the same open file handle as it's produced.
 
-    Peak memory scales with one chunk (`chunk_studies × n_features`), not
-    the full result, so there is no `_LONG_DF_MAX_CELLS`-style cap here —
-    this is the path for extractions too large for the in-memory builder
-    (e.g. the full cohort, labs only, 365-day window, no LOINC filter).
+    Peak memory scales with one chunk's cell count (~`_STREAM_CHUNK_CELLS`
+    by default), not the full result, so there is no `_LONG_DF_MAX_CELLS`-
+    style cap here — this is the path for extractions too large for the
+    in-memory builder (e.g. the full cohort, labs only, 365-day window, no
+    LOINC filter).
 
     The output is written grouped by chunk (i.e. by the extraction's
     original study order) rather than globally sorted by impression_id —
@@ -621,9 +640,12 @@ def _build_long_df_streamed(
     ----------
     fm, concept_map, observed_only : see _build_long_df
     out_path      : destination CSV path (parent dir created if needed)
-    chunk_studies : studies processed per chunk. Lower this if a single
-                    chunk is still too large for a very wide extraction
-                    (many feature types × many windows).
+    chunk_studies : studies processed per chunk. Default (None) auto-sizes
+                    this from `_STREAM_CHUNK_CELLS // n_features`, so it
+                    shrinks automatically for wide extractions instead of
+                    needing to be hand-tuned per extraction. Pass an
+                    explicit value to override (e.g. lower it further on a
+                    memory-constrained machine).
     on_progress   : optional callable(studies_done, studies_total) invoked
                     after each chunk — wire to st.progress() for a live bar.
 
@@ -631,11 +653,15 @@ def _build_long_df_streamed(
     -------
     int : total number of rows written.
     """
+    import gc
     import numpy as np
     from pathlib import Path as _Path
 
     prep  = _prep_long_df(fm, concept_map)
-    n_imp = prep["n_imp"]
+    n_imp, n_feat = prep["n_imp"], prep["n_feat"]
+
+    if chunk_studies is None:
+        chunk_studies = max(1, _STREAM_CHUNK_CELLS // max(n_feat, 1))
 
     out_path = _Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -649,6 +675,8 @@ def _build_long_df_streamed(
                 chunk_df = chunk_df.sort_values(["impression_id", "feature"])
             chunk_df.to_csv(fh, index=False, header=(start == 0))
             total_rows += len(chunk_df)
+            del chunk_df, batch_rows
+            gc.collect()   # encourage prompt release of this chunk's arrays
             if on_progress:
                 on_progress(min(start + chunk_studies, n_imp), n_imp)
 
@@ -1593,19 +1621,40 @@ def main() -> None:  # pragma: no cover
 
             st.markdown("**Too large for the table above?**")
             st.caption(
-                "Writes the same long-format rows straight to a CSV file on "
-                "disk, a few thousand studies at a time, instead of holding "
-                "everything in memory at once — so there's no size cap. Use "
-                "this when 'Build long-format table' raises a memory error "
-                "above (e.g. the full cohort, labs only, a wide window, no "
-                "LOINC filter). Rows are grouped by study-processing order "
-                "rather than globally sorted by impression_id, since "
-                "sorting the whole file would need the whole file in memory."
+                "Writes the same long-format rows straight to one CSV file "
+                "on disk — a bounded-memory chunk of studies at a time, "
+                "appended to the same file as it goes, so there's no "
+                "separate 'fuse the pieces together' step and no size cap. "
+                "Use this when 'Build long-format table' raises a memory "
+                "error above (e.g. the full cohort, labs only, a wide "
+                "window, no LOINC filter). Rows are grouped by "
+                "study-processing order rather than globally sorted by "
+                "impression_id, since sorting the whole file would need the "
+                "whole file in memory."
             )
             lf_stream_path = st.text_input(
                 "Output CSV path",
                 value=str(Path(export_dir) / f"{fm.task}_long.csv"),
                 key="lf_stream_path",
+            )
+            n_feat_est = max(len(fm.columns) - 9, 1)   # minus demo: columns, roughly
+            default_chunk_cells = _STREAM_CHUNK_CELLS
+            lf_chunk_cells = st.number_input(
+                "Target cells per chunk (studies × features held in memory at once)",
+                min_value=100_000, max_value=50_000_000,
+                value=default_chunk_cells, step=100_000,
+                key="lf_chunk_cells",
+                help="Roughly 4 bytes of RAM per cell for the raw matrix slice, "
+                     "plus more for the melted rows depending on how much of it "
+                     "is actually observed. Lower this on a memory-constrained "
+                     "machine; raise it (fewer, bigger chunks) for a faster run "
+                     "on a machine with plenty of RAM.",
+            )
+            lf_chunk_studies = max(1, int(lf_chunk_cells) // n_feat_est)
+            st.caption(
+                f"≈ {lf_chunk_studies:,} studies per chunk at this extraction's "
+                f"~{n_feat_est:,} feature columns "
+                f"(~{lf_chunk_cells * 4 / 1e6:.0f} MB of raw matrix data per chunk)."
             )
             if st.button("💾 Stream full long-format CSV to disk", key="lf_stream_build"):
                 concept_map_lf = (
@@ -1622,7 +1671,8 @@ def main() -> None:  # pragma: no cover
                 with st.spinner("Streaming to disk …"):
                     n_rows = _build_long_df_streamed(
                         fm, concept_map_lf, lf_stream_path,
-                        observed_only=lf_obs_only, on_progress=_on_progress,
+                        observed_only=lf_obs_only, chunk_studies=lf_chunk_studies,
+                        on_progress=_on_progress,
                     )
                 progress.empty()
                 st.success(f"✅ Wrote {n_rows:,} rows to:")
