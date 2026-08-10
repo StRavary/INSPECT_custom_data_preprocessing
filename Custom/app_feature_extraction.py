@@ -370,7 +370,16 @@ def _prep_long_df(fm, concept_map: dict):
     that's O(n_studies) or O(n_features) — cheap regardless of extraction
     size — and independent of which studies are being melted right now.
 
-    Returns a dict consumed by _melt_batch and both builders above it.
+    Critically, this does **not** copy `fm.X`. An earlier version did
+    ``fm.X[:, feat_idx]`` to drop the handful of ``demo:`` columns before
+    melting — for a "labs only" extraction, `feat_idx` excludes at most 9
+    columns out of possibly tens of thousands, so that line was silently
+    duplicating almost the *entire* feature matrix in RAM before any
+    chunking even started, on top of the copy already held by the loaded
+    `fm`. `demo:` columns are excluded later instead, via a boolean mask
+    applied in-place per chunk (see `_melt_batch`), which costs nothing.
+
+    Returns a dict consumed by _melt_batch and both builders below it.
     """
     import pandas as pd
     import numpy as np
@@ -378,9 +387,14 @@ def _prep_long_df(fm, concept_map: dict):
     import re
 
     col_list = list(fm.columns)
+    col_arr  = np.array(col_list, dtype=object)   # aligned 1:1 with fm.X's columns
     col_idx  = {c: i for i, c in enumerate(col_list)}
+    is_demo  = np.array([c.startswith("demo:") for c in col_list])
 
     def _get_demo(name):
+        # Single-column basic indexing (`fm.X[:, i]` with a scalar i) is a
+        # numpy *view*, not a copy of the matrix — only .copy() below (of
+        # that one column) allocates anything, and it's O(n_studies).
         if name in col_idx:
             return fm.X[:, col_idx[name]].copy()
         return np.full(len(fm.impression_ids), np.nan, dtype=np.float32)
@@ -403,23 +417,23 @@ def _prep_long_df(fm, concept_map: dict):
                "tte_days", "event", "sex", "age_years"]
     out_cols = id_vars + ["feature", "record_date", "feature_human_readable", "value"]
 
-    feat_idx  = [i for i, c in enumerate(col_list) if not c.startswith("demo:")]
-    feat_cols = np.array([col_list[i] for i in feat_idx], dtype=object)
-    X_feat    = fm.X[:, feat_idx]
-
     # Labs: record_date = anchor_time - days_since (already in the matrix).
     # Count features: record_date from fm.count_dates (most-recent event date).
+    # Indices below are into the FULL column space (same as fm.X's columns),
+    # not a demo-excluded subset — demo: columns simply never match either
+    # pattern, so they naturally end up with ds_source == -1.
     _LAB_COL_PAT    = re.compile(r'^(labs:[^_]+(?:_[^_]+)*)_([^_]+)_(\d+d)$')
     _DAYS_SINCE_PAT = re.compile(r'^(labs:.+)_days_since_(\d+d)$')
 
-    ds_local_idx: dict = {}   # (base, window) -> position of the days_since column
-    for j, c in enumerate(feat_cols):
+    ds_local_idx: dict = {}   # (base, window) -> global column index of the days_since column
+    for j, c in enumerate(col_list):
         m = _DAYS_SINCE_PAT.match(c)
         if m:
             ds_local_idx[(m.group(1), m.group(2))] = j
 
-    ds_source = np.full(len(feat_cols), -1, dtype=np.int64)
-    for j, c in enumerate(feat_cols):
+    n_total = len(col_list)
+    ds_source = np.full(n_total, -1, dtype=np.int64)
+    for j, c in enumerate(col_list):
         if c.startswith("labs:"):
             m = _LAB_COL_PAT.match(c)
             if m:
@@ -429,49 +443,60 @@ def _prep_long_df(fm, concept_map: dict):
     count_dates_cols = set(count_dates.columns) if count_dates is not None else set()
     anchor_dt = pd.to_datetime([str(a) for a in fm.anchor_times]).to_numpy()
 
-    # Human-readable names computed once for every feature column up front —
-    # O(n_features), shared across every study-chunk that gets melted.
-    name_map = {c: humanize_column(c, concept_map) for c in feat_cols}
+    # Human-readable names computed once for every non-demo feature column up
+    # front — O(n_features), shared across every study-chunk that gets melted.
+    name_map = {c: humanize_column(c, concept_map)
+                for c in col_arr[~is_demo]}
 
     return dict(
-        meta=meta, feat_cols=feat_cols, X_feat=X_feat, ds_source=ds_source,
+        X=fm.X, meta=meta, col_arr=col_arr, is_demo=is_demo, ds_source=ds_source,
         count_dates=count_dates, count_dates_cols=count_dates_cols,
         anchor_dt=anchor_dt, name_map=name_map, id_vars=id_vars,
-        out_cols=out_cols, n_imp=X_feat.shape[0], n_feat=X_feat.shape[1],
+        out_cols=out_cols, n_imp=fm.X.shape[0],
+        n_feat=n_total - int(is_demo.sum()),
     )
 
 
 def _melt_batch(prep: dict, batch_rows, observed_only: bool) -> "pd.DataFrame":
-    """Melt one chunk of studies (`batch_rows`, an int array of row indices
-    into fm's study axis) to long format. `batch_rows` can be all studies
-    (one shot, from _build_long_df) or a few thousand at a time (streamed,
-    from _build_long_df_streamed) — either way, peak memory here scales with
-    `len(batch_rows) × n_features`, never the full matrix at once unless the
-    caller passes all rows in a single batch.
+    """Melt one chunk of studies to long format.
+
+    `batch_rows` is either `None` — use the full matrix as-is, no row copy,
+    for the single-shot in-memory path where the row set already *is*
+    everything — or an int array of a few thousand study indices for one
+    streamed chunk. Either way this is the only place that ever slices rows
+    out of `fm.X`, and only by the number of rows actually requested.
     """
     import pandas as pd
     import numpy as np
 
-    meta, feat_cols, X_feat = prep["meta"], prep["feat_cols"], prep["X_feat"]
+    X, meta, col_arr = prep["X"], prep["meta"], prep["col_arr"]
+    is_demo                 = prep["is_demo"]
     ds_source, count_dates  = prep["ds_source"], prep["count_dates"]
     count_dates_cols        = prep["count_dates_cols"]
     anchor_dt, name_map     = prep["anchor_dt"], prep["name_map"]
     id_vars, out_cols       = prep["id_vars"], prep["out_cols"]
 
-    Xb = X_feat[batch_rows]
+    if batch_rows is None:
+        Xb = X                              # no copy — use the matrix directly
+        abs_rows = np.arange(X.shape[0])
+    else:
+        Xb = X[batch_rows]                  # copy, but only of this chunk
+        abs_rows = np.asarray(batch_rows)
+
     if observed_only:
         keep_mask = ~np.isnan(Xb) & (Xb != 0.0)
     else:
-        keep_mask = np.ones_like(Xb, dtype=bool)
+        keep_mask = np.ones(Xb.shape, dtype=bool)
+    keep_mask[:, is_demo] = False           # demo: columns are metadata, not features
 
     r_local, col_pos = np.nonzero(keep_mask)
     if r_local.size == 0:
         return pd.DataFrame(columns=out_cols)
-    row_idx = np.asarray(batch_rows)[r_local]
+    row_idx = abs_rows[r_local]
     n_kept  = row_idx.size
 
     long = pd.DataFrame({c: meta[c].to_numpy()[row_idx] for c in id_vars})
-    long["feature"] = feat_cols[col_pos]
+    long["feature"] = col_arr[col_pos]
     long["value"]   = Xb[r_local, col_pos]
 
     record_date = np.full(n_kept, "", dtype=object)
@@ -484,9 +509,9 @@ def _melt_batch(prep: dict, batch_rows, observed_only: bool) -> "pd.DataFrame":
     for positions in np.split(order, boundaries):
         j    = col_pos[positions[0]]
         rows = row_idx[positions]
-        c    = feat_cols[j]
+        c    = col_arr[j]
         if ds_source[j] != -1:
-            ds_vals = X_feat[rows, ds_source[j]].astype(float)
+            ds_vals = X[rows, ds_source[j]].astype(float)
             valid   = ~np.isnan(ds_vals)
             if valid.any():
                 dates = anchor_dt[rows[valid]] - pd.to_timedelta(
@@ -494,8 +519,8 @@ def _melt_batch(prep: dict, batch_rows, observed_only: bool) -> "pd.DataFrame":
                 record_date[positions[valid]] = (
                     pd.DatetimeIndex(dates).strftime("%Y-%m-%d"))
         elif c in count_dates_cols:
-            col_arr = count_dates[c].fillna("").astype(str).to_numpy()
-            record_date[positions] = col_arr[rows]
+            col_arr_dates = count_dates[c].fillna("").astype(str).to_numpy()
+            record_date[positions] = col_arr_dates[rows]
     long["record_date"] = record_date
 
     long["feature_human_readable"] = long["feature"].map(name_map)
@@ -530,9 +555,14 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     prep = _prep_long_df(fm, concept_map)
     n_imp, n_feat = prep["n_imp"], prep["n_feat"]
 
-    # ── cheap pre-check: know the output row count before building anything ─
+    # ── cheap pre-check: know the output row count before building anything.
+    #    Computed directly on prep["X"] (the original fm.X, no copy) — the
+    #    boolean mask allocated here is 1 byte/cell vs. float32's 4, and
+    #    unlike a column-subset copy it never duplicates the underlying data.
     if observed_only:
-        keep_mask = ~np.isnan(prep["X_feat"]) & (prep["X_feat"] != 0.0)
+        X = prep["X"]
+        keep_mask = ~np.isnan(X) & (X != 0.0)
+        keep_mask[:, prep["is_demo"]] = False
         n_kept = int(keep_mask.sum())
         del keep_mask
         if n_kept > _LONG_DF_MAX_CELLS:
@@ -564,7 +594,8 @@ def _build_long_df(fm, concept_map: dict, observed_only: bool = True) -> "pd.Dat
     if n_kept == 0:
         return pd.DataFrame(columns=prep["out_cols"])
 
-    long = _melt_batch(prep, np.arange(n_imp), observed_only)
+    # batch_rows=None → _melt_batch uses prep["X"] directly, no row copy.
+    long = _melt_batch(prep, None, observed_only)
     return long.sort_values(["impression_id", "feature"]).reset_index(drop=True)
 
 
