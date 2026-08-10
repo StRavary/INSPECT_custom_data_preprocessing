@@ -100,9 +100,35 @@ class RNNSequentialEncoder(nn.Module):
             bidirectional=bidirectional,
         )
 
-    def forward(self, x):
-        x = x.transpose(0, 1)
-        x, _ = self.rnn(x)  # (Slice, Batch, Feature)
+    def forward(self, x, lengths=None):
+        # Without `lengths`, the RNN processes every one of the num_slices
+        # timesteps as-is, including the zero-padded ones appended by
+        # fix_series_slice_number() for scans shorter than num_slices. For a
+        # bidirectional RNN this is worse than it sounds: the backward
+        # direction starts at the last timestep and runs toward the real
+        # data, so for any short scan it spends its first steps consuming
+        # pure zero-padding before reaching genuine slices — contaminating
+        # the hidden state at every real position with a padding-induced
+        # offset before pooling ever sees it. Pooling-level masking (in
+        # aggregate()) only hides padded positions from the final reduction;
+        # it can't undo this upstream corruption of the "real" positions'
+        # own hidden states.
+        #
+        # pack_padded_sequence/pad_packed_sequence make cuDNN skip padded
+        # timesteps entirely per-sample, so the backward pass genuinely
+        # starts at each sample's real last slice instead of at the
+        # fixed padded end. No parameters or output shape change.
+        x = x.transpose(0, 1)  # (Slice, Batch, Feature)
+        if lengths is not None:
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths.cpu(), batch_first=False, enforce_sorted=False
+            )
+            packed, _ = self.rnn(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(
+                packed, batch_first=False, total_length=x.size(0)
+            )
+        else:
+            x, _ = self.rnn(x)  # (Slice, Batch, Feature)
         x = x.transpose(0, 1)  # (Batch, Slice, Feature)
         return x
 
@@ -157,6 +183,11 @@ class Model1D(nn.Module):
         else:
             raise Exception("")
 
+        # RNNSequentialEncoder accepts a `lengths` kwarg (to skip padded
+        # timesteps via pack_padded_sequence); the transformer branch above
+        # doesn't, so only pass lengths through when we actually built an RNN.
+        self._is_rnn_encoder = cfg.model.seq_encoder.rnn_type in ["LSTM", "GRU"]
+
         if "attention" in cfg.model.aggregation:
             self.attention = Attention(cls_input_size, cfg.dataset.num_slices)
 
@@ -202,7 +233,15 @@ class Model1D(nn.Module):
             x = torch.cat([self.input_norm(feats), pos], dim=-1)
         else:
             x = self.input_norm(x)
-        x = self.seq_encoder(x)
+        if self._is_rnn_encoder and mask is not None:
+            # mask: (Batch, Slice), 1=real, 0=padded. Real slice count per
+            # sample, clamped to >=1 since pack_padded_sequence rejects
+            # zero-length sequences (shouldn't occur — every sample has at
+            # least one real slice — but clamp defensively).
+            lengths = mask.sum(dim=1).clamp(min=1).long()
+            x = self.seq_encoder(x, lengths=lengths)
+        else:
+            x = self.seq_encoder(x)
         x, w = self.aggregate(x, mask)
         # x = self.batch_norm_layer(x)
         pred = self.classifier(x)
