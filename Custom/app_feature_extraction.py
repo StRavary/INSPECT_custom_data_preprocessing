@@ -688,8 +688,14 @@ def _build_long_df_streamed(
 # ---------------------------------------------------------------------------
 
 def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict) -> str:
-    """Write flat (unsplit) files to export_dir. Returns a summary string."""
-    import scipy.sparse
+    """Write flat (unsplit) files to export_dir. Returns a summary string.
+
+    X.npy is always dense — LabFeatureMatrix.X is a dense float32 array by
+    design (unlike the retired Route A, which used scipy.sparse). For a
+    very wide extraction this can be a large file, and — more importantly —
+    loading it back (e.g. via the generated load_survival.py's
+    `np.load(".../X.npy")`) needs that much RAM again downstream.
+    """
     import pandas as pd
     import numpy as np
 
@@ -715,7 +721,10 @@ def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict) -> str:
     meta = fm.to_frame()
     meta.to_csv(out / "metadata.csv", index=False)
 
-    np.save(out / "X.npy",      X.astype(np.float32))
+    # copy=False: X is already float32 (LabFeatureMatrix's dtype by
+    # construction) — without this, .astype() silently duplicates the whole
+    # matrix in memory just to convert a dtype that's already correct.
+    np.save(out / "X.npy",      X.astype(np.float32, copy=False))
     np.save(out / "X_mask.npy", (~np.isnan(X)).astype(np.uint8))
     np.save(out / "y.npy", fm.y)
 
