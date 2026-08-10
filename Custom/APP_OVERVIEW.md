@@ -82,11 +82,10 @@ whatever you extract — no extra step needed.
 ## Where things live
 
 - Cached extractions: `DATA_PROCESSED/femr_cache/<hash>.pkl` (+ `.log` and
-  `_spec.json` recording exactly what produced it — safe to `git`-ignore,
+  `_spec.json` recording exactly what produced it, safe to `git`-ignore,
   never to hand-edit).
 - Exported arrays: wherever you point Tab 4's **Export directory** (default
   `DATA_PROCESSED/exports/<task>/`).
 
-Questions or something looks wrong? Check the live log in Tab 2 first —
-most extraction issues (missing table, empty LOINC filter, bad path) show
+Questions or something looks wrong? See EHR_FEATURE_EXTRACTION_GUIDE.md. or check the live log in Tab 2 first, most extraction issues (missing table, empty LOINC filter, bad path) show
 up there in plain English.

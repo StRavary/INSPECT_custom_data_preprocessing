@@ -87,6 +87,103 @@ PATIENT_ID_CANDIDATES = ("patient_id", "PatientID", "person_id")
 
 
 # ---------------------------------------------------------------------------
+# Column glossary — plain-English descriptions surfaced two ways: as hover
+# tooltips on dataframe column headers (see _glossary_column_config) and as
+# an in-app "what do these columns mean?" expander (see _render_glossary),
+# so a first-time user isn't sent to EHR_FEATURE_EXTRACTION_GUIDE.md just to
+# find out that "tte" means "time to event".
+# ---------------------------------------------------------------------------
+
+COLUMN_GLOSSARY = {
+    "impression_id": "Unique ID for one CTPA study.",
+    "patient_id":     "Unique ID for the patient. One patient can have several studies.",
+    "anchor_time":    "The date features are computed backwards from — StudyTime for "
+                       "prognostic tasks, StudyTime − 1 day for diagnostic tasks.",
+    "y":              "Binary task label for this study: 1 = positive, 0 = negative.",
+    "tte_days":       "Time-to-event — days from anchor_time to the survival event, "
+                       "or to censoring if none was observed.",
+    "event":          "Survival event indicator: 1 = event observed, 0 = censored "
+                       "(no event seen before the patient's data ends), NaN = unknown.",
+    "sex":            "Patient sex, derived from OMOP gender_concept_id.",
+    "age_years":      "Patient age in years at anchor_time.",
+    "age_band":       "Age bucketed into ranges for cohort slicing.",
+    "split":          "Canonical train / valid / test split. Patient-level — no "
+                       "patient appears in more than one split.",
+    "feature":        "Raw feature column name, e.g. labs:LOINC/2160-0_last_30d — "
+                       "see the prefix legend below.",
+    "feature_human_readable": "The same feature with OMOP codes resolved to plain "
+                       "English via concept.csv.",
+    "record_date":    "Date the underlying measurement/event actually happened "
+                       "(not the anchor date).",
+    "value":          "Observed value — a real number for labs/observations, NaN "
+                       "for coded events (diagnoses, drugs, procedures, visits).",
+    "days_before_anchor": "How many days before anchor_time this event occurred.",
+    "days_before_ctpa":   "How many days before the CTPA study (anchor) this event occurred.",
+    "source_table":   "Which OMOP table this event came from.",
+    "event_type":     "Feature type this event belongs to (lab, diagnosis, drug, "
+                       "procedure, observation, visit).",
+    "vocabulary":     "Coding vocabulary for concept_code, e.g. LOINC, ICD10CM, RxNorm, CPT4.",
+    "concept_code":   "Raw vocabulary code, e.g. '2160-0' (LOINC) or 'I26.90' (ICD-10-CM).",
+    "concept_name":   "Human-readable name for the code, resolved via concept.csv.",
+    "concept_id":     "OMOP's internal integer ID for a concept.",
+    "event_date":     "Calendar date of the underlying event.",
+    "event_datetime": "Timestamp of the underlying event (midnight if no time was recorded).",
+}
+
+# (prefix, meaning) — the column-name convention for feature columns, which
+# COLUMN_GLOSSARY can't cover one-by-one since there are tens of thousands of
+# them (one per code × window).
+PREFIX_GLOSSARY = [
+    ("labs:",  "real-valued lab result — e.g. `labs:LOINC/2160-0_last_30d` = "
+               "creatinine, most recent value, 30-day window"),
+    ("diag:",  "count of distinct days a diagnosis code was recorded"),
+    ("drug:",  "count of distinct days a drug was administered or dispensed"),
+    ("proc:",  "count of distinct days a procedure was recorded"),
+    ("obs:",   "count of distinct days an OMOP \"observation\" concept was recorded "
+               "(smoking status, functional status, etc.)"),
+    ("visit:", "count of distinct visit days; `visit:LOS/total_Nd` / "
+               "`visit:LOS/max_Nd` give length-of-stay instead"),
+    ("demo:",  "demographic feature from person.csv (age, sex, race, ethnicity)"),
+    ("*_anc:", "optional concept-ancestor rollup — same meaning as the base "
+               "prefix, but for parent/ancestor codes (e.g. `diag_anc:`)"),
+]
+
+
+def _glossary_column_config(df) -> dict:
+    """Hover-tooltip help text (Streamlit column_config) for any column in
+    `df` that's in COLUMN_GLOSSARY. Columns not in the glossary — including
+    the thousands of labs:/diag:/... feature columns — are left with no
+    special config, so they just render normally."""
+    import streamlit as st
+    return {
+        col: st.column_config.Column(help=COLUMN_GLOSSARY[col])
+        for col in df.columns if col in COLUMN_GLOSSARY
+    }
+
+
+def _render_glossary(st, key: str) -> None:
+    """Collapsed-by-default 'what do these columns mean?' expander."""
+    with st.expander("ℹ️ What do these columns mean?", key=key):
+        st.markdown(
+            "**Study metadata**\n\n"
+            + "\n".join(
+                f"- `{c}` — {COLUMN_GLOSSARY[c]}"
+                for c in ("impression_id", "patient_id", "anchor_time", "y",
+                          "tte_days", "event", "sex", "age_years", "age_band")
+                if c in COLUMN_GLOSSARY
+            )
+            + "\n\n**Feature column prefixes**\n\n"
+            + "\n".join(f"- `{p}` — {d}" for p, d in PREFIX_GLOSSARY)
+            + "\n\n**Feature column suffixes** — `_Nd` = lookback window in "
+              "days before anchor. Lab columns additionally carry an "
+              "aggregate tag: `_last`, `_min`, `_max`, `_mean`, `_n` (count "
+              "of distinct measurement days), `_days_since` (days since the "
+              "most recent measurement).\n\n"
+              "Full reference: `EHR_FEATURE_EXTRACTION_GUIDE.md`."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -616,8 +713,12 @@ def main() -> None:  # pragma: no cover
             c = st.columns(4)
             c[0].metric("Studies",    f"{len(fm.y):,}")
             c[1].metric("Features",   f"{len(fm.columns):,}")
-            c[2].metric("Event rate", f"{float(fm.y.mean()):.4f}")
-            c[3].metric("Anchor",     fm.anchor_kind)
+            c[2].metric("Event rate", f"{float(fm.y.mean()):.4f}",
+                        help="Fraction of studies with a positive task label (y=1).")
+            c[3].metric("Anchor",     fm.anchor_kind,
+                        help="'dx' = features computed as of StudyTime − 1 day "
+                             "(diagnostic tasks); 'px' = as of StudyTime "
+                             "(prognostic tasks).")
 
     # ── 1 · Data sources ────────────────────────────────────────────────────
     with tab_src:
@@ -1084,7 +1185,9 @@ def main() -> None:  # pragma: no cover
             # ── case table preview ────────────────────────────────────────
             st.divider()
             st.subheader(f"Cases ({n_st:,} studies)")
-            st.dataframe(filtered, width="stretch", hide_index=True)
+            _render_glossary(st, key="glossary_desc")
+            st.dataframe(filtered, width="stretch", hide_index=True,
+                         column_config=_glossary_column_config(filtered))
 
             # ── event history viewer ──────────────────────────────────────
             st.divider()
@@ -1169,7 +1272,8 @@ def main() -> None:  # pragma: no cover
                         else:
                             st.success(f"{len(ev_df):,} events across "
                                        f"{ev_df['source_table'].nunique()} table(s)")
-                            st.dataframe(ev_df, use_container_width=True, hide_index=True)
+                            st.dataframe(ev_df, use_container_width=True, hide_index=True,
+                                         column_config=_glossary_column_config(ev_df))
                             ev_buf = io.StringIO()
                             ev_df.to_csv(ev_buf, index=False)
                             st.download_button(
@@ -1215,11 +1319,14 @@ def main() -> None:  # pragma: no cover
                      "configured in Data sources.",
             )
 
+            _render_glossary(st, key="glossary_exp")
+
             st.markdown("**Files written to the export directory:**")
             st.markdown(
                 "**`metadata.csv`** — one row per study: `impression_id`, `patient_id`, "
                 "`anchor_time` (date the feature window ends), `y` (binary task label), "
-                "`tte_days` and `event` (survival outcome, if available).  \n\n"
+                "`tte_days` (**t**ime-**t**o-**e**vent, in days) and `event` "
+                "(1 = event observed, 0 = censored) for survival modelling, if available.  \n\n"
                 "**`X.npy`** — feature matrix, float32, shape `(n_studies, n_features)`. "
                 "Lab values use `NaN` for *not measured*; count features (diagnoses / drugs / "
                 "procedures) use `0` for *not observed*. Rows align 1-to-1 with `metadata.csv`.  \n\n"
@@ -1289,7 +1396,8 @@ def main() -> None:  # pragma: no cover
                     f"{len(ldf):,} rows · "
                     f"{ldf['impression_id'].nunique():,} studies · "
                     f"{ldf['feature'].nunique():,} unique features")
-                st.dataframe(ldf.head(200), use_container_width=True, hide_index=True)
+                st.dataframe(ldf.head(200), use_container_width=True, hide_index=True,
+                             column_config=_glossary_column_config(ldf))
                 lf_buf = io.StringIO()
                 ldf.to_csv(lf_buf, index=False)
                 st.download_button(
@@ -1363,7 +1471,8 @@ def main() -> None:  # pragma: no cover
                         f"{tl_df['impression_id'].nunique():,} studies · "
                         f"{tl_df['event_type'].value_counts().to_dict()}"
                     )
-                    st.dataframe(tl_df.head(200), use_container_width=True, hide_index=True)
+                    st.dataframe(tl_df.head(200), use_container_width=True, hide_index=True,
+                                 column_config=_glossary_column_config(tl_df))
                     tl_buf = io.StringIO()
                     tl_df.to_csv(tl_buf, index=False)
                     st.download_button(

@@ -2,7 +2,7 @@
 
 A guide to getting features and labels out of the INSPECT EHR data.
 
-If you only read one section, read **§3 Anchoring** and **§6 Caveats** — those
+If you only read one section, read **§2 Anchoring** and **§5 Caveats** — those
 are where results go silently wrong.
 
 ---
@@ -23,42 +23,15 @@ features are computed from the patient's record *before* it.
 | cohort master file             | `DATA_PROCESSED/cohort_0.2.0_master_file_anon.csv`    | 6 MB    |
 | labels (incl. survival)        | `DATA_RAW/LABELS/labels_20250611.tsv`                 | 4 MB    |
 | canonical splits               | `DATA_RAW/LABELS/splits_20250611.tsv`                 | 0.5 MB  |
-| FEMR database (processed)      | `DATA_RAW/EHR_FEMR_DB/extract/`                       | 21 GB   |
 | raw OMOP CSVs                  | `DATA_RAW/EHR_CSV/`                                   | 42 GB   |
 
 Paths are relative to the repository's parent directory.
 
----
-
-## 2. Two routes into the data
-
-> **Route A's Python wrapper has been retired.** `TemporalFeatureExtractor`,
-> `FeatureMatrix`, and the `VITALS_LABS` / `DIAG_PROC` / `DRUGS` featurizer
-> groups no longer exist in `Custom/temporal_features.py` — that file is now
-> just a compatibility shim re-exporting shared constants/helpers for Route
-> B (see `Custom/_femr_worker.py`, which is now a stub that raises
-> `SystemExit("Route A / FEMR extraction has been retired.")`). The raw FEMR
-> extract is still on disk and still reachable directly via
-> `femr.datasets.PatientDatabase` (`.venv_legacy` still has `femr`
-> installed), but nothing in `Custom/` calls it anymore, and the app's
-> **Tab 0 · Load** only lists Route B extractions. §4 Option B, §5.1,
-> §6.1–6.3, and §7's example below describe the retired wrapper and are kept
-> for historical/interpretive reference — **for new work, use Route B.**
-
-**Route A — the FEMR database (`DATA_RAW/EHR_FEMR_DB/extract/`).**
-Pre-processed, indexed by patient, with the OMOP concept hierarchy materialised.
-This is what the published INSPECT baselines use, so results from it are
-comparable to the paper. Access it through `femr.datasets.PatientDatabase`;
-the 21 GB `event_metadata` file is an internal binary store and is not readable
-directly.
-
-**Route B — the raw OMOP CSVs (`DATA_RAW/EHR_CSV/`).**
-Complete and unreduced. Use this when you need measurement *values*, true
-sampling frequency, or control over ontology expansion depth. The extractor
-(`appd_route_b_labs.py`) queries OMOP CSVs via DuckDB — large files are streamed
-out-of-core and never loaded into RAM. Supports labs (numeric values from
-`measurement.csv`), diagnoses, drugs, procedures, observations, and visits
-(event counts), plus optional concept ancestor rollup and LOS features.
+The extractor (`Custom/appd_route_b_labs.py`) queries these OMOP CSVs via
+DuckDB — large files are streamed out-of-core and never loaded into RAM. It
+supports labs (numeric values from `measurement.csv`), diagnoses, drugs,
+procedures, observations, and visits (event counts), plus optional concept
+ancestor rollup and length-of-stay features.
 
 | table                | size    | est. rows |
 |----------------------|---------|-----------|
@@ -71,12 +44,15 @@ out-of-core and never loaded into RAM. Supports labs (numeric values from
 | concept_ancestor     | 1.7 GB  | ~79M      |
 | concept              | 1.1 GB  | ~9M       |
 
-**Route A is de-duplicated relative to Route B** — see §6.1. If you need time
-series or actual measurement values, you need Route B.
+### Data downloads:
+- EHR records: https://stanford.redivis.com/datasets/dzc6-9jyt6gapt
+- Labels, splits and other metadata: https://stanfordaimi.azurewebsites.net/datasets?term=INSPECT
+
+### You will require training and approval to gain data access and are responsible for the secure handling of the data. 
 
 ---
 
-## 3. Anchoring — read this one
+## 2. Anchoring — read this one
 
 Every feature is computed backwards from an **anchor time**. Which anchor
 depends on whether the task is diagnostic or prognostic.
@@ -100,7 +76,7 @@ the offset only in its PE branch.
 
 ---
 
-## 4. Quickstart
+## 3. Quickstart
 
 ### Option A — the Streamlit interface
 
@@ -108,8 +84,6 @@ the offset only in its PE branch.
 cd Custom
 pip install -r extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
 streamlit run app_feature_extraction.py
-# or, with the bundled legacy venv (already has these installed):
-../../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
 ```
 
 The app has five tabs:
@@ -119,28 +93,10 @@ The app has five tabs:
 | **0 · Load**         | Lists all saved extractions. Load instantly — no reconfiguration needed. Start here.                      |
 | **1 · Data sources** | Validate file paths: cohort, OMOP CSVs (`measurement`, `concept`, `person`), and labels.                  |
 | **2 · Extract**      | Choose feature types, set per-type lookback windows, run DuckDB extraction. Logs stream live.             |
-| **3 · Describe**     | GDC-style cohort builder — filter by label, survival event, sex, age band; browse individual cases.       |
+| **3 · Describe**     | Cohort builder — filter by label, survival event, sex, age band; browse individual cases.                 |
 | **4 · Export**       | Write split-ready files to disk (`X.npy`, `y.npy`, `metadata.csv`, `feature_names.csv`, load scripts).   |
 
-### Option B — the Python API (Route A) — retired
-
-`TemporalFeatureExtractor`, `FeatureMatrix`, and the `VITALS_LABS` /
-`DIAG_PROC` / `DRUGS` featurizer groups shown in earlier versions of this
-guide have been removed from `Custom/temporal_features.py`; it is now a thin
-re-export shim (task lists, `load_concept_map`, `humanize_column`, a few
-constants) kept for Route B's benefit, not a Route A extraction API.
-
-If you specifically need FEMR's delta-encoded count features (§5.1/§6.1),
-the only remaining path is calling `femr.datasets.PatientDatabase` and
-FEMR's own featurizers directly against `DATA_RAW/EHR_FEMR_DB/extract/` —
-`.venv_legacy` still has `femr` installed. There is no supported wrapper for
-this in `Custom/` anymore; `Custom/x_generate_binned_features.py` is the
-last surviving example of calling FEMR directly, kept for reference.
-
-For everything else — including reproducing what this section used to do,
-just with real values instead of delta-encoded counts — use Route B below.
-
-### Option C — the Python API (Route B)
+### Option B — the Python API
 
 ```python
 from Custom.appd_route_b_labs import LabExtractor
@@ -200,52 +156,12 @@ genuine per-patient right-censoring, not one administrative horizon.
 
 ---
 
-## 5. What the columns mean
+## 4. What the columns mean
 
-### 5.1 Route A columns (FEMR count features) — historical reference
+The extractor can pull six complementary feature types from different OMOP
+tables. Each type has its own column naming convention.
 
-Route A's wrapper is retired (§2); this describes columns from old cached
-extractions or from calling FEMR directly. Nothing in `Custom/` produces
-these today — skip to §5.2 for what the app actually generates now.
-
-Each column is one **(code, time-window)** pair. The value is the count of
-qualifying events for that code inside that window, counted backwards from the
-anchor.
-
-| pattern                                 | meaning                                                    |
-|-----------------------------------------|------------------------------------------------------------|
-| `age`                                   | age at anchor, **z-scored** across all labels — not years  |
-| `<group>:<CODE>_<window>`               | count of CODE within that window                           |
-| `<group>:<CODE> <value>_<window>`       | string-valued events, one column per (code, value)         |
-| `<group>:<CODE> [lo, hi)_<window>`      | numeric-valued events bucketed by decile                   |
-
-`<window>` is a `timedelta` such as `365 days, 0:00:00`, meaning the window
-running from the anchor back to 365 days before it. Windows are non-overlapping
-and consecutive: bins `[2, 30]` give `[T0, T0−2d]` and `[T0−2d, T0−30d]`.
-
-Internally the layout is `column_idx = code_col + bin_idx × num_codes` — all
-codes for the first window, then all codes for the second, and so on.
-
-#### Ontology expansion — both leaf *and* ancestors
-
-Every group runs with `is_ontology_expansion=True`, so each event increments
-**its own code and every ancestor** in the OMOP hierarchy. FEMR's docstring: for
-`A → B → C`, two occurrences of C also count as two of B and two of A.
-
-Three consequences:
-
-1. Both leaf and parent codes appear as columns — it is not one or the other.
-2. **A parent column is the sum over its descendants**, so columns are strongly
-   collinear. Do not read individual numbers as independent effects; use
-   permutation or grouped importance.
-3. The feature space is much wider than the number of distinct raw codes.
-
-### 5.2 Route B columns (OMOP feature types)
-
-Route B can extract six complementary feature types from different OMOP tables.
-Each type has its own column naming convention.
-
-#### 5.2.1 Lab features (`labs:`) — `measurement.csv`
+### 4.1 Lab features (`labs:`) — `measurement.csv`
 
 Each column is one **(LOINC code, aggregate, time-window)** triple. The value is
 a real-valued measurement from `measurement.value_as_number`, summarised over
@@ -271,11 +187,11 @@ Windows are **cumulative**, not nested: `_2d` covers the last 2 days, `_30d`
 covers the last 30 days (including those 2). A measurement at day −5 appears
 in `_30d` and `_365d` but not `_2d`.
 
-Route B extracts only LOINC-coded entries from `measurement.csv`. Vital signs
-recorded under other vocabularies are not included unless you pass their LOINC
-equivalents to `loinc_codes`.
+The extractor extracts only LOINC-coded entries from `measurement.csv`. Vital
+signs recorded under other vocabularies are not included unless you pass
+their LOINC equivalents to `loinc_codes`.
 
-#### 5.2.2 Count features — diagnoses, drugs, procedures, observations, visits
+### 4.2 Count features — diagnoses, drugs, procedures, observations, visits
 
 The remaining five feature types all follow the same pattern: a count of
 **distinct event days** within the lookback window, drawn from a single OMOP
@@ -300,22 +216,25 @@ Examples:
 
 Each feature type has its own independently configurable lookback window
 (`count_window_days` dict), so you can look back 365 days for diagnoses but
-only 60 days for drugs.
+only 60 days for drugs. Direct codes are counted as-is — a code does **not**
+automatically roll up to its parent/ancestor categories; that only happens if
+you turn on concept ancestor rollup (§4.4), which produces separate
+`{prefix}_anc:` columns.
 
-#### 5.2.3 Length-of-stay (LOS) features — `visit_occurrence`
+### 4.3 Length-of-stay (LOS) features — `visit_occurrence`
 
 When `visits` is selected, two LOS columns are automatically appended alongside
 the visit-count columns:
 
 | column pattern                  | meaning                                                         |
-|---------------------------------|-----------------------------------------------------------------|
+|---------------------------------|-------------------------------------------------------------------|
 | `visit:LOS/total_{N}d`          | sum of `(visit_end_date − visit_start_date)` across all visits in window |
 | `visit:LOS/max_{N}d`            | maximum single-visit length of stay in window                   |
 
 Values are in days. These capture hospitalisation burden independently of visit
 count: a patient with one 30-day admission differs from one with 30 day visits.
 
-#### 5.2.4 Concept ancestor rollup (`{prefix}_anc:`) — optional
+### 4.4 Concept ancestor rollup (`{prefix}_anc:`) — optional
 
 When `use_concept_ancestor=True`, each event is also rolled up to its ancestor
 concepts in the OMOP hierarchy using `concept_ancestor.csv`. This creates
@@ -333,78 +252,45 @@ filtering: `min_studies_ancestor` (default 100) and `max_ancestor_features`
 (default 2000 per table). Setting `ancestor_levels=2` (parent and grandparent
 only) dramatically reduces the ancestor pair count relative to unlimited depth.
 
-### 5.3 Demographic columns (both routes)
+### 4.5 Demographic columns
 
 Nine demographic columns sourced from `person.csv` are appended to **every**
 extraction automatically when `person.csv` is configured. They carry the prefix
 `demo:`.
 
-| column                                     | type     | encoding                                                      |
-|--------------------------------------------|----------|--------------------------------------------------------------|
-| `demo:age_years`   | float    | true age at anchor in years — **not z-scored**, so you can choose your own normalisation. NaN if birth date is missing. |
+| column             | type     | encoding                                                                |
+|--------------------|----------|-------------------------------------------------------------------------|
+| `demo:age_years`   | float    | true age at anchor in years, so you can choose your own normalisation strategy. NaN if birth date is missing. |
 | `demo:is_female`   | binary   | 1 = female (OMOP gender_concept_id 8532), 0 = male (8507), NaN = other or not recorded |
-| `demo:sex_unknown` | binary   | 1 if gender_concept_id is 0 or the patient is absent from person.csv |
+| `demo:sex_unknown` | binary   | 1 if gender_concept_id is 0 or the patient is absent from person.csv    |
 | `demo:is_hispanic` | binary   | 1 = Hispanic or Latino (OMOP 38003563), 0 = Not Hispanic or Latino (38003564), NaN = not recorded |
-| `demo:race_white`  | binary   | 1 if race_concept_id = 8527 (White) |
-| `demo:race_black`  | binary   | 1 if race_concept_id = 8516 (Black or African American) |
-| `demo:race_asian`  | binary   | 1 if race_concept_id = 8515 (Asian) |
-| `demo:race_other`  | binary   | 1 if race is recorded but is not white, black, or Asian |
-| `demo:race_unknown`| binary   | 1 if race_concept_id = 0 or the patient is absent from person.csv |
+| `demo:race_white`  | binary   | 1 if race_concept_id = 8527 (White)                                     |
+| `demo:race_black`  | binary   | 1 if race_concept_id = 8516 (Black or African American)                 |
+| `demo:race_asian`  | binary   | 1 if race_concept_id = 8515 (Asian)                                     |
+| `demo:race_other`  | binary   | 1 if race is recorded but is not white, black, or Asian                 |
+| `demo:race_unknown`| binary   | 1 if race_concept_id = 0 or the patient is absent from person.csv       |
 
-**Sparse matrix note (Route A, historical).** `append_demographics()` still
-branches on route internally, but since Route A extractions can no longer be
-produced (§2), every extraction going through the app today takes the dense
-Route B path below. Scipy sparse matrices cannot store NaN, so
-before stacking the demographic columns `append_demographics()` fills age NaN
-with the cohort median age, and fills is_female / is_hispanic NaN with 0. Use
-the `demo:sex_unknown` and `demo:race_unknown` columns to recover the
-missing-data signal in models — a `sex_unknown=1` row is distinct from a
-`is_female=0` row even though both have `is_female=0` in the sparse matrix.
-
-**Dense matrix note (Route B).** NaN is preserved. You should impute before
-training; `sklearn.impute.SimpleImputer(strategy="median")` is a reasonable
-starting point. The exported `load_survival.py` includes a commented example.
+NaN is preserved in the feature matrix — you should impute before training;
+`sklearn.impute.SimpleImputer(strategy="median")` is a reasonable starting
+point. The exported `load_survival.py` includes a commented example.
 
 If `person.csv` is not found or not configured in Data sources, the step is
 silently skipped (logged) and no `demo:` columns are added.
 
 ---
 
-## 5.4 Full column reference
+## 4.6 Full column reference
 
 A typical extraction produces tens of thousands of columns. The tables below
-give the vocabulary format, clinical meaning, and key examples for every column
-type you will encounter. Use `fm.human_columns(concept_map)` to resolve raw
-codes to readable names in bulk (see §5.5).
-
-The group names below (`vitals_labs`, `diag_proc`, `drugs`, `visits`) and the
-ontology-expansion behaviour are Route A's retired scheme (§5.1). The
-underlying vocabularies and code meanings are unchanged, though — the same
-LOINC / ICD-10 / RxNorm / Visit codes below apply directly to Route B's
-`labs:` / `diag:` / `drug:` / `proc:` / `obs:` / `visit:` columns (§5.2),
-just without automatic ancestor expansion unless you turn on concept
-ancestor rollup (§5.2.4).
+give the vocabulary format, clinical meaning, and key examples for the codes
+you're most likely to want. Use `fm.human_columns(concept_map)` to resolve raw
+codes to readable names in bulk (§4.7).
 
 ---
 
-### 5.4.1 The `age` column (Route A only)
+### 4.6.1 Labs & vitals — OMOP table: `measurement`
 
-| column | source               | value                                                                  |
-|--------|----------------------|------------------------------------------------------------------------|
-| `age`  | FEMR `AgeFeaturizer` | patient age at anchor, **z-scored** across all labelled studies — not in years |
-
-This is the only column not associated with a time window. Route B does not
-produce it; use `demo:age_years` for true years on either route.
-
----
-
-### 5.4.2 `vitals_labs` group — OMOP tables: `measurement`, `observation`
-
-Column prefix: `vitals_labs:LOINC/<code>_<window>` (most entries) or
-`vitals_labs:SNOMED/<code>_<window>` (some observation concepts).
-
-Values are **counts of distinct days** on which that code appeared with a
-changed value (Route A delta-encoding — see §6.1).
+Column prefix: `labs:LOINC/<code>_<agg>_<N>d` (§4.1).
 
 #### Vital signs (LOINC-coded, from `measurement`)
 
@@ -440,7 +326,7 @@ changed value (Route A delta-encoding — see §6.1).
 | `731-0`          | Lymphocytes (absolute)                                       |
 | `787-2`          | MCV — macrocytosis (B12/folate), microcytosis (iron)         |
 | `785-6`          | MCH                                                          |
-| `786-4`          | MCHC                                                         |
+| `786-4`          | MCHC                                                          |
 
 #### Coagulation — especially relevant for PE diagnosis and anticoagulation
 
@@ -522,21 +408,22 @@ changed value (Route A delta-encoding — see §6.1).
 | LOINC code   | what it measures                                             |
 |--------------|--------------------------------------------------------------|
 | `11558-4`    | pH (arterial blood gas)                                      |
-| `2703-7`     | PaO₂ (partial pressure of oxygen)                            |
-| `2019-8`     | PaCO₂ (partial pressure of CO₂)                              |
-| `19994-3`    | PaO₂/FiO₂ ratio — lung injury index                          |
-| `2708-6`     | O₂ saturation (arterial, blood gas)                          |
+| `2703-7`     | PaO₂ (partial pressure of oxygen)                             |
+| `2019-8`     | PaCO₂ (partial pressure of CO₂)                               |
+| `19994-3`    | PaO₂/FiO₂ ratio — lung injury index                           |
+| `2708-6`     | O₂ saturation (arterial, blood gas)                           |
 
 ---
 
-### 5.4.3 `diag` / `diag_proc` group — OMOP tables: `condition_occurrence`
+### 4.6.2 Diagnoses — OMOP table: `condition_occurrence`
 
-Column prefix: `diag:ICD10CM/<code>_<window>` (most entries) or
-`diag:SNOMED/<code>_<window>`.
+Column prefix: `diag:<vocab>/<code>_<N>d` (§4.2) — `vocab` is `ICD10CM`,
+`ICD9CM`, or `SNOMED`.
 
-Values are counts of days the diagnosis was recorded. Because of ontology
-expansion, a code for "submassive PE" (I26.02) also increments every parent
-ICD-10 chapter (I26.0, I26, I00-I99).
+Values are counts of distinct days the diagnosis was recorded, for the direct
+code only — ancestor/parent categories (e.g. "submassive PE" I26.02 rolling up
+to the parent I26 chapter) only appear as separate `diag_anc:` columns if you
+enable concept ancestor rollup (§4.4).
 
 #### Pulmonary embolism
 
@@ -567,7 +454,7 @@ ICD-10 chapter (I26.0, I26, I00-I99).
 #### Deep vein thrombosis (DVT) — frequent PE precursor
 
 | ICD-10-CM code | meaning                                                               |
-|----------------|-----------------------------------------------------------------------|
+|----------------|-------------------------------------------------------------------------|
 | `I82.401`      | Acute DVT of unspecified deep vein of right lower extremity           |
 | `I82.411`      | Acute DVT of right femoral vein                                       |
 | `I82.431`      | Acute DVT of right tibial vein                                        |
@@ -578,7 +465,7 @@ ICD-10 chapter (I26.0, I26, I00-I99).
 #### Cardiac conditions
 
 | ICD-10-CM code | meaning                                                             |
-|----------------|---------------------------------------------------------------------|
+|----------------|-------------------------------------------------------------------------|
 | `I50.20`       | Unspecified systolic (congestive) heart failure                     |
 | `I50.22`       | Chronic systolic heart failure                                      |
 | `I50.30`       | Unspecified diastolic heart failure                                 |
@@ -595,7 +482,7 @@ ICD-10 chapter (I26.0, I26, I00-I99).
 #### Lung and respiratory conditions
 
 | ICD-10-CM code | meaning                                                             |
-|----------------|---------------------------------------------------------------------|
+|----------------|-------------------------------------------------------------------------|
 | `J18.9`        | Pneumonia, unspecified organism                                     |
 | `J44.0`        | COPD with acute lower respiratory infection                         |
 | `J44.1`        | COPD with acute exacerbation                                        |
@@ -609,7 +496,7 @@ ICD-10 chapter (I26.0, I26, I00-I99).
 #### Metabolic / chronic conditions (PE risk factors)
 
 | ICD-10-CM code | meaning                                                             |
-|----------------|---------------------------------------------------------------------|
+|----------------|-------------------------------------------------------------------------|
 | `E11.9`        | Type 2 diabetes mellitus without complications                      |
 | `E66.9`        | Obesity, unspecified                                                |
 | `N18.3`        | CKD stage 3                                                         |
@@ -621,17 +508,17 @@ ICD-10 chapter (I26.0, I26, I00-I99).
 
 ---
 
-### 5.4.4 `proc` / `diag_proc` group — OMOP tables: `procedure_occurrence`, `device_exposure`
+### 4.6.3 Procedures — OMOP table: `procedure_occurrence`
 
-Column prefix: `proc:ICD10PCS/<code>_<window>`, `proc:CPT4/<code>_<window>`,
-`proc:HCPCS/<code>_<window>`, or `proc:SNOMED/<code>_<window>`.
+Column prefix: `proc:<vocab>/<code>_<N>d` (§4.2) — `vocab` is `CPT4`,
+`ICD10PCS`, `HCPCS`, or `ICD9Proc`.
 
-Values are counts of days a procedure was recorded.
+Values are counts of distinct days a procedure was recorded.
 
 #### Imaging and diagnostic procedures (CPT4)
 
 | CPT4 code | meaning                                |
-|-----------|----------------------------------------|
+|-----------|-----------------------------------------|
 | `71250`   | CT thorax without contrast             |
 | `71260`   | CT thorax with contrast                |
 | `71270`   | CT thorax without and with contrast    |
@@ -644,41 +531,33 @@ Values are counts of days a procedure was recorded.
 #### PE treatment procedures (ICD-10-PCS)
 
 | ICD-10-PCS code | meaning                             |
-|-----------------|-------------------------------------|
+|-----------------|---------------------------------------|
 | `05H633Z`       | Inferior vena cava filter insertion |
 | `06BQ0ZZ`       | Excision of pulmonary trunk         |
 
 #### General procedures
 
 Procedure columns span a wide range from lab draw (pathology) to surgical
-procedures. The `diag_proc` group combines these with diagnoses, so the same
-time window covers both a cancer diagnosis and a chemotherapy procedure.
-
-#### Devices (`device_exposure`)
-
-Device exposure concept IDs appear as `proc:Device/<concept_id>_<window>`. They
-represent implanted or applied devices (IVC filters, pacemakers, oxygen
-delivery). These are less commonly important features but are included by default
-in `diag_proc` and `proc`.
+procedures.
 
 ---
 
-### 5.4.5 `drugs` group — OMOP table: `drug_exposure`
+### 4.6.4 Drugs — OMOP table: `drug_exposure`
 
-Column prefix: `drugs:RxNorm/<ingredient_concept_id>_<window>`.
+Column prefix: `drug:RxNorm/<ingredient_concept_id>_<N>d` (§4.2).
 
-Values are counts of days the drug was administered or dispensed. FEMR maps
-all drug records to the RxNorm ingredient level (the active molecule), not the
-branded product or dose form, so `drugs:RxNorm/1049502_<window>` covers all
-formulations of warfarin regardless of dose or brand.
-
-Because of ontology expansion, an ingredient-level event also increments its
-ATC class ancestors.
+Values are counts of distinct days the drug was administered or dispensed.
+`RxNorm`/`RxNorm Extension` codes in OMOP are typically assigned at the
+ingredient level (the active molecule), not the branded product or dose form,
+so `drug:RxNorm/11289_<N>d` covers all formulations of warfarin regardless of
+dose or brand. Ancestor-class rollups (e.g. ATC drug classes) only appear as
+separate `drug_anc:` columns if you enable concept ancestor rollup (§4.4) —
+they are not automatic.
 
 #### Anticoagulants — drugs most directly tied to PE management
 
 | RxNorm ingredient | drug                                                                   |
-|-------------------|------------------------------------------------------------------------|
+|-------------------|--------------------------------------------------------------------------|
 | `11289`           | Warfarin (Coumadin) — vitamin K antagonist                             |
 | `5224`            | Heparin (unfractionated) — IV anticoagulation                          |
 | `67108`           | Enoxaparin (Lovenox) — LMWH, bridging and treatment                    |
@@ -692,7 +571,7 @@ ATC class ancestors.
 #### Pulmonary vasodilators — drugs for PH management
 
 | RxNorm ingredient     | drug                                                                   |
-|-----------------------|------------------------------------------------------------------------|
+|------------------------|----------------------------------------------------------------------|
 | `36117`               | Sildenafil (Revatio / Viagra) — PDE-5 inhibitor                        |
 | `187899`              | Tadalafil (Ad circa / Cialis) — PDE-5 inhibitor                        |
 | `1546954`             | Riociguat (Adempas) — soluble guanylate cyclase stimulator             |
@@ -706,7 +585,7 @@ ATC class ancestors.
 #### Diuretics — right heart failure management
 
 | RxNorm ingredient | drug                                                                   |
-|-------------------|------------------------------------------------------------------------|
+|--------------------|-----------------------------------------------------------------------|
 | `4603`              | Furosemide (Lasix) — loop diuretic                                   |
 | `1808`              | Bumetanide (Bumex) — loop diuretic                                   |
 | `38413`             | Torsemide — loop diuretic                                            |
@@ -715,7 +594,7 @@ ATC class ancestors.
 #### Cardiovascular
 
 | RxNorm ingredient | drug                                                                   |
-|-------------------|------------------------------------------------------------------------|
+|--------------------|-----------------------------------------------------------------------|
 | `41493`           | Metoprolol — beta-blocker                                              |
 | `20352`           | Carvedilol — beta-blocker                                              |
 | `83367`           | Atorvastatin — statin                                                  |
@@ -729,45 +608,46 @@ ATC class ancestors.
 #### Thrombolytics
 
 | RxNorm ingredient | drug                                                                   |
-|-------------------|------------------------------------------------------------------------|
+|--------------------|-----------------------------------------------------------------------|
 | `688965`          | Alteplase (tPA, Activase) — systemic thrombolysis for massive PE       |
 | `1347111`         | Tenecteplase (TNKase)                                                  |
 
 ---
 
-### 5.4.6 `visits` group — OMOP tables: `visit_occurrence`, `visit_detail`
+### 4.6.5 Visits — OMOP table: `visit_occurrence`
 
-Column prefix: `visits:Visit/<concept_id>_<window>`.
+Column prefix: `visit:Visit/<concept_id>_<N>d` (§4.2), plus
+`visit:LOS/total_<N>d` / `visit:LOS/max_<N>d` (§4.3).
 
 Values are counts of distinct visit episodes within the window. These are
 typically the broadest features: "was the patient hospitalised in the last year".
 
 | OMOP Visit concept   | meaning                                                      |
-|----------------------|--------------------------------------------------------------|
+|-----------------------|----------------------------------------------------------------|
 | `9201`               | Inpatient Visit (IP) — overnight hospital admission          |
 | `9202`               | Outpatient Visit (OP) — ambulatory, clinic, or day procedure |
 | `9203`               | Emergency Room Visit (ER)                                    |
 | `8883`               | Observation Room — less-than-24h monitoring                  |
 | `262`                | Emergency Room and Inpatient Visit (ER → admitted)           |
-| `32037`              | Intensive Care Unit (ICU) stay                               |
-| `32044`              | Home Visit                                                   |
+| `32037`              | Intensive Care Unit (ICU) stay                                |
+| `32044`              | Home Visit                                                    |
 
 Visit counts are often among the strongest predictors because frequent
 hospitalisation correlates directly with disease severity.
 
 ---
 
-### 5.5 Decoding column names programmatically
+### 4.7 Decoding column names programmatically
 
 ```python
-from Custom.temporal_features import load_concept_map
+from Custom.appd_route_b_labs import load_concept_map
 
 # Load once per session — concept.csv is 1.1 GB but pandas reads it in ~30s
 concept_map = load_concept_map("path/to/DATA_RAW/EHR_CSV/concept.csv")
 
 # Get all human-readable names for a loaded feature matrix
 human = fm.human_columns(concept_map)
-# e.g. 'vitals_labs:Creatinine [Mass/vol] in Serum [LOINC/2160-0]_365d'
+# e.g. 'labs:Creatinine [Mass/vol] in Serum [LOINC/2160-0]_last_30d'
 
 # Find every creatinine column
 cr_cols = [c for c in fm.columns if "LOINC/2160-0" in c]
@@ -779,115 +659,61 @@ pe_cols = [c for c in fm.columns if "ICD10CM/I26" in c]
 warf_cols = [c for c in fm.columns if "RxNorm/11289" in c]
 
 # Map raw name → human name for a specific column
-col = "diag:ICD10CM/I26.90_365 days, 0:00:00"
+col = "diag:ICD10CM/I26.90_365d"
 human_name = concept_map.get("ICD10CM/I26.90", col)
 # → 'Pulmonary embolism without acute cor pulmonale'
 
-# Route B: find all 30-day lab columns for troponin I
+# Find all 30-day lab columns for troponin I
 trop_30d = [c for c in fm.columns if "LOINC/10839-9" in c and "_30d" in c]
 # → ['labs:LOINC/10839-9_last_30d', 'labs:LOINC/10839-9_min_30d', ...]
 ```
 
 The column format for each group is:
 
-| group                         | format                                  | example raw name                                 |
-|-------------------------------|-----------------------------------------|--------------------------------------------------|
-| Route A vitals/labs           | `<group>:LOINC/<code>_<timedelta>`      | `vitals_labs:LOINC/2160-0_365 days, 0:00:00`     |
-| Route A diagnosis             | `diag:ICD10CM/<code>_<timedelta>`       | `diag:ICD10CM/I26.90_365 days, 0:00:00`          |
-| Route A procedure             | `proc:CPT4/<code>_<timedelta>`          | `proc:CPT4/71275_365 days, 0:00:00`              |
-| Route A drug                  | `drugs:RxNorm/<id>_<timedelta>`         | `drugs:RxNorm/11289_30 days, 0:00:00`            |
-| Route A visit                 | `visits:Visit/<id>_<timedelta>`         | `visits:Visit/9201_365 days, 0:00:00`            |
-| Route B lab                   | `labs:LOINC/<code>_<agg>_<N>d`          | `labs:LOINC/2160-0_last_30d`                     |
-| Route B diagnosis count       | `diag:<vocab>/<code>_<N>d`              | `diag:ICD10CM/I26.90_365d`                       |
-| Route B drug count            | `drug:<vocab>/<code>_<N>d`              | `drug:RxNorm/11289_60d`                          |
-| Route B procedure count       | `proc:<vocab>/<code>_<N>d`              | `proc:CPT4/71275_365d`                           |
-| Route B observation count     | `obs:<vocab>/<code>_<N>d`               | `obs:SNOMED/271649006_365d`                      |
-| Route B visit count           | `visit:<vocab>/<code>_<N>d`             | `visit:Visit/9201_365d`                          |
-| Route B LOS (total)           | `visit:LOS/total_<N>d`                  | `visit:LOS/total_365d`                           |
-| Route B LOS (max)             | `visit:LOS/max_<N>d`                    | `visit:LOS/max_365d`                             |
-| Route B ancestor rollup       | `{prefix}_anc:<vocab>/<code>_<N>d`      | `diag_anc:SNOMED/59282003_365d`                  |
-| Demographics                  | `demo:<name>`                           | `demo:age_years`                                 |
-
-Note that Route A window labels use Python `timedelta` format (`365 days, 0:00:00`),
-not the short `_365d` notation used by Route B. The `human_columns()` method
-converts them to the short form for display.
+| group                    | format                                  | example raw name                  |
+|---------------------------|-------------------------------------------|--------------------------------------|
+| Lab                      | `labs:LOINC/<code>_<agg>_<N>d`          | `labs:LOINC/2160-0_last_30d`       |
+| Diagnosis count          | `diag:<vocab>/<code>_<N>d`              | `diag:ICD10CM/I26.90_365d`         |
+| Drug count               | `drug:<vocab>/<code>_<N>d`              | `drug:RxNorm/11289_60d`            |
+| Procedure count          | `proc:<vocab>/<code>_<N>d`              | `proc:CPT4/71275_365d`             |
+| Observation count        | `obs:<vocab>/<code>_<N>d`               | `obs:SNOMED/271649006_365d`        |
+| Visit count              | `visit:<vocab>/<code>_<N>d`             | `visit:Visit/9201_365d`            |
+| LOS (total)              | `visit:LOS/total_<N>d`                  | `visit:LOS/total_365d`             |
+| LOS (max)                | `visit:LOS/max_<N>d`                    | `visit:LOS/max_365d`               |
+| Ancestor rollup          | `{prefix}_anc:<vocab>/<code>_<N>d`      | `diag_anc:SNOMED/59282003_365d`    |
+| Demographics             | `demo:<name>`                           | `demo:age_years`                   |
 
 ---
 
-## 6. Caveats that will hinder you
+## 5. Caveats that will hinder you
 
-§§6.1–6.3 describe the retired Route A wrapper (§2) — relevant if you're
-interpreting an old cached extraction or calling FEMR directly, not
-something you can hit through the app today. §6.4–6.7 apply to Route B, the
-current path.
-
-### 6.1 The FEMR extract is de-duplicated
-
-Building it dropped **72,508,452** events via `delta_encode` and 130,015 via
-`remove_nones`. `delta_encode` removes *sequential duplicates of the same
-(concept_id, date) with the same value*.
-
-So counts from Route A mean **"days on which this code appeared with a changed
-value"**, not raw record counts. Distinct days and distinct values survive;
-within-day repetition does not.
-
-For count features this is arguably a feature — it makes counts insensitive to
-charting frequency. **For time series it is fatal.** An hourly blood pressure
-record collapsed to one reading per changed value cannot support trajectory
-modelling. Use Route B for anything temporal.
-
-### 6.2 Windows silently discard older events (Route A)
-
-`CountFeaturizer` emits `len(time_bins)` bins but tracks `len + 1`. Events older
-than the last bin edge land in a bucket that is never written out.
-
-`bins=[1825]` therefore **discards everything beyond five years without warning**.
-The retired `TemporalFeatureExtractor` wrapper appended a 100-year catch-all
-bin by default to guard against this; if you're calling FEMR's
-`CountFeaturizer` directly (§4 Option B), you must add that catch-all bin
-yourself.
-
-### 6.3 Unsorted bins mislabel columns (Route A)
-
-`featurize()` sorts `time_bins` internally, but `get_column_name()` indexes the
-original list. Unsorted bins produce mislabelled columns. The retired
-wrapper always sorted first — if you call FEMR directly, sort them yourself.
-
-### 6.4 Missingness is informative
+### 5.1 Missingness is informative
 
 "Lab not drawn" is a clinical decision, not absent data. Encode presence
 explicitly rather than imputing. Measurements cluster during instability and
-vanish otherwise, so the sampling process is not missing-at-random. Route B's
-`labs:LOINC/<code>_n_<N>d` columns (the `n` aggregate, §5.2.1) capture
+vanish otherwise, so the sampling process is not missing-at-random. The
+`labs:LOINC/<code>_n_<N>d` columns (the `n` aggregate, §4.1) capture
 measurement frequency; the NaN in the `last`/`min`/`max`/`mean` value columns
 captures absence.
 
-### 6.5 `concept_id = 0`
+### 5.2 `concept_id = 0`
 
-In OMOP this means "no matching concept". Route B filters it automatically —
-count-feature queries exclude `concept_id = 0` with an explicit predicate;
-lab queries exclude it implicitly by inner-joining only to known LOINC
-`concept_id`s, so a `0` never matches. If you write your own SQL, add an
-explicit filter or it becomes a large junk column.
+In OMOP this means "no matching concept". The extractor filters it
+automatically — count-feature queries exclude `concept_id = 0` with an
+explicit predicate; lab queries exclude it implicitly by inner-joining only to
+known LOINC `concept_id`s, so a `0` never matches. If you write your own SQL,
+add an explicit filter or it becomes a large junk column.
 
-### 6.6 Route B windows are cumulative, not nested
+### 5.3 Windows are cumulative, not nested
 
-Route A's bins are non-overlapping (bin `[2, 30]` means days 2–30 only). Route B
-windows are cumulative: `_30d` includes everything from days 1–30, so a
-measurement at day 5 contributes to both `_7d` and `_30d`. This means the `last`
-and `min`/`max` columns for a wider window subsume the narrower window's values,
-creating some collinearity. Plan accordingly when selecting features.
-
-### 6.7 `demo:age_years` replaces `age` (Route A only)
-
-Route A already includes an `age` column from FEMR's `AgeFeaturizer`, which is
-z-scored across all labels. The new `demo:age_years` column is the raw age in
-years, not z-scored. Both appear in the matrix after demographics are appended.
-The z-scored `age` column is absent from Route B.
+`_30d` includes everything from days 1–30, so a measurement at day 5
+contributes to both `_7d` and `_30d`. This means the `last` and `min`/`max`
+columns for a wider window subsume the narrower window's values, creating
+some collinearity. Plan accordingly when selecting features.
 
 ---
 
-## 7. Context descriptors
+## 6. Context descriptors
 
 For studying **why a model performs well in one context and worse in another**,
 the unit of analysis is the slice, not the patient. `ContextDescriber` produces
@@ -924,27 +750,17 @@ Built-in slicers: `all`, `split`, `density_quartile`, `age_band`, `sex`,
 **What is not computable here.** Anything needing the raw event stream — true
 history length, sampling intervals, measurement values — has already been
 aggregated away by the count matrix. `frac_with_oldest_window_events` and
-`mean_distinct_codes` are labelled proxies, not measurements. Use Route B for
-genuine temporal descriptors.
+`mean_distinct_codes` are labelled proxies, not measurements. Query the raw
+OMOP CSVs directly (§4.7) for genuine temporal descriptors.
 
 ---
 
-## 8. Reproducibility rules
-
-**Keep the FEMR comparison frozen.** The published INSPECT baselines are
-reproduced through Route A to within +0.013 mean AUROC across eight tasks —
-that comparison point is a fixed historical reference regardless of what
-happens to the code. Since the `TemporalFeatureExtractor` wrapper is retired
-(§2), actually re-running that reproduction today means calling
-`femr.datasets.PatientDatabase` and FEMR's featurizers directly rather than
-through anything in `Custom/`. Build Route B work as a clearly labelled
-parallel track; don't treat it as a drop-in replacement for the Route A
-numbers without re-validating.
+## 7. Reproducibility rules
 
 **Features must be strictly pre-anchor.** The extractor enforces this, but if
 you write your own SQL, `e.dt < a.anchor` is not optional.
 
-**Splits are patient-level and canonical.** They originate from a frozen FEMR
+**Splits are patient-level and canonical.** They originate from a frozen
 table (`splits_omop_2023_03_05`) and propagate to every arm — EHR, imaging and
 reports. Do not regenerate them; zero patients currently span splits and it
 should stay that way.
@@ -956,7 +772,7 @@ best-validation values.
 
 ---
 
-## 9. Open questions
+## 8. Open questions
 
 Things not yet settled, flagged so you do not assume they are:
 
@@ -969,13 +785,13 @@ Things not yet settled, flagged so you do not assume they are:
   possible, but nothing currently handles this.
 * **Discrete-time survival** needs person-period expansion; the API emits one
   row per study only.
-* **Route B vital signs.** Vital signs (BP, HR, SpO₂, temperature) are often
-  recorded in OMOP under LOINC codes but may also appear under SNOMED or local
-  vocabulary IDs depending on the source system. The current Route B extractor
-  filters to `vocabulary_id = 'LOINC'` only. Pass specific LOINC codes for
-  vitals (e.g. 8480-6 for systolic BP) to include them explicitly.
-* **Route B slope features.** The extractor currently computes last, min, max,
-  mean, n, and days_since. Linear regression slope over the window (a common
+* **Vital signs vocabulary coverage.** Vital signs (BP, HR, SpO₂, temperature)
+  are often recorded in OMOP under LOINC codes but may also appear under
+  SNOMED or local vocabulary IDs depending on the source system. The current
+  extractor filters to `vocabulary_id = 'LOINC'` only. Pass specific LOINC
+  codes for vitals (e.g. 8480-6 for systolic BP) to include them explicitly.
+* **Slope features.** The extractor currently computes last, min, max, mean,
+  n, and days_since. Linear regression slope over the window (a common
   strong predictor for trending labs like troponin or creatinine) is not yet
   implemented.
 * **care_site_id as a feature.** Available in `person.csv` and used for
@@ -985,18 +801,12 @@ Things not yet settled, flagged so you do not assume they are:
 
 ---
 
-## 10. File map
+## 9. File map
 
 | file                               | purpose |
 |------------------------------------|---------|
-| `Custom/app_feature_extraction.py` | Streamlit interface — 5-tab UI (Load, Data sources, Extract, Describe, Export) over Route B and its Cohort Builder / export tooling. No Route A UI remains. |
-| `Custom/temporal_features.py`      | Compatibility shim — re-exports shared constants/helpers (task lists, `load_concept_map`, `humanize_column`, …) from `appd_route_b_labs.py`. The Route A `TemporalFeatureExtractor`/`FeatureMatrix` classes it used to hold are retired (§2). |
-| `Custom/appd_route_b_labs.py`   | Route B extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` |
-| `Custom/_femr_worker.py`           | Retired — now a stub that raises `SystemExit("Route A / FEMR extraction has been retired.")`. Kept only so old cached `spec.json` files referencing it don't error on load. |
-| `Custom/appd_route_b_worker.py`        | Subprocess worker for Route B extraction, spawned by the Streamlit app |
-| `Custom/appd_context_descriptors.py`    | Per-slice descriptor tables (`ContextDescriber`) |
-| `Custom/extract_requirements.txt`  | Pip requirements for `app_feature_extraction.py` and the `appd_*` modules (duckdb, streamlit, numpy, pandas, scipy) |
-| `Custom/x_generate_binned_features.py` | Earlier CLI version calling FEMR directly (superseded by the app; still functional since it doesn't depend on the retired wrapper) |
-| `Custom/extract_temporal_features.py` | Long-format event extraction with signed day windows |
-| `Custom/9a_run_baseline_benchmark.py` | Generates `labeled_patients.csv` per task |
-| `Custom/INSPECT_Baseline_Reconstruction.md` | Full methods and findings record |
+| `Custom/app_feature_extraction.py` | Streamlit interface — 5-tab UI (Load, Data sources, Extract, Describe, Export) |
+| `Custom/appd_route_b_labs.py`      | Core extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` |
+| `Custom/appd_route_b_worker.py`    | Subprocess worker spawned by the Streamlit app to run an extraction |
+| `Custom/appd_context_descriptors.py` | Per-slice descriptor tables (`ContextDescriber`) |
+| `Custom/extract_requirements.txt`  | Pip requirements (duckdb, streamlit, numpy, pandas, scipy) |
