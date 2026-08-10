@@ -100,21 +100,16 @@ class RNNSequentialEncoder(nn.Module):
             bidirectional=bidirectional,
         )
 
-        # PyTorch's nn.LSTM/GRU `dropout` kwarg only applies BETWEEN
+        # NOTE: PyTorch's nn.LSTM/GRU `dropout` kwarg only applies BETWEEN
         # recurrent layers — with num_layers=1 (what every run_classify_*.sh
         # script here uses) there's no "between", so it's silently a no-op
-        # (PyTorch only emits a UserWarning, doesn't error). Every current
-        # script sets a nonzero dropout_prob expecting real regularization
-        # (e.g. dropout_prob=0.5 for PE) that was never actually applied,
-        # leaving the model free to overfit unchecked. Add it explicitly as
-        # output dropout, but only for num_layers==1 — for num_layers>1 the
-        # built-in inter-layer dropout already works, so adding this too
-        # would double up regularization beyond what dropout_prob specifies.
-        self.output_dropout = (
-            nn.Dropout(dropout_prob)
-            if (dropout_prob > 0 and num_layers == 1)
-            else nn.Identity()
-        )
+        # (PyTorch only emits a UserWarning, doesn't error). dropout_prob is
+        # therefore not actually regularizing anything at this level; see
+        # Model1D.__init__ for where it's applied instead (on the pooled
+        # classifier input, not per-timestep here — per-timestep dropout
+        # ahead of a max-pool perturbs which slice wins each channel's max
+        # on every forward pass without shrinking the classifier's effective
+        # input capacity, which is the actual lever for reducing overfit).
 
     def forward(self, x, lengths=None):
         # Without `lengths`, the RNN processes every one of the num_slices
@@ -145,7 +140,6 @@ class RNNSequentialEncoder(nn.Module):
             )
         else:
             x, _ = self.rnn(x)  # (Slice, Batch, Feature)
-        x = self.output_dropout(x)  # no-op in eval() mode, and when dropout_prob=0
         x = x.transpose(0, 1)  # (Batch, Slice, Feature)
         return x
 
@@ -244,6 +238,31 @@ class Model1D(nn.Module):
         self.classifier = nn.Linear(cls_input_size, num_classes)
         self.cfg = cfg
 
+        # dropout_prob is set on every run_classify_*.sh script (e.g. 0.5 for
+        # PE) expecting real regularization, but with num_layers=1 (used
+        # everywhere here) PyTorch's built-in nn.LSTM/GRU `dropout` kwarg is a
+        # silent no-op (see RNNSequentialEncoder). Applied here, on the final
+        # pooled feature vector right before the classifier, instead of
+        # per-timestep on the RNN's output before pooling: per-timestep
+        # dropout ahead of a max-reduction randomly perturbs which slice wins
+        # each channel's max on every forward pass, adding noise without
+        # actually shrinking the classifier's effective input capacity — this
+        # placement regularizes what the classifier sees directly, which is
+        # the standard/effective spot for it. Scoped to the same condition as
+        # before: only meaningful for the RNN branch with num_layers==1 (the
+        # transformer branch already applies real dropout inside its own
+        # layers; num_layers>1 already gets real inter-layer dropout too).
+        use_classifier_dropout = (
+            self._is_rnn_encoder
+            and cfg.model.seq_encoder.num_layers == 1
+            and cfg.model.seq_encoder.dropout_prob > 0
+        )
+        self.classifier_dropout = (
+            nn.Dropout(cfg.model.seq_encoder.dropout_prob)
+            if use_classifier_dropout
+            else nn.Identity()
+        )
+
     def forward(self, x, get_features=False, mask=None):
         if self._norm_features_only:
             feats, pos = x[..., :-1], x[..., -1:]
@@ -261,6 +280,7 @@ class Model1D(nn.Module):
             x = self.seq_encoder(x)
         x, w = self.aggregate(x, mask)
         # x = self.batch_norm_layer(x)
+        x = self.classifier_dropout(x)
         pred = self.classifier(x)
         return pred, x
 
