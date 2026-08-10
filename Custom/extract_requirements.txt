@@ -1,0 +1,14 @@
+# Requirements for app_feature_extraction.py and its appd_ dependencies
+# Install with:
+#   pip install -r extract_requirements.txt
+
+# ── UI framework ─────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Out-of-core CSV querying (PIVOT statement requires >= 0.8.0) ─────────────
+duckdb>=0.8.0
+
+# ── Numerical / tabular ──────────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0          # scipy.sparse used for Route A sparse matrix handling
