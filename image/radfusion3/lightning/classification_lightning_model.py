@@ -90,6 +90,11 @@ class ClassificationLightningModel(LightningModule):
         self.step_outputs[split]["y"].append(y.detach().cpu())
         self.step_outputs[split]["ids"].append(ids)
 
+        # Only accumulate embeddings for the test split to avoid ballooning
+        # memory over many training epochs.
+        if split == "test":
+            self.step_outputs[split]["features"].append(features.detach().cpu())
+
         return loss
 
     def shared_epoch_end(self, split):
@@ -129,6 +134,24 @@ class ClassificationLightningModel(LightningModule):
             print(f"Predictions saved at: {out_dir}")
             print("=" * 80)
 
+            # Save the post-RNN (seq_encoder + aggregation) embeddings that
+            # shared_step already computes via get_features=True, but which
+            # were previously discarded after the loss/logit were used.
+            if self.step_outputs[split]["features"]:
+                feats = torch.cat(
+                    self.step_outputs[split]["features"], dim=0
+                ).numpy()
+                emb_path = os.path.join(self.save_dir, "test_embeddings.hdf5")
+                with h5py.File(emb_path, "w") as hf:
+                    hf.create_dataset("embeddings", data=feats.astype(np.float32))
+                    hf.create_dataset(
+                        "ids",
+                        data=np.array(all_ids, dtype=object),
+                        dtype=h5py.string_dtype(),
+                    )
+                print(f"RNN embeddings saved at: {emb_path}")
+                print("=" * 80)
+
         # log auroc
         auroc_dict = utils.get_auroc(y, prob, self.target_names)
         for k, v in auroc_dict.items():
@@ -146,3 +169,4 @@ class ClassificationLightningModel(LightningModule):
         self.step_outputs[split]["logit"].clear()
         self.step_outputs[split]["y"].clear()
         self.step_outputs[split]["ids"].clear()
+        self.step_outputs[split]["features"].clear()

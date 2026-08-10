@@ -316,6 +316,39 @@ def _list_cached() -> list[tuple[str, Path]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Export directory naming — sustainable multi-extraction layout
+# ---------------------------------------------------------------------------
+# The export defaults used to be exports/<task>/ with fixed filenames
+# (X.npy, metadata.csv, ...) regardless of *which* extraction for that task
+# produced them. Two different extractions for the same task (e.g. labs-only
+# vs. drugs-only) would silently overwrite each other's files if exported to
+# the default path. The fix: key the export directory off the same spec hash
+# already used for caching, so it's automatically unique per extraction
+# config — plus a short human-readable tag so the folder name still says
+# something at a glance in a file browser.
+
+_FT_ABBR = {
+    "labs": "labs", "diagnoses": "diag", "drugs": "drug",
+    "procedures": "proc", "observations": "obs", "visits": "visit",
+}
+
+
+def _feature_summary(fm) -> str:
+    """Short human-readable tag from an fm's feature types, e.g. 'labs' or
+    'labs+diag+drug'. Not guaranteed unique on its own — pair with a hash."""
+    fts = list(getattr(fm, "feature_types", None) or ["labs"])
+    return "+".join(_FT_ABBR.get(ft, ft) for ft in fts) or "labs"
+
+
+def _export_subdir(fm, fm_hash: "str | None") -> str:
+    """{feature_summary}_{hash8}, or just {feature_summary} if this fm's
+    cache hash isn't known (e.g. a pickle loaded before this existed) —
+    still human-readable, just without the collision guarantee."""
+    tag = _feature_summary(fm)
+    return f"{tag}_{fm_hash[:8]}" if fm_hash else tag
+
+
 def _default_concept_csv(omop_path: str) -> Path:
     return Path(omop_path) / "concept.csv"
 
@@ -687,8 +720,16 @@ def _build_long_df_streamed(
 # Export helper
 # ---------------------------------------------------------------------------
 
-def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict) -> str:
+def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict,
+                _fm_hash: "str | None" = None) -> str:
     """Write flat (unsplit) files to export_dir. Returns a summary string.
+
+    _fm_hash : cache hash of the extraction being exported (from
+               st.session_state["fm_hash"]), used to locate and copy the
+               original full spec.json as extraction_spec.json in the
+               export directory. None if unknown (older pickle, or loaded
+               before fm_hash tracking existed) — falls back to a partial
+               manifest built from whatever fm itself still carries.
 
     X.npy is always dense — LabFeatureMatrix.X is a dense float32 array by
     design (unlike the retired Route A, which used scipy.sparse). For a
@@ -701,6 +742,31 @@ def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict) -> str:
 
     out = Path(export_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    # Manifest: what exactly produced these files. Independent of however
+    # the export directory ends up named/moved/renamed — always copy the
+    # full extraction spec if we know which cache entry this fm came from;
+    # fall back to whatever fm itself still carries (older pickles predating
+    # fm_hash tracking won't have a matching spec.json, but still have this
+    # much on the object).
+    fm_hash = _fm_hash
+    spec_src = CACHE_DIR / f"{fm_hash}_spec.json" if fm_hash else None
+    if spec_src and spec_src.exists():
+        (out / "extraction_spec.json").write_text(spec_src.read_text())
+    else:
+        partial = {
+            "task":               fm.task,
+            "anchor":             fm.anchor_kind,
+            "feature_types":      getattr(fm, "feature_types", None),
+            "windows_days":       fm.windows_days,
+            "count_window_days":  getattr(fm, "count_window_days", None),
+            "note": "Reconstructed from the loaded extraction, not the "
+                    "original cache spec — fm_hash unknown or its "
+                    "_spec.json was missing/deleted, so LOINC filter, "
+                    "min_studies thresholds, and ancestor-rollup settings "
+                    "aren't recoverable here.",
+        }
+        (out / "extraction_spec.json").write_text(json.dumps(partial, indent=2))
 
     raw_cols   = list(fm.columns)
     human_cols = (fm.human_columns(concept_map) if concept_map else raw_cols)
@@ -913,6 +979,7 @@ def main() -> None:  # pragma: no cover
                     with st.spinner("Loading …"):
                         with open(cpath, "rb") as _f:
                             st.session_state["fm"] = pickle.load(_f)
+                        st.session_state["fm_hash"] = chash
                     st.rerun()
                 if c3.button("🗑️", key=f"del_{chash}", help="Delete cache entry"):
                     for suffix in (".pkl", ".log", "_spec.json"):
@@ -1195,6 +1262,7 @@ def main() -> None:  # pragma: no cover
                 b_spec_path.write_text(json.dumps(b_spec, indent=2))
                 with open(out_str, "rb") as _f:
                     st.session_state["fm"] = pickle.load(_f)
+                st.session_state["fm_hash"] = b_hash
                 st.session_state.pop(b_proc_key)
                 st.rerun()
 
@@ -1230,6 +1298,7 @@ def main() -> None:  # pragma: no cover
                 with st.spinner("Loading …"):
                     with open(b_pkl, "rb") as _f:
                         st.session_state["fm"] = pickle.load(_f)
+                    st.session_state["fm_hash"] = b_hash
                 st.rerun()
             if c2.button("Re-run", key="rerun_b"):
                 b_pkl.unlink(missing_ok=True)
@@ -1529,9 +1598,18 @@ def main() -> None:  # pragma: no cover
                 "All studies exported together — no train/test split baked in. "
                 "Apply your own split downstream using the generated `load_survival.py`.")
 
+            fm_hash = st.session_state.get("fm_hash")
+            _default_subdir = _export_subdir(fm, fm_hash)
             export_dir = st.text_input(
                 "Export directory",
-                value=str(DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task),
+                value=str(DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task / _default_subdir),
+                help="Defaults to a subfolder tagged with this extraction's feature "
+                     "types and a short hash of its full config — so a different "
+                     "extraction for the same task (e.g. drugs instead of labs) lands "
+                     "in its own folder instead of overwriting X.npy / y.npy / "
+                     "metadata.csv here. `extraction_spec.json` in the export "
+                     "directory always records exactly what produced these files, "
+                     "regardless of the folder name.",
             )
 
             col_opt1, col_opt2 = st.columns(2)
@@ -1554,6 +1632,10 @@ def main() -> None:  # pragma: no cover
 
             st.markdown("**Files written to the export directory:**")
             st.markdown(
+                "**`extraction_spec.json`** — the exact parameters that produced every "
+                "other file here (task, feature types, windows, LOINC filter, thresholds, "
+                "…). The source of truth for what this export *is*, independent of "
+                "however the folder ends up named, copied, or moved later.  \n\n"
                 "**`metadata.csv`** — one row per study: `impression_id`, `patient_id`, "
                 "`anchor_time` (date the feature window ends), `y` (binary task label), "
                 "`tte_days` (**t**ime-**t**o-**e**vent, in days) and `event` "
@@ -1583,7 +1665,8 @@ def main() -> None:  # pragma: no cover
                         _load_concept_map_cached(concept_csv, st)
                         if use_human and Path(concept_csv).exists() else {}
                     )
-                    msg = _do_export(fm, export_dir, drop_zero, concept_map)
+                    msg = _do_export(fm, export_dir, drop_zero, concept_map,
+                                      _fm_hash=st.session_state.get("fm_hash"))
                 st.success(msg)
                 st.code(export_dir)
 
@@ -1799,6 +1882,7 @@ def main() -> None:  # pragma: no cover
                 tl_stream_path = st.text_input(
                     "Output CSV path",
                     value=str(DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task
+                              / _export_subdir(fm, st.session_state.get("fm_hash"))
                               / f"{fm.task}_event_timeline.csv"),
                     key="tl_stream_path",
                 )

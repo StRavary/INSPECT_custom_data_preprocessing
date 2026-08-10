@@ -163,13 +163,45 @@ class Model1D(nn.Module):
         if cfg.model.aggregation == "attention+max":
             cls_input_size = cls_input_size * 2
 
-        #self.input_norm = nn.LayerNorm(seq_input_size)
+        # Normalize only the raw CNN feature block, not the position-encoding
+        # column appended after it (dataset_base.py: `arr = np.concatenate(
+        # [arr, pos[:, None]], axis=1)`, position is the LAST column). Position
+        # is already rescaled to [0, 1] (see dataset_base.py's fix for LSTM
+        # gradient explosion from unnormalized slice positions). Folding it
+        # into a single joint LayerNorm over all `seq_input_size` dims would
+        # renormalize it using the CNN features' per-token mean/std instead of
+        # its own consistent range: since position is 1 value out of ~2049, it
+        # barely affects that mean/std, so it would get rescaled by whatever
+        # the CNN activation statistics happen to be for that slice — noise
+        # that varies per token/sample and has nothing to do with slice order.
+        # That destroys the monotonic 0->1 position signal the RNN needs.
+        # Splitting the normalization keeps the CNN features from saturating
+        # the RNN gates while leaving position untouched.
+        #
+        # This assumes contextualize_slice=False (the default, and what every
+        # run_classify_*.sh currently uses). When contextualize_slice=True,
+        # dataset_1d.py's contextualize_slice() triples/interleaves the
+        # position column into slice-difference blocks, so "last column =
+        # position" no longer holds; that path isn't exercised by any current
+        # script, so it's intentionally left using the old joint-normalization
+        # behavior below rather than guessing at the right split.
+        self._norm_features_only = (
+            cfg.trainer.position_encoding and not cfg.dataset.contextualize_slice
+        )
+        norm_size = (
+            cfg.dataset.feature_size if self._norm_features_only else seq_input_size
+        )
+        self.input_norm = nn.LayerNorm(norm_size)
         # self.batch_norm_layer = torch.nn.BatchNorm1d(cls_input_size)
         self.classifier = nn.Linear(cls_input_size, num_classes)
         self.cfg = cfg
 
     def forward(self, x, get_features=False, mask=None):
-        #x = self.input_norm(x)
+        if self._norm_features_only:
+            feats, pos = x[..., :-1], x[..., -1:]
+            x = torch.cat([self.input_norm(feats), pos], dim=-1)
+        else:
+            x = self.input_norm(x)
         x = self.seq_encoder(x)
         x, w = self.aggregate(x, mask)
         # x = self.batch_norm_layer(x)
