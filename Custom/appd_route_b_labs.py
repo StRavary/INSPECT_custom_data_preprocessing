@@ -763,6 +763,7 @@ def build_event_timeline(
         import duckdb
     except ImportError:
         raise ImportError("pip install duckdb")
+    import tempfile
 
     feature_types     = list(getattr(fm, "feature_types", None) or [])
     count_window_days = dict(getattr(fm, "count_window_days", None) or {})
@@ -776,7 +777,13 @@ def build_event_timeline(
         "y":             fm.y.astype(float),
     })
 
-    con = duckdb.connect()
+    # On-disk temp file, not the default in-memory database — gives DuckDB
+    # somewhere to spill large intermediate state (the join against
+    # measurement.csv can be sizeable for a wide window / large cohort).
+    # Same pattern as _run_duckdb_and_pivot / _run_duckdb_ancestor_rollup.
+    tmp_db = Path(tempfile.mktemp(suffix="_event_timeline_preview.duckdb"))
+    con = duckdb.connect(str(tmp_db))
+    con.execute("PRAGMA threads=4")
     con.register("anchors_tbl", anchors_df)
 
     # Load concept.csv once — vocabulary_id, concept_code, concept_name
@@ -881,6 +888,8 @@ def build_event_timeline(
         parts.append(part_df)
 
     con.close()
+    if tmp_db.exists():
+        tmp_db.unlink(missing_ok=True)
 
     if not parts:
         return pd.DataFrame(columns=[
@@ -918,25 +927,50 @@ def build_event_timeline_streamed(
     concept_path: "Path",
     out_path,
     loinc_codes: Optional[list] = None,
+    memory_limit_gb: float = 4.0,
     verbose: bool = True,
 ) -> int:
-    """Same output as build_event_timeline, written directly to a CSV file
-    via DuckDB's own out-of-core ``COPY (...) TO`` instead of being pulled
-    into a pandas DataFrame first.
+    """Same output as build_event_timeline (except unsorted — see below),
+    written directly to a CSV file via DuckDB's own out-of-core
+    ``COPY (...) TO`` instead of being pulled into a pandas DataFrame first.
 
     build_event_timeline queries raw individual events — one row per lab
     measurement / diagnosis / drug / procedure / observation / visit
     occurrence, *not* aggregated — so for a wide window over a large cohort
-    this can be more rows than the aggregated feature matrix has columns.
-    The original implementation pulls every per-feature-type query into
-    memory via ``.df()``, concatenates them, merges in patient_id /
-    anchor_time, then sorts — each step a full-size copy stacked on the
-    last. This version instead has DuckDB do the filtering, joining,
-    ordering, and CSV writing entirely inside its own engine (which already
-    spills to disk for larger-than-memory results), so Python never holds
-    more than a small, fixed amount of data at any point — there is no
-    per-study chunking here because none is needed; DuckDB's ``COPY`` is
-    already streaming.
+    this can be tens of millions of rows, more than the aggregated feature
+    matrix has columns. The original implementation pulls every
+    per-feature-type query into memory via ``.df()``, concatenates them,
+    merges in patient_id / anchor_time, then sorts — each step a full-size
+    copy stacked on the last. This version instead has DuckDB do the
+    filtering, joining, and CSV writing entirely inside its own engine, so
+    Python never holds more than a small, fixed amount of data at any point.
+
+    Two things had to both be true for this to actually be memory-safe in
+    practice, not just in theory — the first alone (an earlier version of
+    this function) still hit ~29 GB RSS + full swap on a real ~59M-row run:
+
+    1. **On-disk temp DuckDB file**, not ``duckdb.connect()``'s default
+       in-memory database — an in-memory connection has nowhere to spill
+       large intermediate state. Matches `_run_duckdb_and_pivot` /
+       `_run_duckdb_ancestor_rollup` elsewhere in this file.
+    2. **No ``ORDER BY``.** A global sort needs the *entire* result
+       considered before a single row can be written — for ~59M rows, that
+       sort was almost certainly the actual peak-memory driver, disk-spill
+       or not. Without it, execution is a genuinely constant-memory
+       pipeline (scan → filter → join → write), bounded by one row at a
+       time plus the small `anchors_tbl` hash-join build side (O(n_studies),
+       not O(n_events)). The tradeoff: output rows are in whatever order
+       DuckDB's parallel scan produces them — grouped by feature type, not
+       globally sorted by study/time. Sort after loading if you need that
+       (e.g. `pd.read_csv(...).sort_values([...])`, or let a groupby handle
+       it) — cheap once it's already reduced to your own memory budget.
+
+    `memory_limit_gb` additionally caps how much DuckDB tries to hold in
+    RAM before spilling more of its own working set to the temp file,
+    regardless of the system's actual available memory (DuckDB's default is
+    80% of detected system RAM, which is far too permissive to rely on
+    here). 4 GB is deliberately conservative; raise it for a faster run if
+    you know the machine has room.
 
     One consequence of building `patient_id`/`anchor_time` from the SQL
     query directly instead of a pandas merge: `anchor_time` in the output
@@ -965,6 +999,7 @@ def build_event_timeline_streamed(
     except ImportError:
         raise ImportError("pip install duckdb")
     import pandas as pd
+    import tempfile
 
     feature_types     = list(getattr(fm, "feature_types", None) or [])
     count_window_days = dict(getattr(fm, "count_window_days", None) or {})
@@ -977,7 +1012,13 @@ def build_event_timeline_streamed(
         "y":             fm.y.astype(float),
     })
 
-    con = duckdb.connect()
+    # On-disk temp file, not the default in-memory database — gives DuckDB
+    # somewhere to spill large intermediate state. See the docstring for why
+    # this alone (without also dropping ORDER BY, below) was not enough.
+    tmp_db = Path(tempfile.mktemp(suffix="_event_timeline.duckdb"))
+    con = duckdb.connect(str(tmp_db))
+    con.execute("PRAGMA threads=4")                       # cap parallelism
+    con.execute(f"PRAGMA memory_limit='{memory_limit_gb}GB'")  # spill early, on purpose
     con.register("anchors_tbl", anchors_df)
 
     _log("[timeline] loading concept.csv …")
@@ -1081,27 +1122,35 @@ def build_event_timeline_streamed(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not parts_sql:
-        con.close()
-        out_path.write_text(
-            "impression_id,patient_id,anchor_time,y,event_type,vocabulary,"
-            "concept_code,concept_name,event_datetime,event_date,"
-            "days_before_ctpa,value\n"
-        )
-        return 0
+    try:
+        if not parts_sql:
+            out_path.write_text(
+                "impression_id,patient_id,anchor_time,y,event_type,vocabulary,"
+                "concept_code,concept_name,event_datetime,event_date,"
+                "days_before_ctpa,value\n"
+            )
+            return 0
 
-    union_sql = "\nUNION ALL\n".join(parts_sql)
-    _log(f"[timeline] writing directly to {out_path} …")
-    # POSIX path with single quotes escaped, matching how paths are quoted
-    # elsewhere in this file's f-string SQL.
-    escaped_out = str(out_path).replace("'", "''")
-    con.execute(f"""
-        COPY (
-            {union_sql}
-            ORDER BY impression_id, event_datetime, event_type
-        ) TO '{escaped_out}' (HEADER, DELIMITER ',')
-    """, params)
-    con.close()
+        union_sql = "\nUNION ALL\n".join(parts_sql)
+        _log(f"[timeline] writing directly to {out_path} …")
+        # POSIX path with single quotes escaped, matching how paths are quoted
+        # elsewhere in this file's f-string SQL.
+        escaped_out = str(out_path).replace("'", "''")
+        # No ORDER BY, deliberately — see the function docstring. Rows come
+        # out grouped by feature type in whatever order DuckDB's parallel
+        # scan produces them, not globally sorted by study/time.
+        con.execute(f"""
+            COPY (
+                {union_sql}
+            ) TO '{escaped_out}' (HEADER, DELIMITER ',')
+        """, params)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        if tmp_db.exists():
+            tmp_db.unlink(missing_ok=True)
 
     # Row count from the file itself rather than re-querying DuckDB, so the
     # (potentially 22+ GB) source CSVs are only scanned once.

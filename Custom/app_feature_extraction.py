@@ -1766,17 +1766,35 @@ def main() -> None:  # pragma: no cover
                     "measurement / diagnosis / drug / procedure / "
                     "observation / visit, not aggregated — so for a wide "
                     "window over a large cohort it's often even bigger than "
-                    "the long-format export above. This writes straight to "
-                    "a CSV file using DuckDB's own out-of-core query "
-                    "engine — Python never holds the full result, so "
-                    "there's no size cap and no separate chunk size to "
-                    "tune (DuckDB streams this on its own)."
+                    "the long-format export above (tens of millions of rows "
+                    "is normal, not a bug). This writes straight to a CSV "
+                    "file using DuckDB's own out-of-core query engine — "
+                    "Python never holds the full result. **Rows are not "
+                    "globally sorted** (grouped by feature type, in "
+                    "whatever order DuckDB's scan produces them) — a full "
+                    "sort would need the entire result considered before "
+                    "writing anything, which is what pushed this close to "
+                    "the edge even with disk-spilling on. Sort after "
+                    "loading if you need chronological order; every row "
+                    "still carries its own `event_date`/`days_before_ctpa`."
                 )
                 tl_stream_path = st.text_input(
                     "Output CSV path",
                     value=str(DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task
                               / f"{fm.task}_event_timeline.csv"),
                     key="tl_stream_path",
+                )
+                tl_memory_limit_gb = st.number_input(
+                    "DuckDB memory limit (GB)",
+                    min_value=1.0, max_value=64.0, value=4.0, step=1.0,
+                    key="tl_memory_limit_gb",
+                    help="How much RAM DuckDB is allowed to use before it "
+                         "spills its own working set (joins, aggregation) to "
+                         "the temp file, regardless of how much the machine "
+                         "actually has. Deliberately conservative by default "
+                         "— raise it for a faster run if you know the "
+                         "machine has headroom to spare; lower it further if "
+                         "this still runs the system close to its limit.",
                 )
                 if st.button("💾 Stream full event timeline CSV to disk", key="tl_stream_build"):
                     from Custom.appd_route_b_labs import build_event_timeline_streamed
@@ -1795,6 +1813,7 @@ def main() -> None:  # pragma: no cover
                             measurement_path=_measurement_csv,
                             concept_path=_concept_csv,
                             out_path=tl_stream_path,
+                            memory_limit_gb=float(tl_memory_limit_gb),
                             verbose=True,
                         )
                     st.success(f"✅ Wrote {n_events:,} rows to:")
