@@ -20,14 +20,25 @@
 # extract.yaml already defaults to model=resnetv2_ct, dataset=stanford
 # (channels: window already fixed there).
 #
+# lr=0.0005 (below, inherited unchanged from the resnext101_32x8d runs) is
+# aggressive for a full end-to-end fine-tune of resnetv2_101x3_bitm_in21k —
+# a BiT (Big Transfer) model. Google's own BiT paper is explicit that these
+# need much more conservative fine-tuning LRs than standard ResNets; too
+# high an LR on a full fine-tune tends to rapidly degrade an already-strong
+# pretrained representation. The first fine-tune here (2026-08-10) peaked at
+# epoch 0 and declined every epoch after — consistent with exactly that.
+# Dropped 0.0005 -> 0.00003 (~15x) for this run; combined with
+# resnetv2_ct_pretrain.yaml's new dropout_prob=0.3.
+#
 # Other backbones tried previously (kept for reference):
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=swinv2 dataset=rsna
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct_pretrain dataset=rsna dataset.transform.final_size=224 dataset.batch_size=256 trainer.accumulate_grad_batches=1 lr=0.0005
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2 dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4 lr=0.0005
+#CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4 lr=0.0005
 
 CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset=rsna \
     dataset.transform.final_size=224 \
     dataset.batch_size=64 \
     trainer.accumulate_grad_batches=4 \
-    lr=0.0005
+    lr=0.00003

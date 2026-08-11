@@ -8,3 +8,11 @@ checkpoint_path: "/data/processed/INSPECT/checkpoints/resnetv2_ct.ckpt"
 # exactly). Use this as the starting point for RSNA/RSPECT fine-tuning with
 # channels=window (see run_rsna.sh). After fine-tuning, copy the best
 # checkpoint to resnetv2_ct.yaml's checkpoint_path.
+#
+# First fine-tune (2026-08-10) peaked at epoch 0 and declined every epoch
+# after — Model2D had no regularization on the classifier head at all, and
+# run_rsna.sh's lr=0.0005 (inherited from the resnext setup) is aggressive
+# for a full end-to-end fine-tune of a BiT/GroupNorm-WS backbone this large.
+# dropout_prob here is the regularization half of the fix; the LR half is in
+# run_rsna.sh.
+dropout_prob: 0.3
