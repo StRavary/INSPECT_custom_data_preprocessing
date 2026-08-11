@@ -2,12 +2,10 @@ type: model_2d
 model_name: resnetv2_101_ct
 pretrain_type: supervised
 num_class: 1
-# Was pointing at a 2026-07-24 local RSNA fine-tune that predates the
-# channels=window fix (repeated single window -> 3 distinct windows) and was
-# almost certainly trained on the buggy input distribution. Replaced with the
-# official StanfordShahLab/resnetv2_ct HuggingFace checkpoint instead — same
-# checkpoint run_rsna.sh now starts fine-tuning from (see
-# resnetv2_ct_pretrain.yaml), so this file is ready to use as-is for
-# run_featurize.py even without re-running run_rsna.sh first. If you do
-# re-run run_rsna.sh, copy its best checkpoint here afterward, same as before.
-checkpoint_path: "/data/processed/INSPECT/checkpoints/resnetv2_ct.ckpt"
+# RSPECT (RSNA PE) fine-tune of resnetv2_ct_pretrain.yaml's official
+# StanfordShahLab/resnetv2_ct checkpoint, with the corrected channels=window
+# (3 distinct windows, not repeated PE window) — run 2026-08-10_21:25:26.
+# Best val/mean_auroc (0.931) was at epoch 0 and never improved afterward
+# (save_top_k=1 kept only that checkpoint), so this is only ~1 epoch of
+# fine-tuning past the base HF checkpoint.
+checkpoint_path: "/data/processed/INSPECT/checkpoints/classify_pe_present_on_image_2026-08-10_21:25:26/epoch=0-val/mean_auroc=0.931.ckpt"

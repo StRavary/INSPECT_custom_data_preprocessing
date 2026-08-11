@@ -13,10 +13,7 @@
 # with real 3-window inputs is a documented failure mode in this repo, see
 # resnext_101_imagenet.yaml / vision_backbones.py docstrings: out-of-
 # distribution features, training collapses to loss=0). resnetv2_ct.yaml
-# now points at this same official checkpoint too, so if you'd rather skip
-# this fine-tuning run and go straight to run_featurize.py on the base
-# checkpoint, that's already wired up — this run just continues fine-tuning
-# it further with the corrected windowing.
+# now points at this same official checkpoint too.
 #
 # After this run, copy the best val AUROC checkpoint to resnetv2_ct.yaml's
 # checkpoint_path, then run_featurize.py will pick it up automatically —
