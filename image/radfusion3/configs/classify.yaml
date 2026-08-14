@@ -6,6 +6,12 @@ test_split: test  # all
 ckpt: null
 
 lr: 0.0005
+# LR multiplier applied to backbone params when using discriminative LRs
+# (see trainer.freeze_backbone_epochs below). 1.0 = single LR for every
+# param, identical to prior behavior. Only takes effect for models that
+# expose separate `.model` (backbone) / `.classifier` (head) submodules,
+# e.g. Model2D.
+backbone_lr_mult: 1.0
 optimizer:
   name: AdamW
 loss:
@@ -31,6 +37,11 @@ trainer:
   num_workers: 16
   strategy: ddp
   position_encoding: true
+  # Number of epochs to train with the backbone frozen (requires_grad=False,
+  # head-only training) before unfreezing it for full fine-tuning. 0 = no
+  # freezing, identical to prior behavior. Only takes effect for models
+  # exposing freeze_backbone()/unfreeze_backbone(), e.g. Model2D.
+  freeze_backbone_epochs: 0
 
 defaults:
   - _self_

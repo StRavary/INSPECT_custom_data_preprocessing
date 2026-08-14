@@ -87,7 +87,23 @@ def build_transformation(cfg, split):
 
 
 def build_optimizer(cfg, model):
-    params = [p for p in model.parameters() if p.requires_grad]
+    backbone_lr_mult = getattr(cfg, "backbone_lr_mult", 1.0)
+
+    if backbone_lr_mult != 1.0 and hasattr(model, "model") and hasattr(model, "classifier"):
+        # Discriminative LRs: backbone gets cfg.lr * backbone_lr_mult, head
+        # gets cfg.lr. Both groups are registered here regardless of their
+        # current requires_grad state (e.g. while the backbone is frozen via
+        # cfg.trainer.freeze_backbone_epochs) so that (a) the LR scheduler's
+        # base_lrs are correct for both groups from the start, and (b)
+        # unfreezing later just resumes updates -- no optimizer rebuild
+        # needed. AdamW skips any param whose .grad is None, so registering
+        # frozen params up front is a no-op until they're unfrozen.
+        params = [
+            {"params": list(model.model.parameters()), "lr": cfg.lr * backbone_lr_mult},
+            {"params": list(model.classifier.parameters()), "lr": cfg.lr},
+        ]
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
 
     if "optimizer" in cfg:
         optimizer_name = cfg.optimizer.name

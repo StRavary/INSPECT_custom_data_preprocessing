@@ -30,6 +30,20 @@ class Model2D(nn.Module):
         self.cfg = cfg
         self.get_features = cfg.get_features
 
+    def freeze_backbone(self):
+        """Disable grad on the backbone so only the classifier head trains.
+
+        Used for a linear-probe warmup phase (cfg.trainer.freeze_backbone_epochs)
+        before unfreezing for full end-to-end fine-tuning -- see
+        ClassificationLightningModel.on_train_epoch_start.
+        """
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        for p in self.model.parameters():
+            p.requires_grad = True
+
     def forward(self, x, mask=None, get_features=False):
         x = self.model(x)
         pred = self.classifier(self.classifier_dropout(x))

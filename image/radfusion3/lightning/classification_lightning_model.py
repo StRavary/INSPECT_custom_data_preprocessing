@@ -34,6 +34,39 @@ class ClassificationLightningModel(LightningModule):
         self.save_dir = "./outputs"
         self.not_test_cases = []
 
+        # Optional linear-probe warmup: keep the backbone frozen for the
+        # first N epochs (classifier head only), then unfreeze for full
+        # fine-tuning (on_train_epoch_start below). 0 = disabled, unchanged
+        # behavior. See cfg.backbone_lr_mult for pairing this with a smaller
+        # backbone LR once unfrozen.
+        #
+        # NB (multi-GPU only): freezing works by toggling requires_grad
+        # rather than rebuilding the optimizer, so it's transparent to the
+        # LR scheduler. With strategy=ddp and >1 device, DDP's reducer is
+        # built from each param's requires_grad at wrap time, so params
+        # frozen here at __init__ won't be registered for cross-process
+        # grad sync when later unfrozen -- fine for this repo's actual
+        # single-GPU runs (CUDA_VISIBLE_DEVICES=<one id>), but pass
+        # find_unused_parameters=True (or switch strategy=auto) if this is
+        # ever run with >1 visible device.
+        self.freeze_backbone_epochs = getattr(cfg.trainer, "freeze_backbone_epochs", 0)
+        self._backbone_frozen = False
+        if self.freeze_backbone_epochs > 0:
+            if hasattr(self.model, "freeze_backbone"):
+                self.model.freeze_backbone()
+                self._backbone_frozen = True
+                print("=" * 80)
+                print(
+                    f"Backbone frozen for the first {self.freeze_backbone_epochs} "
+                    "epoch(s) (classifier head only)."
+                )
+                print("=" * 80)
+            else:
+                print(
+                    f"WARNING: cfg.trainer.freeze_backbone_epochs={self.freeze_backbone_epochs} "
+                    f"but {type(self.model).__name__} has no freeze_backbone() method -- ignoring."
+                )
+
     def configure_optimizers(self):
         import torch
         optimizer = builder.build_optimizer(self.cfg, self.model)
@@ -46,6 +79,20 @@ class ClassificationLightningModel(LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }
+
+    def on_train_epoch_start(self):
+        if (
+            self._backbone_frozen
+            and self.current_epoch >= self.freeze_backbone_epochs
+        ):
+            self.model.unfreeze_backbone()
+            self._backbone_frozen = False
+            print("=" * 80)
+            print(
+                f"Epoch {self.current_epoch}: unfreezing backbone "
+                f"(was frozen for {self.freeze_backbone_epochs} epoch(s))."
+            )
+            print("=" * 80)
 
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch, "train")

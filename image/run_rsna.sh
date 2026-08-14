@@ -30,6 +30,21 @@
 # Dropped 0.0005 -> 0.00003 (~15x) for this run; combined with
 # resnetv2_ct_pretrain.yaml's new dropout_prob=0.3.
 #
+# Second fine-tune (2026-08-11, lr=0.00003 + dropout_prob=0.3) showed the
+# same epoch-0-best-then-declining pattern. dropout_prob only regularizes
+# the ~6K-param classifier head; it does nothing for the ~200M-param
+# GroupNorm/weight-standardized-conv backbone, which is what's actually
+# free to drift/overfit against a small, heavily-oversampled positive pool
+# (2,368 positive-exam studies, ~3x WeightedRandomSampler oversampling —
+# see Custom/INSPECT_Baseline_Reconstruction.md §22.3). This run instead:
+#   1. Freezes the backbone for the first freeze_backbone_epochs epochs
+#      (linear-probe warmup: only the classifier head trains).
+#   2. Unfreezes with the backbone at lr * backbone_lr_mult (10x smaller
+#      than the head's lr) rather than the same LR for every param.
+# Watch train/mean_auroc vs val/mean_auroc in wandb after this run: if
+# train keeps climbing while val still declines post-unfreeze, that
+# confirms backbone overfitting rather than an LR/precision/scheduler bug.
+#
 # Other backbones tried previously (kept for reference):
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=swinv2 dataset=rsna
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224
@@ -41,4 +56,6 @@ CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset
     dataset.transform.final_size=224 \
     dataset.batch_size=64 \
     trainer.accumulate_grad_batches=4 \
-    lr=0.00003
+    lr=0.00003 \
+    trainer.freeze_backbone_epochs=2 \
+    backbone_lr_mult=0.1
