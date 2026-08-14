@@ -128,6 +128,11 @@ TRUTHY             = {"TRUE", "1", "1.0", "YES", "T"}
 SKIP_LABEL_VALUES  = {"CENSORED", "CENSOR", "NAN", "NA", "NONE", ""}
 CATCH_ALL_DAYS     = 36500  # 100 years
 
+# visit_concept_ids treated as a qualifying inpatient stay for
+# admission-anchored extraction: Inpatient Visit, and Emergency Room +
+# Inpatient Visit (an ER visit that rolled straight into an admission).
+ADMISSION_VISIT_CONCEPT_IDS = (9201, 262)
+
 # ---------------------------------------------------------------------------
 # OMOP concept-name helpers (previously in temporal_features.py)
 # ---------------------------------------------------------------------------
@@ -660,6 +665,13 @@ class LabFeatureMatrix:
     # per-type lookback windows in days.  None for old pickled extractions.
     feature_types:     Optional[object] = None   # Optional[list]
     count_window_days: Optional[object] = None   # Optional[dict] {feature_type: days}
+    # Admission-anchored extraction (build(admission_anchored=True)): the
+    # window per study became [admission_date, anchor_time] instead of a
+    # fixed lookback, capped by windows_days/count_window_days as an outer
+    # ceiling. None/False for ordinary extractions.
+    admission_anchored:   bool = False
+    admission_dates:      Optional[np.ndarray] = None   # ISO date strings, aligned to rows
+    days_since_admission: Optional[np.ndarray] = None   # float days, admission_date -> anchor_time
 
     def __len__(self) -> int:
         return len(self.y)
@@ -678,6 +690,9 @@ class LabFeatureMatrix:
         if self.tte is not None:
             d["tte_days"] = self.tte
             d["event"]    = self.event
+        if self.admission_dates is not None:
+            d["admission_date"]        = self.admission_dates
+            d["days_since_admission"]  = self.days_since_admission
         return pd.DataFrame(d)
 
     def human_columns(self, concept_map: dict) -> list:
@@ -692,7 +707,9 @@ class LabFeatureMatrix:
         lines = [
             f"route=B  task={self.task}  anchor={self.anchor_kind}  "
             f"rows={len(self):,}  cols={len(self.columns):,}  labs={n_labs:,}",
-            f"  windows         : {self.windows_days} days",
+            f"  windows         : {self.windows_days} days"
+            + ("  (admission-anchored: capped at admission→anchor gap)"
+               if self.admission_anchored else ""),
             f"  label prevalence: {float(np.nanmean(self.y)):.4f}",
             f"  measured frac   : {measured:.3f}  "
             "(fraction of study×feature pairs with an observed value)",
@@ -1353,6 +1370,85 @@ class LabExtractor:
                       "have no matching survival entry")
         return tte, event
 
+    # -- admission anchoring ------------------------------------------------
+
+    def _find_encompassing_admissions(self, cohort_rows: list) -> "pd.DataFrame":
+        """For each cohort row, find the inpatient admission the anchor falls
+        inside — i.e. visit_start_date <= anchor_date <= visit_end_date (or
+        the visit is still open, visit_end_date IS NULL).
+
+        Used by admission-anchored extraction (``build(admission_anchored=True)``):
+        the feature window becomes [admission_start_date, anchor_time] per
+        patient instead of a fixed number of days before anchor for everyone.
+        Studies with no qualifying admission have no row in the result and are
+        dropped from the cohort by the caller.
+
+        A single DuckDB join against the whole cohort at once — no per-patient
+        Python loop.
+
+        Returns
+        -------
+        pd.DataFrame with columns:
+            impression_id, admission_date (ISO date string),
+            visit_occurrence_id, days_since_admission (int, admission -> anchor)
+        One row per impression_id with a qualifying admission. Patients with
+        multiple overlapping qualifying visits (a data-quality edge case) keep
+        only the one with the latest visit_start_date.
+        """
+        import duckdb
+        import pandas as pd
+
+        visit_csv = self.omop_dir / "visit_occurrence.csv"
+        if not visit_csv.exists():
+            raise FileNotFoundError(
+                f"visit_occurrence.csv not found at {visit_csv} — required "
+                "for admission-anchored extraction.")
+
+        anchors_df = pd.DataFrame(
+            [(pid, anchor.isoformat(), imp) for pid, anchor, imp, _, _ in cohort_rows],
+            columns=["person_id", "anchor_time", "impression_id"],
+        )
+        anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+
+        concept_ids = ", ".join(str(c) for c in ADMISSION_VISIT_CONCEPT_IDS)
+        con = duckdb.connect()
+        con.register("anchors_tbl", anchors_df)
+        df = con.execute(f"""
+            SELECT impression_id, admission_date, visit_occurrence_id, days_since_admission
+            FROM (
+                SELECT
+                    a.impression_id,
+                    CAST(t.visit_start_date AS VARCHAR)                        AS admission_date,
+                    t.visit_occurrence_id                                      AS visit_occurrence_id,
+                    DATEDIFF('day', CAST(t.visit_start_date AS DATE),
+                             CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))   AS days_since_admission,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.impression_id
+                        ORDER BY t.visit_start_date DESC
+                    )                                                         AS rn
+                FROM read_csv_auto('{visit_csv}', ignore_errors=true) t
+                INNER JOIN anchors_tbl a
+                        ON CAST(t.person_id AS BIGINT) = a.person_id
+                WHERE t.visit_concept_id IN ({concept_ids})
+                  AND t.visit_start_date IS NOT NULL
+                  AND CAST(t.visit_start_date AS DATE)
+                        <= CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  AND (
+                        t.visit_end_date IS NULL
+                        OR CAST(t.visit_end_date AS DATE)
+                             >= CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      )
+            )
+            WHERE rn = 1
+        """).df()
+        con.close()
+
+        self._log(
+            f"  encompassing admission: {df['impression_id'].nunique():,}/"
+            f"{len(cohort_rows):,} studies matched "
+            f"(visit_concept_id IN {ADMISSION_VISIT_CONCEPT_IDS})")
+        return df
+
     # -- DuckDB-native scan + pivot ----------------------------------------
 
     def _run_duckdb_and_pivot(
@@ -1362,6 +1458,8 @@ class LabExtractor:
         loinc_codes: Optional[list],
         min_studies: int,
         all_impression_ids: list,
+        admission_dates: Optional[dict] = None,
+        col_suffix: str = "",
     ) -> tuple:
         """Scan measurement.csv, aggregate per window, filter, and pivot lab
         features — all inside DuckDB with an on-disk connection.
@@ -1373,6 +1471,19 @@ class LabExtractor:
         3–4× overhead that arises from long_df → melt → pivot_table in pandas.
 
         Requires DuckDB ≥ 0.8.0 (PIVOT statement).
+
+        admission_dates : optional {impression_id: ISO date string}. When
+            given (admission-anchored mode), each study's effective upper
+            bound becomes ``LEAST(w, admission -> anchor gap)`` instead of the
+            fixed ``w`` for every study — a per-row SQL expression, still one
+            vectorized scan, not a per-patient loop. Every impression_id in
+            ``cohort_rows`` must have an entry (the caller is expected to have
+            already dropped studies with no qualifying admission).
+        col_suffix : appended to every generated column name, right after the
+            ``_{w}d`` window tag (e.g. ``"_preadm"`` → ``..._last_7d_preadm``).
+            Used by ``build()`` to run this same function a second time with
+            ``cohort_rows`` anchored at admission_date instead of anchor_time
+            (a pre-admission baseline window) without colliding column names.
 
         Returns
         -------
@@ -1393,6 +1504,17 @@ class LabExtractor:
             columns=["person_id", "anchor_time", "impression_id"],
         )
         anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+        if admission_dates is not None:
+            anchors_df["admission_date"] = anchors_df["impression_id"].map(admission_dates)
+
+        if admission_dates is not None:
+            max_window_expr = (
+                f"LEAST({max_window}, DATEDIFF('day', "
+                "CAST(a.admission_date AS DATE), "
+                "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+            )
+        else:
+            max_window_expr = str(max_window)
 
         tmp_db = Path(tempfile.mktemp(suffix="_lab_pivot.duckdb"))
         try:
@@ -1426,7 +1548,8 @@ class LabExtractor:
             # ── 2. Scan measurement.csv → on-disk temp table ─────────────────
             #  No .df() here — result stays inside DuckDB and can spill to disk
             self._log(
-                f"  scanning measurement.csv (max window={max_window} d) …")
+                f"  scanning measurement.csv (max window="
+                f"{'admission-anchored, capped at ' + str(max_window) + 'd' if admission_dates is not None else str(max_window) + ' d'}) …")
             con.execute(f"""
                 CREATE TEMP TABLE _raw AS
                 SELECT
@@ -1453,7 +1576,7 @@ class LabExtractor:
                             TRY_CAST(m.measurement_date     AS TIMESTAMP)
                         ) AS DATE),
                         CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                      ) BETWEEN 1 AND {max_window}
+                      ) BETWEEN 1 AND {max_window_expr}
             """)
             n_raw, n_codes, n_stud = con.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT loinc_code), "
@@ -1518,7 +1641,7 @@ class LabExtractor:
             ]
             union_parts = [
                 f"SELECT impression_id, "
-                f"'labs:LOINC/' || loinc_code || '_{tag}_{w}d' AS col_name, "
+                f"'labs:LOINC/' || loinc_code || '_{tag}_{w}d{col_suffix}' AS col_name, "
                 f"CAST({col} AS DOUBLE) AS value FROM _agg_{w}d"
                 for w in windows_days
                 for col, tag in agg_tags
@@ -1556,6 +1679,88 @@ class LabExtractor:
             f"({(~np.isnan(X)).mean():.1%} of cells observed)")
         return X, columns
 
+    # -- pre-admission baseline + delta (admission-anchored labs only) ----
+
+    def _compute_pre_admission_baseline_and_delta(
+        self,
+        cohort_rows: list,
+        admission_dates: dict,
+        windows_days: list,
+        loinc_codes: Optional[list],
+        min_studies_per_lab: int,
+        imp_ids: list,
+        pre_admission_days: int,
+        X_admission: np.ndarray,
+        columns_admission: list,
+    ) -> tuple:
+        """Pre-admission lab baseline window + delta vs. the admission value.
+
+        Runs ``_run_duckdb_and_pivot`` a second time with each study's anchor
+        replaced by its admission_date and a single fixed lookback window
+        (``pre_admission_days``) ending there — an ordinary (non
+        admission-anchored) call, so it's simply "the N days right before
+        admission", uncapped by anything else. Columns are tagged
+        ``_preadm`` so they never collide with the admission-to-anchor
+        columns already in ``columns_admission``.
+
+        Delta columns (``labs:LOINC/{code}_delta_{agg}`` for agg in
+        last/min/max/mean) = the admission-to-anchor value — taken from
+        ``X_admission``'s largest ``windows_days`` entry, which is already
+        capped to the admission span by the caller's admission-anchored
+        call — minus the pre-admission baseline. NaN if either side is
+        missing for a given study/lab.
+
+        A soft failure (e.g. too few labs pass min_studies_per_lab in the
+        much shorter baseline window) logs a warning and returns empty
+        baseline/delta columns rather than aborting the whole extraction.
+
+        Returns
+        -------
+        X_extra, columns_extra : baseline columns followed by delta columns,
+            ready to ``np.hstack`` onto the combined feature matrix.
+        """
+        baseline_rows = [
+            (pid, datetime.date.fromisoformat(admission_dates[imp]), imp, split, y)
+            for pid, _anchor, imp, split, y in cohort_rows
+        ]
+        try:
+            X_pre, columns_pre = self._run_duckdb_and_pivot(
+                baseline_rows, [pre_admission_days], loinc_codes,
+                min_studies_per_lab, imp_ids, admission_dates=None,
+                col_suffix="_preadm")
+        except RuntimeError as e:
+            self._log(
+                f"  WARNING: pre-admission baseline extraction failed "
+                f"({e}) — skipping baseline/delta")
+            return np.zeros((len(imp_ids), 0), dtype=np.float32), []
+
+        max_w    = max(windows_days)
+        pre_idx  = {c: i for i, c in enumerate(columns_pre)}
+
+        delta_cols, delta_parts = [], []
+        for agg in ("last", "min", "max", "mean"):
+            suffix_adm = f"_{agg}_{max_w}d"
+            for j, col in enumerate(columns_admission):
+                if not col.endswith(suffix_adm):
+                    continue
+                code_part = col[:-len(suffix_adm)]   # e.g. "labs:LOINC/2160-0"
+                pre_col   = f"{code_part}_{agg}_{pre_admission_days}d_preadm"
+                if pre_col not in pre_idx:
+                    continue
+                delta_cols.append(f"{code_part}_delta_{agg}")
+                delta_parts.append(X_admission[:, j] - X_pre[:, pre_idx[pre_col]])
+
+        X_delta = (np.column_stack(delta_parts).astype(np.float32)
+                   if delta_parts else np.zeros((len(imp_ids), 0), dtype=np.float32))
+
+        self._log(
+            f"  pre-admission baseline: {len(columns_pre):,} columns "
+            f"({pre_admission_days}d before admission_date)  "
+            f"delta: {len(delta_cols):,} columns "
+            f"(vs. admission-to-anchor {max_w}d)")
+
+        return np.hstack([X_pre, X_delta]), columns_pre + delta_cols
+
     # -- count feature extraction (diagnoses / drugs / procedures) --------
 
     def _run_duckdb_counts(
@@ -1563,6 +1768,7 @@ class LabExtractor:
         cohort_rows: list,
         tables: list,
         window_days_per_table: dict,
+        admission_dates: Optional[dict] = None,
     ) -> "pd.DataFrame":
         """Scan OMOP event tables and count distinct event-days per (study, code).
 
@@ -1577,6 +1783,12 @@ class LabExtractor:
         window_days_per_table : dict
             Mapping from OMOP table name → lookback window in days, e.g.
             ``{"condition_occurrence": 365, "drug_exposure": 60}``.
+        admission_dates : optional {impression_id: ISO date string}. When
+            given, each table's per-row upper bound becomes
+            ``LEAST(window_days, admission -> anchor gap)`` instead of the
+            fixed ``window_days`` for every study — window_days_per_table
+            still acts as an outer ceiling. Every impression_id in
+            ``cohort_rows`` must have an entry.
 
         Returns
         -------
@@ -1597,6 +1809,8 @@ class LabExtractor:
             columns=["person_id", "anchor_time", "impression_id"],
         )
         anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+        if admission_dates is not None:
+            anchors_df["admission_date"] = anchors_df["impression_id"].map(admission_dates)
 
         con = duckdb.connect()
         con.register("anchors_tbl", anchors_df)
@@ -1636,6 +1850,14 @@ class LabExtractor:
             tbl_alias  = f"_concepts_{tbl.replace('_', '')}"
             con.register(tbl_alias, concepts_df)
             window_days = window_days_per_table.get(tbl, 365)
+            if admission_dates is not None:
+                window_upper_expr = (
+                    f"LEAST({window_days}, DATEDIFF('day', "
+                    "CAST(a.admission_date AS DATE), "
+                    "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+                )
+            else:
+                window_upper_expr = str(window_days)
 
             sql = f"""
                 SELECT
@@ -1654,7 +1876,7 @@ class LabExtractor:
                         'day',
                         CAST(t.{date_col} AS DATE),
                         CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                      ) BETWEEN 1 AND {window_days}
+                      ) BETWEEN 1 AND {window_upper_expr}
                 GROUP BY a.impression_id, c.vocabulary_id, c.concept_code
             """
             part_df = con.execute(sql).df()
@@ -1668,18 +1890,31 @@ class LabExtractor:
             end_date_col = cfg.get("end_date_col")
             if end_date_col:
                 self._log(f"    computing LOS features from {end_date_col} …")
+                # Admission-anchored mode: the qualifying admission's
+                # visit_end_date is often *after* the anchor (patient still
+                # admitted at anchor time — that's the qualifying condition
+                # itself), so an untruncated LOS would leak the eventual
+                # total stay length. Cap at anchor_time so LOS reflects only
+                # "days admitted so far", not future stay length.
+                if admission_dates is not None:
+                    end_date_expr = (
+                        f"LEAST(CAST(t.{end_date_col} AS DATE), "
+                        "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))"
+                    )
+                else:
+                    end_date_expr = f"CAST(t.{end_date_col} AS DATE)"
                 los_sql = f"""
                     SELECT
                         a.impression_id,
                         SUM(GREATEST(0, DATEDIFF(
                             'day',
                             CAST(t.{date_col} AS DATE),
-                            CAST(t.{end_date_col} AS DATE)
+                            {end_date_expr}
                         )))                                                 AS los_total,
                         MAX(GREATEST(0, DATEDIFF(
                             'day',
                             CAST(t.{date_col} AS DATE),
-                            CAST(t.{end_date_col} AS DATE)
+                            {end_date_expr}
                         )))                                                 AS los_max,
                         CAST(MAX(CAST(t.{date_col} AS DATE)) AS VARCHAR)   AS most_recent_date
                     FROM read_csv_auto('{csv_path}', ignore_errors=true) t
@@ -1691,7 +1926,7 @@ class LabExtractor:
                             'day',
                             CAST(t.{date_col} AS DATE),
                             CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                          ) BETWEEN 1 AND {window_days}
+                          ) BETWEEN 1 AND {window_upper_expr}
                     GROUP BY a.impression_id
                 """
                 los_df = con.execute(los_sql).df()
@@ -1805,6 +2040,7 @@ class LabExtractor:
         ancestor_levels: Optional[int] = None,
         min_studies_ancestor: int = 100,
         max_ancestor_features: int = 2000,
+        admission_dates: Optional[dict] = None,
     ) -> "pd.DataFrame":
         """Roll up OMOP events to ancestor concepts via concept_ancestor.csv.
 
@@ -1835,6 +2071,9 @@ class LabExtractor:
                                  because ancestor codes are far more numerous)
         max_ancestor_features  : hard cap on ancestor columns per event table,
                                  keeping the highest-coverage codes (default 2000)
+        admission_dates        : optional {impression_id: ISO date string}. See
+                                 ``_run_duckdb_counts`` — same per-row
+                                 ``LEAST(window_days, admission -> anchor gap)`` bound.
 
         Returns
         -------
@@ -1865,6 +2104,8 @@ class LabExtractor:
             columns=["person_id", "anchor_time", "impression_id"],
         )
         anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
+        if admission_dates is not None:
+            anchors_df["admission_date"] = anchors_df["impression_id"].map(admission_dates)
 
         # Use an on-disk DuckDB file so large temp tables can spill to disk
         tmp_db = Path(tempfile.mktemp(suffix="_ancestor_rollup.duckdb"))
@@ -1928,6 +2169,14 @@ class LabExtractor:
                 col_prefix  = cfg["col_prefix"]
                 anc_prefix  = f"{col_prefix}_anc"
                 window_days = window_days_per_table.get(tbl, 365)
+                if admission_dates is not None:
+                    window_upper_expr = (
+                        f"LEAST({window_days}, DATEDIFF('day', "
+                        "CAST(a.admission_date AS DATE), "
+                        "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+                    )
+                else:
+                    window_upper_expr = str(window_days)
 
                 self._log(f"  [ancestor] {tbl} → {window_days} d window …")
 
@@ -1943,7 +2192,7 @@ class LabExtractor:
                             'day',
                             CAST(t.{date_col} AS DATE),
                             CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                          ) BETWEEN 1 AND {window_days}
+                          ) BETWEEN 1 AND {window_upper_expr}
                 """)
                 n_desc = con.execute("SELECT COUNT(*) FROM _desc_ids").fetchone()[0]
                 self._log(f"    {n_desc:,} distinct descendant concept_ids in window")
@@ -1994,7 +2243,7 @@ class LabExtractor:
                             'day',
                             CAST(t.{date_col} AS DATE),
                             CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                          ) BETWEEN 1 AND {window_days}
+                          ) BETWEEN 1 AND {window_upper_expr}
                     GROUP BY ac.vocabulary_id, ac.concept_code
                     HAVING COUNT(DISTINCT a.impression_id) >= {min_studies_ancestor}
                     ORDER BY n_studies DESC
@@ -2027,7 +2276,7 @@ class LabExtractor:
                             'day',
                             CAST(t.{date_col} AS DATE),
                             CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                          ) BETWEEN 1 AND {window_days}
+                          ) BETWEEN 1 AND {window_upper_expr}
                     GROUP BY a.impression_id, ac.vocabulary_id, ac.concept_code
                 """).df()
 
@@ -2068,6 +2317,8 @@ class LabExtractor:
         min_studies_ancestor:   int = 100,
         max_ancestor_features:  int = 2000,
         one_study_per_patient:  Optional[str] = None,
+        admission_anchored:     bool = False,
+        pre_admission_days:     Optional[int] = None,
     ) -> LabFeatureMatrix:
         """Run the full extraction and return a LabFeatureMatrix.
 
@@ -2105,6 +2356,30 @@ class LabExtractor:
                                     long-format/timeline export size) proportionally
                                     to how many patients have multiple studies. See
                                     `_read_cohort` for the tie-breaking rule.
+            admission_anchored    : if True, restrict the cohort to studies whose
+                                    anchor falls inside an inpatient admission
+                                    (visit_concept_id IN ADMISSION_VISIT_CONCEPT_IDS,
+                                    visit_start_date <= anchor <= visit_end_date or
+                                    still open) and extract features from
+                                    [admission_start_date, anchor] instead of a
+                                    fixed lookback — windows_days/count_window_days
+                                    still apply as an outer ceiling per study
+                                    (LEAST(window, admission -> anchor gap)).
+                                    Studies with no qualifying admission are
+                                    dropped from the cohort entirely. See
+                                    `_find_encompassing_admissions`.
+            pre_admission_days    : if set (requires admission_anchored=True and
+                                    "labs" in feature_types), also extract a
+                                    baseline lab window of this many days
+                                    *before* admission_date (columns tagged
+                                    ``_preadm``, e.g. ``..._last_7d_preadm``),
+                                    and add delta columns
+                                    (``labs:LOINC/{code}_delta_{agg}`` for
+                                    agg in last/min/max/mean) = the
+                                    admission-to-anchor value (largest
+                                    windows_days entry, already capped to the
+                                    admission span) minus the pre-admission
+                                    baseline. NaN if either side is missing.
         """
         if windows_days is None:
             windows_days = DEFAULT_WINDOWS
@@ -2147,11 +2422,43 @@ class LabExtractor:
 
         # 1. Read cohort
         cohort_rows = self._read_cohort(task, anchor_kind, one_study_per_patient)
+
+        # 1b. Admission-anchored mode: restrict the cohort to studies with an
+        #     encompassing inpatient admission, and derive a per-study
+        #     [admission_start, anchor] window that steps 2-4 below cap their
+        #     lookback windows against. Single vectorized DuckDB join across
+        #     the whole cohort — no per-patient loop.
+        admission_meta  = None
+        admission_dates = None
+        if admission_anchored:
+            self._log("\n[admission-anchored] finding encompassing admissions …")
+            admission_meta = self._find_encompassing_admissions(cohort_rows)
+            admission_dates = dict(zip(admission_meta["impression_id"],
+                                        admission_meta["admission_date"]))
+            n_before = len(cohort_rows)
+            cohort_rows = [r for r in cohort_rows if r[2] in admission_dates]
+            self._log(
+                f"  {n_before:,} -> {len(cohort_rows):,} studies "
+                f"({n_before - len(cohort_rows):,} dropped — no encompassing "
+                f"admission in visit_occurrence.csv)")
+            if not cohort_rows:
+                raise RuntimeError(
+                    "No studies had an encompassing inpatient admission — check "
+                    "that visit_occurrence.csv covers this cohort, or disable "
+                    "admission_anchored.")
+
         imp_ids     = [r[2] for r in cohort_rows]
         pat_ids     = np.array([r[0] for r in cohort_rows], dtype=np.int64)
         anchors     = np.array([r[1] for r in cohort_rows], dtype=object)
         splits      = np.array([r[3] for r in cohort_rows], dtype=object)
         y           = np.array([r[4] for r in cohort_rows], dtype=np.float32)
+
+        admission_date_arr       = None
+        days_since_admission_arr = None
+        if admission_anchored:
+            _adm_aligned = admission_meta.set_index("impression_id").reindex(imp_ids)
+            admission_date_arr       = _adm_aligned["admission_date"].to_numpy(dtype=object)
+            days_since_admission_arr = _adm_aligned["days_since_admission"].to_numpy(dtype=np.float32)
 
         # 2. Lab features (measurement.csv via DuckDB)
         #    _run_duckdb_and_pivot() keeps all intermediates inside an on-disk
@@ -2161,7 +2468,24 @@ class LabExtractor:
         if extract_labs:
             X_lab, columns_lab = self._run_duckdb_and_pivot(
                 cohort_rows, windows_days, loinc_codes,
-                min_studies_per_lab, imp_ids)
+                min_studies_per_lab, imp_ids, admission_dates=admission_dates)
+
+            # 2b. Pre-admission baseline + delta (admission-anchored only)
+            if admission_anchored and pre_admission_days:
+                self._log(
+                    f"\n[pre-admission baseline] {pre_admission_days}d before "
+                    f"admission_date …")
+                X_pre, columns_pre = self._compute_pre_admission_baseline_and_delta(
+                    cohort_rows, admission_dates, windows_days, loinc_codes,
+                    min_studies_per_lab, imp_ids, pre_admission_days,
+                    X_lab, columns_lab)
+                if columns_pre:
+                    X_lab       = np.hstack([X_lab, X_pre])
+                    columns_lab = columns_lab + columns_pre
+            elif pre_admission_days and not admission_anchored:
+                self._log(
+                    "  WARNING: pre_admission_days set but admission_anchored=False "
+                    "— ignoring (no admission_date to anchor the baseline to)")
 
         # 3. Count features (condition_occurrence / drug_exposure / procedure_occurrence)
         X_count, columns_count = np.zeros((len(imp_ids), 0), dtype=np.float32), []
@@ -2169,7 +2493,8 @@ class LabExtractor:
         if count_tables:
             self._log("\n[count features]")
             count_long = self._run_duckdb_counts(cohort_rows, count_tables,
-                                                  count_window_per_table)
+                                                  count_window_per_table,
+                                                  admission_dates=admission_dates)
             X_count, columns_count, count_dates = self._pivot_counts(
                 count_long, imp_ids, min_studies_per_lab)
             self._log(f"  count X shape: {X_count.shape}")
@@ -2186,6 +2511,7 @@ class LabExtractor:
                 ancestor_levels=ancestor_levels,
                 min_studies_ancestor=min_studies_ancestor,
                 max_ancestor_features=max_ancestor_features,
+                admission_dates=admission_dates,
             )
             if not anc_long.empty:
                 X_anc, columns_anc, count_dates_anc = self._pivot_counts(
@@ -2234,6 +2560,9 @@ class LabExtractor:
             count_dates       = count_dates,
             feature_types     = list(feature_types),
             count_window_days = dict(count_window_days),
+            admission_anchored   = admission_anchored,
+            admission_dates       = admission_date_arr,
+            days_since_admission  = days_since_admission_arr,
         )
 
         # Append demographics if person.csv is available

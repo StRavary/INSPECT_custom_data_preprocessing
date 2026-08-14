@@ -41,6 +41,8 @@ def main() -> None:
     min_studies_ancestor  = spec.get("min_studies_ancestor", 100)
     max_ancestor_features = spec.get("max_ancestor_features", 2000)
     one_study_per_patient = spec.get("one_study_per_patient") or None
+    admission_anchored    = spec.get("admission_anchored", False)
+    pre_admission_days    = spec.get("pre_admission_days") or None
 
     print(f"[route_b_worker] task={spec['task']}  anchor={spec.get('anchor', 'auto')}",
           flush=True)
@@ -56,6 +58,9 @@ def main() -> None:
           flush=True)
     print(f"[route_b_worker] use_concept_ancestor: {use_concept_ancestor}",        flush=True)
     print(f"[route_b_worker] one_study_per_patient: {one_study_per_patient or 'all'}", flush=True)
+    print(f"[route_b_worker] admission_anchored  : {admission_anchored}", flush=True)
+    if admission_anchored and pre_admission_days:
+        print(f"[route_b_worker] pre_admission_days  : {pre_admission_days}", flush=True)
     if use_concept_ancestor:
         print(f"[route_b_worker] ancestor_levels     : {ancestor_levels}",          flush=True)
         print(f"[route_b_worker] min_studies_ancestor: {min_studies_ancestor}",     flush=True)
@@ -85,6 +90,8 @@ def main() -> None:
         min_studies_ancestor=min_studies_ancestor,
         max_ancestor_features=max_ancestor_features,
         one_study_per_patient=one_study_per_patient,
+        admission_anchored=admission_anchored,
+        pre_admission_days=pre_admission_days,
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
