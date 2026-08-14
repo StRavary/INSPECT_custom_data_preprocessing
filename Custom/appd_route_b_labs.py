@@ -2383,6 +2383,28 @@ class LabExtractor:
         """
         if windows_days is None:
             windows_days = DEFAULT_WINDOWS
+        if not windows_days:
+            # Empty list (as opposed to None) means the caller deliberately
+            # wants no fixed window ceiling — only meaningful in
+            # admission-anchored mode, where the per-patient admission span
+            # is itself the bound. CATCH_ALL_DAYS (100y) as the sole window
+            # makes LEAST(w, admission->anchor gap) reduce to just the
+            # admission->anchor gap, uncapped by anything else, and is the
+            # codebase's existing "unbounded" idiom (humanize_column already
+            # renders it as "_whole_history").
+            if admission_anchored:
+                windows_days = [CATCH_ALL_DAYS]
+                self._log(
+                    "  lab windows: none configured — admission-anchored "
+                    "mode, using the full admission-to-anchor span only "
+                    "(no fixed ceiling)")
+            else:
+                raise ValueError(
+                    "windows_days is empty and admission_anchored=False — "
+                    "there's no per-patient admission span to fall back on, "
+                    "so the lab window would be unbounded for every study. "
+                    "Pass explicit windows_days (e.g. [2, 7, 30, 365]) or "
+                    "enable admission_anchored.")
         if feature_types is None:
             feature_types = ["labs"]
         if count_window_days is None:

@@ -98,15 +98,33 @@ COLUMN_GLOSSARY = {
     "impression_id": "Unique ID for one CTPA study.",
     "patient_id":     "Unique ID for the patient. One patient can have several studies.",
     "anchor_time":    "The date features are computed backwards from — StudyTime for "
-                       "prognostic tasks, StudyTime − 1 day for diagnostic tasks.",
+                       "prognostic tasks, StudyTime − 1 day for diagnostic tasks. If "
+                       "admission-anchored (see below), this is still the reference "
+                       "point features count backward *to*, but the window now starts "
+                       "at admission_date instead of a fixed number of days before it.",
     "y":              "Binary task label for this study: 1 = positive, 0 = negative.",
     "tte_days":       "Time-to-event — days from anchor_time to the survival event, "
                        "or to censoring if none was observed.",
     "event":          "Survival event indicator: 1 = event observed, 0 = censored "
                        "(no event seen before the patient's data ends), NaN = unknown.",
-    "sex":            "Patient sex, derived from OMOP gender_concept_id.",
+    "admission_date": "Admission-anchored extractions only. Start date (visit_start_date) "
+                       "of the inpatient stay the anchor falls inside — the window for "
+                       "every feature type starts here instead of a fixed lookback. "
+                       "Studies with no such admission are dropped from the cohort "
+                       "entirely, so this is never missing when the column is present.",
+    "days_since_admission": "Admission-anchored extractions only. anchor_time minus "
+                       "admission_date, in days — the actual per-study window length "
+                       "before any windows_days ceiling is applied "
+                       "(effective window = min(windows_days, days_since_admission)).",
+    "sex":            "Derived display field — female / male / unknown, from "
+                       "demo:is_female / demo:sex_unknown. Shown in the Describe and "
+                       "long-format views for filtering; not itself a column in the "
+                       "exported metadata.csv or X.npy (those carry the one-hot "
+                       "demo:is_female / demo:sex_unknown pair instead — see the demo: "
+                       "prefix below).",
     "age_years":      "Patient age in years at anchor_time.",
-    "age_band":       "Age bucketed into ranges for cohort slicing.",
+    "age_band":       "Age bucketed into ranges, for Describe-tab cohort filtering only "
+                       "— not a column in the exported metadata.csv or X.npy.",
     "split":          "Canonical train / valid / test split. Patient-level — no "
                        "patient appears in more than one split.",
     "feature":        "Raw feature column name, e.g. labs:LOINC/2160-0_last_30d — "
@@ -115,8 +133,10 @@ COLUMN_GLOSSARY = {
                        "English via concept.csv.",
     "record_date":    "Date the underlying measurement/event actually happened "
                        "(not the anchor date).",
-    "value":          "Observed value — a real number for labs/observations, NaN "
-                       "for coded events (diagnoses, drugs, procedures, visits).",
+    "value":          "This row's observed value: the actual result for labs:, or the "
+                       "count of distinct event-days for diag:/drug:/proc:/obs:/visit: "
+                       "(count features with 0 observed days are dropped from this "
+                       "long-format view entirely, not shown as a 0 row).",
     "days_before_anchor": "How many days before anchor_time this event occurred.",
     "days_before_ctpa":   "How many days before the CTPA study (anchor) this event occurred.",
     "source_table":   "Which OMOP table this event came from.",
@@ -135,7 +155,12 @@ COLUMN_GLOSSARY = {
 # them (one per code × window).
 PREFIX_GLOSSARY = [
     ("labs:",  "real-valued lab result — e.g. `labs:LOINC/2160-0_last_30d` = "
-               "creatinine, most recent value, 30-day window"),
+               "creatinine, most recent value, 30-day window. Admission-anchored "
+               "extractions add `_preadm` (baseline window ending at admission_date "
+               "instead of anchor_time, e.g. `..._last_7d_preadm`) and "
+               "`_delta_{agg}` columns (admission-to-anchor value minus that "
+               "baseline, for agg in last/min/max/mean) when a pre-admission "
+               "baseline window was configured."),
     ("diag:",  "count of distinct days a diagnosis code was recorded"),
     ("drug:",  "count of distinct days a drug was administered or dispensed"),
     ("proc:",  "count of distinct days a procedure was recorded"),
@@ -143,7 +168,15 @@ PREFIX_GLOSSARY = [
                "(smoking status, functional status, etc.)"),
     ("visit:", "count of distinct visit days; `visit:LOS/total_Nd` / "
                "`visit:LOS/max_Nd` give length-of-stay instead"),
-    ("demo:",  "demographic feature from person.csv (age, sex, race, ethnicity)"),
+    ("demo:",  "one of 9 fixed columns from person.csv (not one per code, unlike "
+               "the prefixes above): `age_years`; `is_female` / `sex_unknown` "
+               "(from gender_concept_id); `is_hispanic` (**ethnicity** — OMOP's "
+               "ethnicity_concept_id, Hispanic/Latino origin only, 0/1/NaN); and "
+               "`race_white` / `race_black` / `race_asian` / `race_other` / "
+               "`race_unknown` (**race** — OMOP's separate race_concept_id, "
+               "one-hot). Race and ethnicity are independent OMOP fields, not two "
+               "views of the same thing — e.g. race_white=1 and is_hispanic=1 can "
+               "both be true for the same patient."),
     ("*_anc:", "optional concept-ancestor rollup — same meaning as the base "
                "prefix, but for parent/ancestor codes (e.g. `diag_anc:`)"),
 ]
@@ -169,16 +202,26 @@ def _render_glossary(st, key: str) -> None:
             + "\n".join(
                 f"- `{c}` — {COLUMN_GLOSSARY[c]}"
                 for c in ("impression_id", "patient_id", "anchor_time", "y",
-                          "tte_days", "event", "sex", "age_years", "age_band")
+                          "tte_days", "event", "admission_date",
+                          "days_since_admission", "sex", "age_years", "age_band")
                 if c in COLUMN_GLOSSARY
             )
             + "\n\n**Feature column prefixes**\n\n"
             + "\n".join(f"- `{p}` — {d}" for p, d in PREFIX_GLOSSARY)
             + "\n\n**Feature column suffixes** — `_Nd` = lookback window in "
-              "days before anchor. Lab columns additionally carry an "
-              "aggregate tag: `_last`, `_min`, `_max`, `_mean`, `_n` (count "
-              "of distinct measurement days), `_days_since` (days since the "
-              "most recent measurement).\n\n"
+              "days before anchor (e.g. `_30d`). Lab columns additionally "
+              "carry an aggregate tag: `_last`, `_min`, `_max`, `_mean`, `_n` "
+              "(count of distinct measurement days), `_days_since` (days "
+              "since the most recent measurement).\n\n"
+              "**Admission-anchored extractions** (\"Anchor extraction window "
+              "to encompassing admission\" in the Extract tab) change what "
+              "`_Nd` means: the window is capped at min(N, "
+              "days_since_admission), so it never reaches before "
+              "admission_date. A window of `_36500d` (100 years) means no "
+              "fixed ceiling was configured — the feature just uses the full "
+              "admission-to-anchor span. `_preadm` and `_delta_{agg}` "
+              "columns (see the `labs:` prefix above) only appear when a "
+              "pre-admission baseline window was also configured.\n\n"
               "Full reference: `EHR_FEATURE_EXTRACTION_GUIDE.md`."
         )
 
@@ -1111,7 +1154,12 @@ def main() -> None:  # pragma: no cover
             b_windows_raw = col1.text_input(
                 "Lab windows (days, comma-separated)", value="2, 7, 30, 365",
                 key="b_windows",
-                help="Cumulative lookback windows. '2,30,365' gives 3 window columns per lab.")
+                help="Cumulative lookback windows. '2,30,365' gives 3 window columns per lab. "
+                     "Leave blank ONLY if \"Anchor extraction window to encompassing "
+                     "admission\" below is checked — that uses the full "
+                     "admission-to-anchor span with no fixed ceiling instead. Blank "
+                     "without admission-anchoring is invalid (there'd be nothing to "
+                     "bound the lookback).")
             b_loinc_raw = col2.text_area(
                 "LOINC codes (leave blank = all LOINC)",
                 value="", height=80, key="b_loinc",
@@ -1198,6 +1246,16 @@ def main() -> None:  # pragma: no cover
                  "admission_date and days_since_admission are added to "
                  "metadata.csv for the export.",
         )
+
+        b_windows_empty_ok = b_admission_anchored and b_ft_labs and not b_windows
+        if b_windows_empty_ok:
+            st.caption(
+                "ℹ️ Lab windows left blank — using the full admission-to-anchor "
+                "span only, with no fixed ceiling.")
+        elif b_ft_labs and not b_windows and not b_admission_anchored:
+            st.error(
+                "Lab windows can't be blank unless \"Anchor extraction window "
+                "to encompassing admission\" above is checked.")
 
         b_pre_admission_days = None
         if b_admission_anchored and b_ft_labs:
@@ -1367,6 +1425,10 @@ def main() -> None:  # pragma: no cover
                 st.error(f"measurement.csv not found at {b_measurement}")
             elif not b_feature_types:
                 st.error("Select at least one feature type before running.")
+            elif b_ft_labs and not b_windows and not b_admission_anchored:
+                st.error(
+                    "Fix the lab windows error above before running "
+                    "(blank is only valid with admission-anchored mode).")
             elif st.button("▶ Run extraction", type="primary", key="run_b"):
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 b_spec_path = _cache_spec(b_spec)
