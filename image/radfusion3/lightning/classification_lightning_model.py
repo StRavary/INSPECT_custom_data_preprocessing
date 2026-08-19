@@ -107,6 +107,12 @@ class ClassificationLightningModel(LightningModule):
             logger=True,
         )
 
+        # Local import: avoids a top-level circular import (data.data_module
+        # imports builder, which imports this module's package), and by
+        # call-time here every module has already finished loading anyway.
+        from ..data.dataset_base import DatasetBase
+        DatasetBase.reset_decode_failure_stats()
+
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch, "train")
 
@@ -120,6 +126,27 @@ class ClassificationLightningModel(LightningModule):
     #    return self.shared_epoch_end("train")
 
     def on_train_epoch_end(self):
+        # Covers decode attempts across both this epoch's training AND
+        # validation batches (same shared counters, and val runs nested
+        # inside the epoch before this hook fires when val_check_interval
+        # <= 1.0) -- not split by split, just a single "is anything broken"
+        # signal. See DatasetBase.record_decode_attempt for what this is
+        # tracking and why (silently-corrupted/blank images from failed
+        # image decodes, e.g. a missing pydicom codec plugin).
+        from ..data.dataset_base import DatasetBase
+        attempts, failures = DatasetBase.decode_failure_stats()
+        rate = (failures / attempts) if attempts else 0.0
+        self.log("train/decode_failures", float(failures), on_epoch=True, logger=True)
+        self.log("train/decode_failure_rate", rate, on_epoch=True, logger=True, prog_bar=(failures > 0))
+        if failures:
+            print("=" * 80)
+            print(
+                f"WARNING: {failures}/{attempts} ({rate:.1%}) image reads failed "
+                "to decode this epoch and were replaced with blank/zero images. "
+                "Check codec plugins (pylibjpeg-openjpeg, python-gdcm) and/or "
+                "file corruption -- see the [DECODE FAIL] lines above for paths."
+            )
+            print("=" * 80)
         return self.shared_epoch_end("train")
 
     def on_validation_epoch_end(self):

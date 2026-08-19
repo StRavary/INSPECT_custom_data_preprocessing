@@ -6,6 +6,7 @@ import pandas as pd
 from PIL import Image as _PILImage
 import h5py
 import nibabel as nib
+import multiprocessing
 
 from ..constants import *
 from torch.utils.data import Dataset
@@ -17,6 +18,39 @@ import pickle
 
 
 class DatasetBase(Dataset):
+    # Shared image-decode-failure counters. DataLoader workers (num_workers>0)
+    # are forked processes on Linux; multiprocessing.Value is backed by real
+    # shared memory, so as long as these are created here -- at class-
+    # definition time, in the main process, before any worker fork -- every
+    # forked worker inherits the *same* shared counters rather than a private
+    # copy, and the main process (ClassificationLightningModel) can read them
+    # back. Root cause this was added for: a missing pylibjpeg-openjpeg
+    # codec silently turned every JPEG2000-compressed CT slice into a blank
+    # zero image via the except blocks below, with no visible signal besides
+    # scrolling raw logs -- see decode_failure_stats()/reset_decode_failure_stats().
+    _decode_attempts = multiprocessing.Value("L", 0)
+    _decode_failures = multiprocessing.Value("L", 0)
+
+    @classmethod
+    def record_decode_attempt(cls, failed: bool):
+        with cls._decode_attempts.get_lock():
+            cls._decode_attempts.value += 1
+        if failed:
+            with cls._decode_failures.get_lock():
+                cls._decode_failures.value += 1
+
+    @classmethod
+    def decode_failure_stats(cls):
+        """(attempts, failures) accumulated since the last reset."""
+        return cls._decode_attempts.value, cls._decode_failures.value
+
+    @classmethod
+    def reset_decode_failure_stats(cls):
+        with cls._decode_attempts.get_lock():
+            cls._decode_attempts.value = 0
+        with cls._decode_failures.get_lock():
+            cls._decode_failures.value = 0
+
     def __init__(self, cfg, split="train", transform=None):
         self.cfg = cfg
         self.transform = transform
@@ -112,8 +146,10 @@ class DatasetBase(Dataset):
 
         try:
             pixel_array = dcm.pixel_array
-        except:
-            print(file_path)
+            self.record_decode_attempt(failed=False)
+        except Exception as e:
+            self.record_decode_attempt(failed=True)
+            print(f"[DECODE FAIL] {file_path}: {e}")
             if channels == "repeat":
                 pixel_array = np.zeros((resize_size, resize_size))
             else:
@@ -164,7 +200,9 @@ class DatasetBase(Dataset):
                     # 4D: (H, W, num_slices, T)
                     actual_idx = min(slice_idx, volume.shape[2] - 1)
                     pixel_array = volume[:, :, actual_idx, 0]
+                self.record_decode_attempt(failed=False)
             except Exception as e:
+                self.record_decode_attempt(failed=True)
                 print(f"[WARN] Corrupt or unreadable NIfTI, skipping: {file_path} ({e})")
                 self._nifti_cache_path = None
                 self._nifti_cache_data = None
@@ -189,8 +227,10 @@ class DatasetBase(Dataset):
                     intercept = 0
                     slope = 1
                 pixel_array = pixel_array * slope + intercept
-            except:
-                print(f"Error reading {file_path}")
+                self.record_decode_attempt(failed=False)
+            except Exception as e:
+                self.record_decode_attempt(failed=True)
+                print(f"[DECODE FAIL] {file_path}: {e}")
                 if channels == "repeat":
                     pixel_array = np.zeros((resize_size, resize_size))
                 else:
