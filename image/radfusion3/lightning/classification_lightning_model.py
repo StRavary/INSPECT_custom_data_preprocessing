@@ -94,6 +94,19 @@ class ClassificationLightningModel(LightningModule):
             )
             print("=" * 80)
 
+        # Step-function scalar for TensorBoard: 1.0 while the backbone is
+        # frozen, 0.0 once unfrozen (or always 0.0 if freezing isn't in use
+        # -- freeze_backbone_epochs=0 on every current run_classify_*.sh
+        # target). Logged unconditionally so every run in a sweep, frozen or
+        # not, lands on the same chart for direct comparison.
+        self.log(
+            "train/backbone_frozen",
+            float(self._backbone_frozen),
+            on_epoch=True,
+            on_step=False,
+            logger=True,
+        )
+
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch, "train")
 
