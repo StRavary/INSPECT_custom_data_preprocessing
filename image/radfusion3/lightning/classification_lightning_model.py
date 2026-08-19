@@ -107,6 +107,11 @@ class ClassificationLightningModel(LightningModule):
             logger=True,
         )
 
+        # Zero the decode-attempt/failure counters at the start of each
+        # epoch so on_train_epoch_end's train/decode_failures and
+        # train/decode_failure_rate reflect that epoch specifically,
+        # rather than accumulating across the whole run.
+        #
         # Local import: avoids a top-level circular import (data.data_module
         # imports builder, which imports this module's package), and by
         # call-time here every module has already finished loading anyway.
