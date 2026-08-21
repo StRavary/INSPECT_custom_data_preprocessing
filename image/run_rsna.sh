@@ -45,17 +45,44 @@
 # train keeps climbing while val still declines post-unfreeze, that
 # confirms backbone overfitting rather than an LR/precision/scheduler bug.
 #
+# Third fine-tune (2026-08-19 to 2026-08-21): run_rsna_sweep.sh screened 9
+# combinations of freeze_backbone_epochs / backbone_lr_mult / dropout_prob /
+# weighted_sample at a reduced max_epochs=10 (see build_sweep_table.py for
+# the ranked results). Findings:
+#   - backbone_lr_mult is the load-bearing lever, not freezing -- the two
+#     clearly worst runs (no_lr_multi, no_freeze_no_lr_mult) both had
+#     backbone_lr_mult=1.0 regardless of freeze setting.
+#   - dropout_prob (0.3 vs 0.5) and weighted_sample (true vs false) made no
+#     measurable difference -- 6 of 9 configs converged to within 0.001
+#     val/mean_auroc of each other despite varying these independently, the
+#     signature of an intrinsic ceiling rather than more signal to chase.
+#   - Winner: aggressive_lr_lowering (freeze=2, backbone_lr_mult=0.03,
+#     dropout=0.3, weighted=true), val/mean_auroc=0.937 -- tied with
+#     unfrozen_bb_but_dropout (freeze=0), but that run's identical peak was
+#     at epoch 0 (declined every epoch after, the same failure signature
+#     freezing/lr_mult were built to fix), while aggressive_lr_lowering's
+#     peak was at epoch 3 -- genuine multi-epoch improvement, not a lucky
+#     first pass. Picked on that basis over the raw tie.
+# This run uses that winning config at full length (max_epochs=30, not the
+# sweep's screening length) to produce the actual checkpoint for
+# resnetv2_ct.yaml -- copy its best val AUROC checkpoint there when done.
+#
 # Other backbones tried previously (kept for reference):
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=swinv2 dataset=rsna
 #CUDA_VISIBLE_DEVICES=1 python run_classify.py model=dinov2 dataset=rsna dataset.transform.final_size=224
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnext_101_ct_pretrain dataset=rsna dataset.transform.final_size=224 dataset.batch_size=256 trainer.accumulate_grad_batches=1 lr=0.0005
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2 dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4 lr=0.0005
 #CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4 lr=0.0005
+#CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset=rsna dataset.transform.final_size=224 dataset.batch_size=64 trainer.accumulate_grad_batches=4 lr=0.00003 trainer.freeze_backbone_epochs=2 backbone_lr_mult=0.1
 
 CUDA_VISIBLE_DEVICES=0 python run_classify.py model=resnetv2_ct_pretrain dataset=rsna \
+    exp.name=rsna_final_aggressive_lr_lowering \
     dataset.transform.final_size=224 \
     dataset.batch_size=64 \
+    dataset.weighted_sample=true \
     trainer.accumulate_grad_batches=4 \
-    lr=0.00003 \
+    trainer.max_epochs=30 \
+    lr=0.0005 \
     trainer.freeze_backbone_epochs=2 \
-    backbone_lr_mult=0.1
+    backbone_lr_mult=0.03 \
+    model.dropout_prob=0.3
