@@ -7,8 +7,8 @@ import h5py
 import tqdm
 import os
 
-SRC = "/data/processed/INSPECT/CNN_embeddings/features.hdf5"
-DST = "/data/processed/INSPECT/CNN_embeddings/features_resnetv2_ct_uncompressed.hdf5"
+SRC = "/data/processed/INSPECT/CNN_embeddings/aggressive_lr_lowering/features.hdf5"
+DST = "/data/processed/INSPECT/CNN_embeddings/aggressive_lr_lowering/features_uncompressed.hdf5"
 
 print(f"Source: {SRC}")
 print(f"Destination: {DST}")

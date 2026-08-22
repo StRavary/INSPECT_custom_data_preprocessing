@@ -4,8 +4,15 @@ pretrain_type: supervised
 num_class: 1
 # RSPECT (RSNA PE) fine-tune of resnetv2_ct_pretrain.yaml's official
 # StanfordShahLab/resnetv2_ct checkpoint, with the corrected channels=window
-# (3 distinct windows, not repeated PE window) — run 2026-08-10_21:25:26.
-# Best val/mean_auroc (0.931) was at epoch 0 and never improved afterward
-# (save_top_k=1 kept only that checkpoint), so this is only ~1 epoch of
-# fine-tuning past the base HF checkpoint.
-checkpoint_path: "/data/processed/INSPECT/checkpoints/classify_pe_present_on_image_2026-08-10_21:25:26/epoch=0-val/mean_auroc=0.931.ckpt"
+# (3 distinct windows, not repeated PE window). Superseded the earlier
+# 2026-08-10 epoch=0 checkpoint (only ~1 epoch of real fine-tuning) with the
+# winner of the run_rsna_sweep.sh hyperparameter sweep (freeze_backbone_
+# epochs=2, backbone_lr_mult=0.03, dropout_prob=0.3, weighted_sample=true --
+# see run_rsna.sh and build_sweep_table.py for the full comparison), run at
+# full length (max_epochs=30) via run_rsna.sh's
+# rsna_final_aggressive_lr_lowering run — 2026-08-21_12:21:43. Best
+# checkpoint landed at epoch 3 (val/mean_auroc=0.937), matching the 10-epoch
+# screening sweep's finding exactly; the remaining 27 epochs found nothing
+# better. test/mean_auroc=0.930, test/mean_auprc=0.761 on held-out RSPECT
+# test data.
+checkpoint_path: "/data/processed/INSPECT/checkpoints/rsna_final_aggressive_lr_lowering_pe_present_on_image_2026-08-21_12:21:43/epoch=3-val/mean_auroc=0.937.ckpt"
