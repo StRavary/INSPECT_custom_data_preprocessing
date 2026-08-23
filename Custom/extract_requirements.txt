@@ -11,4 +11,7 @@ duckdb>=0.8.0
 # ── Numerical / tabular ──────────────────────────────────────────────────────
 numpy>=1.24.0
 pandas>=2.0.0
-scipy>=1.10.0          # scipy.sparse used for Route A sparse matrix handling
+scipy>=1.10.0          # scipy.sparse — imported in appd_route_b_labs.append_demographics
+
+# ── Timeline viewer (Tab 5) ───────────────────────────────────────────────────
+plotly>=5.18.0          # multi-lane zoomable timeline plots

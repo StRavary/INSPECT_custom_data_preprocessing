@@ -227,6 +227,72 @@ def _render_glossary(st, key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Timeline viewer (Tab 5) — figure builder
+# ---------------------------------------------------------------------------
+
+def _build_timeline_figure(events_df: "pd.DataFrame", anchor_time, title: str = ""):
+    """Multi-lane (one row per clinical panel) Plotly timeline for a single
+    study's events.
+
+    events_df needs columns: event_datetime (datetime64), panel (str),
+    optionally event_type / concept_name for the hover tooltip. Marks T0
+    (anchor_time) with a vertical line and gives the x-axis native
+    hour/day/week/month/year zoom via Plotly's range selector — "week" isn't
+    a native Plotly step type, so it's approximated as 7 days. Because the
+    data only spans [anchor − window, anchor] (see query_events_stack), T0
+    sits at the data's right edge, which is exactly where Plotly's
+    stepmode="backward" buttons zoom from — no extra alignment needed.
+    """
+    import plotly.graph_objects as go
+    import pandas as pd
+
+    fig = go.Figure()
+    panels = sorted(events_df["panel"].unique()) if len(events_df) else []
+    concept_name = events_df.get("concept_name", pd.Series([""] * len(events_df)))
+    event_type   = events_df.get("event_type",   pd.Series([""] * len(events_df)))
+
+    for panel in panels:
+        mask = events_df["panel"] == panel
+        sub  = events_df[mask]
+        fig.add_trace(go.Scatter(
+            x=sub["event_datetime"],
+            y=[panel] * len(sub),
+            mode="markers",
+            name=panel,
+            marker=dict(size=9),
+            text=concept_name[mask] if hasattr(concept_name, "__getitem__") else None,
+            customdata=event_type[mask] if hasattr(event_type, "__getitem__") else None,
+            hovertemplate="<b>%{text}</b><br>%{x}<br>type: %{customdata}<extra></extra>",
+        ))
+
+    if anchor_time is not None:
+        fig.add_vline(x=pd.Timestamp(anchor_time), line_dash="dash",
+                      line_color="crimson",
+                      annotation_text="T0 (CTPA)", annotation_position="top")
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(
+            type="date",
+            rangeselector=dict(buttons=[
+                dict(count=1, label="1h", step="hour",  stepmode="backward"),
+                dict(count=1, label="1d", step="day",   stepmode="backward"),
+                dict(count=7, label="1w", step="day",   stepmode="backward"),
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=1, label="1y", step="year",  stepmode="backward"),
+                dict(step="all", label="All"),
+            ]),
+            rangeslider=dict(visible=True),
+        ),
+        yaxis=dict(categoryorder="array", categoryarray=panels[::-1]),
+        height=max(320, 45 * max(len(panels), 1)),
+        showlegend=False,
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -418,6 +484,19 @@ def _load_concept_id_map_cached(concept_csv: str, st):
     @st.cache_resource(show_spinner="Loading concept ID map …")
     def _load(path: str):
         return load_concept_id_map(path)
+
+    return _load(concept_csv)
+
+
+def _load_concept_vocab_map_cached(concept_csv: str, st):
+    """Streamlit-cached wrapper around route_b_labs.load_concept_vocab_code_map —
+    {concept_id: (vocabulary_id, concept_code)}, used for clinical-panel
+    assignment in the Timeline viewer (Tab 5)."""
+    from Custom.appd_route_b_labs import load_concept_vocab_code_map
+
+    @st.cache_resource(show_spinner="Loading concept vocabulary map …")
+    def _load(path: str):
+        return load_concept_vocab_code_map(path)
 
     return _load(concept_csv)
 
@@ -985,12 +1064,13 @@ def main() -> None:  # pragma: no cover
         "explore per-impression event histories, and export flat arrays for modelling. "
         "See EHR_FEATURE_EXTRACTION_GUIDE.md for column definitions.")
 
-    tab_load, tab_src, tab_b, tab_desc, tab_exp = st.tabs([
+    tab_load, tab_src, tab_b, tab_desc, tab_exp, tab_timeline = st.tabs([
         "0 · Load",
         "1 · Data sources",
         "2 · Extract",
         "3 · Describe",
         "4 · Export",
+        "5 · Timeline",
     ])
 
     # ── 0 · Load ────────────────────────────────────────────────────────────
@@ -2040,6 +2120,215 @@ def main() -> None:  # pragma: no cover
                         )
                     st.success(f"✅ Wrote {n_events:,} rows to:")
                     st.code(tl_stream_path)
+
+    # ── 5 · Timeline ──────────────────────────────────────────────────────
+    with tab_timeline:
+        st.subheader("EHR Timeline Viewer")
+        st.caption(
+            "Every clinical sub-modality on its own lane, zoomable by "
+            "hour / day / week / month / year via the buttons above each "
+            "plot. The dashed red line is **T0** — the CTPA study time, "
+            "the same anchor used everywhere else in this app. "
+            "Identifiers, clinical panel, and timing only — no measured "
+            "values or task labels are plotted or exported here."
+        )
+
+        try:
+            import plotly.graph_objects as _go_check  # noqa: F401
+            _has_plotly = True
+        except ImportError:
+            _has_plotly = False
+            st.error(
+                "This viewer needs `plotly` — `pip install plotly` "
+                "(already listed in `extract_requirements.txt`) and "
+                "restart the app."
+            )
+
+        if _has_plotly:
+            # ── Live, per-study ──────────────────────────────────────────
+            st.markdown("### Live viewer")
+            st.caption(
+                "Pick one or more studies from the currently loaded "
+                "extraction to render, each as its own figure — different "
+                "patients have different T0s, so overlaying them on one "
+                "shared calendar axis wouldn't align meaningfully. Queries "
+                "the raw OMOP CSVs live via DuckDB, same mechanism as Tab "
+                "3's event history viewer.")
+
+            fm = st.session_state.get("fm")
+            if fm is None:
+                st.info(
+                    "Load an extraction first (Tab 0 · Load) to pick "
+                    "studies here — or use the batch export below, which "
+                    "only needs Data sources configured.")
+            else:
+                import pandas as pd
+
+                omop_dir    = st.session_state.get(
+                    "path_omop", str(DATA_SOURCES["omop"][2]))
+                concept_csv = str(Path(omop_dir) / "concept.csv")
+
+                imp_to_info = {
+                    str(imp): (int(pid), anchor)
+                    for imp, pid, anchor in zip(
+                        fm.impression_ids, fm.patient_ids, fm.anchor_times)
+                }
+                imp_options = list(fm.impression_ids.astype(str))
+
+                tl5_sel = st.multiselect(
+                    "Studies to view (impression_id)", options=imp_options,
+                    default=imp_options[:1], max_selections=5,
+                    key="tl5_live_sel",
+                )
+                col_w, col_t = st.columns(2)
+                tl5_window = col_w.number_input(
+                    "Days before anchor", min_value=1, value=365, step=30,
+                    key="tl5_live_window",
+                    help="Events between anchor−N days and anchor are shown.")
+                tl5_tables = col_t.multiselect(
+                    "Event tables",
+                    ["measurement", "condition_occurrence", "drug_exposure",
+                     "procedure_occurrence", "observation", "visit_occurrence"],
+                    default=["measurement", "condition_occurrence", "drug_exposure",
+                             "procedure_occurrence", "observation", "visit_occurrence"],
+                    key="tl5_live_tables",
+                )
+
+                if st.button("🔍 Render timeline", type="primary",
+                             key="tl5_live_render",
+                             disabled=not tl5_sel or not tl5_tables):
+                    from Custom.appd_route_b_labs import query_events_stack
+                    from Custom.appd_clinical_panels import assign_panel, normalize_event_type
+
+                    concept_id_map = (
+                        _load_concept_id_map_cached(concept_csv, st)
+                        if Path(concept_csv).exists() else {}
+                    )
+                    vocab_map = (
+                        _load_concept_vocab_map_cached(concept_csv, st)
+                        if Path(concept_csv).exists() else {}
+                    )
+
+                    with st.spinner(f"Querying {len(tl5_sel)} study/studies …"):
+                        try:
+                            ev_df = query_events_stack(
+                                omop_dir=omop_dir,
+                                selected_impressions=tl5_sel,
+                                imp_to_info=imp_to_info,
+                                window_days=tl5_window,
+                                tables=tl5_tables,
+                                concept_id_map=concept_id_map,
+                            )
+                        except Exception as e:
+                            st.error(f"DuckDB query failed: {e}")
+                            ev_df = None
+
+                    if ev_df is not None and not ev_df.empty:
+                        ev_df = ev_df.copy()
+                        ev_df["event_datetime"] = pd.to_datetime(ev_df["event_datetime"])
+                        # Normalize source_table ("measurement", "condition", …)
+                        # to the same event_type vocabulary ("lab", "diagnosis",
+                        # …) the batch skeleton export uses, so the "Other
+                        # <type>" panel fallback agrees regardless of which
+                        # path produced the row.
+                        ev_df["event_type"] = ev_df["source_table"].map(normalize_event_type)
+                        ev_df["panel"] = [
+                            assign_panel(*vocab_map.get(cid, ("", "")), et)
+                            for cid, et in zip(ev_df["concept_id"], ev_df["event_type"])
+                        ]
+                        st.session_state["tl5_live_df"]          = ev_df
+                        st.session_state["tl5_live_imp_to_info"] = imp_to_info
+                    elif ev_df is not None:
+                        st.info("No events found for the selected studies and window.")
+                        st.session_state.pop("tl5_live_df", None)
+
+                tl5_ev_df = st.session_state.get("tl5_live_df")
+                if tl5_ev_df is not None:
+                    tl5_imp_to_info = st.session_state.get(
+                        "tl5_live_imp_to_info", imp_to_info)
+                    for imp in tl5_sel:
+                        sub = tl5_ev_df[tl5_ev_df["impression_id"] == imp]
+                        if sub.empty:
+                            continue
+                        info   = tl5_imp_to_info.get(imp)
+                        anchor = info[1] if info else None
+                        fig = _build_timeline_figure(
+                            sub, anchor_time=anchor, title=f"{imp}  ·  T0 = {anchor}")
+                        st.plotly_chart(fig, use_container_width=True, key=f"tl5_fig_{imp}")
+
+            st.markdown("---")
+
+            # ── Batch, cohort-wide, de-identified ───────────────────────────
+            st.markdown("### Batch export — full cohort, de-identified")
+            st.caption(
+                "Writes one CSV covering every study in the currently "
+                "loaded extraction: `impression_id`, `patient_id`, "
+                "`anchor_time`, `panel`, `event_type`, `vocabulary`, "
+                "`concept_code`, `concept_name`, `event_datetime`, "
+                "`event_date`, `days_before_ctpa`. No measured values, no "
+                "task label — identifiers, clinical panel, and timing "
+                "only, suitable for an external timeline viewer (e.g. "
+                "MEDprofiles) or bulk analysis without exposing clinical "
+                "values. Same DuckDB streaming mechanism as the Export "
+                "tab's event timeline CSV, so the same size/memory "
+                "guidance applies."
+            )
+
+            fm = st.session_state.get("fm")
+            if fm is None:
+                st.info(
+                    "Load an extraction first (Tab 0 · Load) — the batch "
+                    "export needs feature_types/windows from a loaded "
+                    "extraction, same as the Export tab's event timeline CSV.")
+            else:
+                omop_dir    = st.session_state.get(
+                    "path_omop", str(DATA_SOURCES["omop"][2]))
+                concept_csv = str(Path(omop_dir) / "concept.csv")
+                _ft5 = getattr(fm, "feature_types", None) or []
+
+                if not _ft5:
+                    st.warning(
+                        "Feature types not stored in this extraction (older "
+                        "pkl). Re-run the extraction to enable this export.")
+                else:
+                    fm_hash5     = st.session_state.get("fm_hash")
+                    default_dir5 = (DATA_ROOT / "DATA_PROCESSED" / "exports" / fm.task
+                                    / _export_subdir(fm, fm_hash5))
+                    sk_stream_path = st.text_input(
+                        "Output CSV path",
+                        value=str(default_dir5 / f"{fm.task}_timeline_skeleton.csv"),
+                        key="sk_stream_path",
+                    )
+                    sk_memory_limit_gb = st.number_input(
+                        "DuckDB memory limit (GB)",
+                        min_value=1.0, max_value=64.0, value=4.0, step=1.0,
+                        key="sk_memory_limit_gb",
+                        help="Same purpose as the equivalent field in the Export "
+                             "tab's event timeline CSV section — how much RAM "
+                             "DuckDB is allowed before it spills to disk.",
+                    )
+                    if st.button("💾 Stream de-identified timeline to disk",
+                                 type="primary", key="sk_stream_build"):
+                        from Custom.appd_route_b_labs import build_timeline_skeleton_streamed
+                        _omop_dir        = Path(omop_dir)
+                        _measurement_csv = _omop_dir / "measurement.csv"
+                        _concept_csv     = Path(concept_csv)
+                        with st.spinner(
+                            "Querying and writing via DuckDB … this can "
+                            "take several minutes for a wide window over a "
+                            "large cohort."
+                        ):
+                            n_rows = build_timeline_skeleton_streamed(
+                                fm=fm,
+                                omop_dir=_omop_dir,
+                                measurement_path=_measurement_csv,
+                                concept_path=_concept_csv,
+                                out_path=sk_stream_path,
+                                memory_limit_gb=float(sk_memory_limit_gb),
+                                verbose=True,
+                            )
+                        st.success(f"✅ Wrote {n_rows:,} rows to:")
+                        st.code(sk_stream_path)
 
 
 if __name__ == "__main__":  # pragma: no cover

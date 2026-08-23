@@ -183,6 +183,31 @@ def load_concept_id_map(concept_csv) -> dict:
         return lookup
 
 
+def load_concept_vocab_code_map(concept_csv) -> dict:
+    """Build {concept_id (str): (vocabulary_id, concept_code)} from concept.csv.
+
+    Separate from load_concept_id_map (which resolves concept_id -> a
+    display name) because the timeline viewer's clinical-panel assignment
+    (appd_clinical_panels.assign_panel) needs the (vocabulary, code) pair,
+    not the name — e.g. ('LOINC', '2160-0'), not 'Creatinine'.
+    """
+    p = Path(concept_csv)
+    try:
+        import pandas as pd
+        df = pd.read_csv(p, usecols=["concept_id", "vocabulary_id", "concept_code"],
+                         dtype=str, low_memory=False)
+        return {
+            cid: (vocab, code)
+            for cid, vocab, code in zip(df["concept_id"], df["vocabulary_id"], df["concept_code"])
+        }
+    except ImportError:
+        lookup: dict = {}
+        with open(p, newline="") as f:
+            for row in csv.DictReader(f):
+                lookup[row["concept_id"]] = (row["vocabulary_id"], row["concept_code"])
+        return lookup
+
+
 def _readable_window(window_str: str) -> str:
     m = _re.match(r"_(\d+) days", window_str)
     if not m:
@@ -259,40 +284,46 @@ def humanize_column(col: str, concept_map: dict) -> str:
 
 _EVENT_TABLES = {
     "measurement": {
-        "date_col":    "measurement_date",
-        "concept_col": "measurement_concept_id",
-        "value_col":   "value_as_number",
-        "label":       "measurement",
+        "date_col":     "measurement_date",
+        "datetime_col": "measurement_datetime",
+        "concept_col":  "measurement_concept_id",
+        "value_col":    "value_as_number",
+        "label":        "measurement",
     },
     "condition_occurrence": {
-        "date_col":    "condition_start_date",
-        "concept_col": "condition_concept_id",
-        "value_col":   None,
-        "label":       "condition",
+        "date_col":     "condition_start_date",
+        "datetime_col": "condition_start_datetime",
+        "concept_col":  "condition_concept_id",
+        "value_col":    None,
+        "label":        "condition",
     },
     "drug_exposure": {
-        "date_col":    "drug_exposure_start_date",
-        "concept_col": "drug_concept_id",
-        "value_col":   None,
-        "label":       "drug",
+        "date_col":     "drug_exposure_start_date",
+        "datetime_col": "drug_exposure_start_datetime",
+        "concept_col":  "drug_concept_id",
+        "value_col":    None,
+        "label":        "drug",
     },
     "procedure_occurrence": {
-        "date_col":    "procedure_date",
-        "concept_col": "procedure_concept_id",
-        "value_col":   None,
-        "label":       "procedure",
+        "date_col":     "procedure_date",
+        "datetime_col": "procedure_datetime",
+        "concept_col":  "procedure_concept_id",
+        "value_col":    None,
+        "label":        "procedure",
     },
     "observation": {
-        "date_col":    "observation_date",
-        "concept_col": "observation_concept_id",
-        "value_col":   "value_as_number",
-        "label":       "observation",
+        "date_col":     "observation_date",
+        "datetime_col": "observation_datetime",
+        "concept_col":  "observation_concept_id",
+        "value_col":    "value_as_number",
+        "label":        "observation",
     },
     "visit_occurrence": {
-        "date_col":    "visit_start_date",
-        "concept_col": "visit_concept_id",
-        "value_col":   None,
-        "label":       "visit",
+        "date_col":     "visit_start_date",
+        "datetime_col": "visit_start_datetime",
+        "concept_col":  "visit_concept_id",
+        "value_col":    None,
+        "label":        "visit",
     },
 }
 
@@ -386,10 +417,11 @@ def query_events_stack(
                        datetime.datetime.fromisoformat(str(anchor)).date())
         anchor_rows.append((str(imp), int(pid), str(anchor_date)))
 
+    out_cols = ["impression_id", "event_date", "event_datetime", "days_before_anchor",
+                "source_table", "concept_id", "concept_name", "value"]
+
     if not anchor_rows:
-        return pd.DataFrame(columns=[
-            "impression_id", "event_date", "days_before_anchor",
-            "source_table", "concept_id", "concept_name", "value"])
+        return pd.DataFrame(columns=out_cols)
 
     con = duckdb.connect()
     con.execute("""
@@ -409,15 +441,22 @@ def query_events_stack(
         csv_path = omop_dir / f"{tbl}.csv"
         if not csv_path.exists():
             continue
-        date_col    = meta["date_col"]
-        concept_col = meta["concept_col"]
-        value_expr  = (f"CAST(t.{meta['value_col']} AS VARCHAR)"
-                       if meta["value_col"] else "NULL")
-        label       = meta["label"]
+        date_col     = meta["date_col"]
+        datetime_col = meta["datetime_col"]
+        concept_col  = meta["concept_col"]
+        value_expr   = (f"CAST(t.{meta['value_col']} AS VARCHAR)"
+                        if meta["value_col"] else "NULL")
+        label        = meta["label"]
         parts.append(f"""
             SELECT
                 a.impression_id,
                 CAST(t.{date_col} AS VARCHAR)                      AS event_date,
+                CAST(
+                    COALESCE(
+                        TRY_CAST(t.{datetime_col} AS TIMESTAMP),
+                        TRY_CAST(t.{date_col}     AS TIMESTAMP)
+                    ) AS VARCHAR
+                )                                                  AS event_datetime,
                 DATEDIFF('day', CAST(t.{date_col} AS DATE),
                          a.anchor_date)                            AS days_before_anchor,
                 '{label}'                                          AS source_table,
@@ -432,9 +471,7 @@ def query_events_stack(
 
     if not parts:
         con.close()
-        return pd.DataFrame(columns=[
-            "impression_id", "event_date", "days_before_anchor",
-            "source_table", "concept_id", "concept_name", "value"])
+        return pd.DataFrame(columns=out_cols)
 
     union_sql = " UNION ALL ".join(parts)
     df = con.execute(
@@ -443,9 +480,7 @@ def query_events_stack(
     con.close()
 
     df["concept_name"] = df["concept_id"].map(concept_id_map).fillna("")
-    col_order = ["impression_id", "event_date", "days_before_anchor",
-                 "source_table", "concept_id", "concept_name", "value"]
-    return df[col_order]
+    return df[out_cols]
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1210,219 @@ def build_event_timeline_streamed(
         n_rows = sum(1 for _ in f) - 1   # minus header
     n_rows = max(n_rows, 0)
     _log(f"[timeline] {n_rows:,} rows written")
+    return n_rows
+
+
+def build_timeline_skeleton_streamed(
+    fm: "LabFeatureMatrix",
+    omop_dir: "Path",
+    measurement_path: "Path",
+    concept_path: "Path",
+    out_path,
+    loinc_codes: Optional[list] = None,
+    memory_limit_gb: float = 4.0,
+    verbose: bool = True,
+) -> int:
+    """Cohort-wide, de-identified timeline export for the EHR timeline viewer
+    (Tab 5) — identifiers, clinical panel/feature, and timing only. No
+    measured values, no task label.
+
+    Same query shape as build_event_timeline_streamed, with two differences:
+
+    1. Every event additionally gets a `panel` column — a clinical grouping
+       (e.g. "Renal function", "Anticoagulants") assigned via a LEFT JOIN
+       against appd_clinical_panels.panel_lookup_rows(), not a Python pass
+       over the rows (which would reintroduce exactly the memory problem
+       this module spent a lot of this session getting rid of). Anything
+       not in that curated taxonomy still appears, tagged "Other <type>" —
+       nothing is silently dropped for lacking a panel.
+    2. `value` and `y` are never selected — this artifact is deliberately
+       data-minimized to (impression_id, patient_id, anchor_time, panel,
+       feature identity, timing) only, suitable for a de-identified
+       multi-lane timeline view, not for modelling (use
+       build_event_timeline_streamed for that).
+
+    Same memory-safety measures as build_event_timeline_streamed apply here
+    for the same reasons: on-disk temp DuckDB file, capped `memory_limit_gb`,
+    no ``ORDER BY`` (rows come out grouped by feature type, not globally
+    sorted — sort after loading if you need chronological order).
+
+    Parameters
+    ----------
+    fm, omop_dir, measurement_path, concept_path, loinc_codes,
+    memory_limit_gb, verbose : see build_event_timeline_streamed
+    out_path : destination CSV path (parent directory created if needed)
+
+    Returns
+    -------
+    int : total number of rows written.
+    """
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    try:
+        import duckdb
+    except ImportError:
+        raise ImportError("pip install duckdb")
+    import pandas as pd
+    import tempfile
+    from Custom.appd_clinical_panels import panel_lookup_rows
+
+    feature_types     = list(getattr(fm, "feature_types", None) or [])
+    count_window_days = dict(getattr(fm, "count_window_days", None) or {})
+    windows_days      = list(fm.windows_days) if fm.windows_days else [365]
+
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+    })
+
+    tmp_db = Path(tempfile.mktemp(suffix="_timeline_skeleton.duckdb"))
+    con = duckdb.connect(str(tmp_db))
+    con.execute("PRAGMA threads=4")
+    con.execute(f"PRAGMA memory_limit='{memory_limit_gb}GB'")
+    con.register("anchors_tbl", anchors_df)
+
+    _log("[skeleton] loading concept.csv …")
+    con.execute(f"""
+        CREATE TEMP TABLE _concept AS
+        SELECT
+            CAST(concept_id AS BIGINT) AS concept_id,
+            vocabulary_id,
+            concept_code,
+            concept_name
+        FROM read_csv_auto('{concept_path}', ignore_errors=true)
+        WHERE concept_id IS NOT NULL
+    """)
+
+    _log("[skeleton] loading clinical panel taxonomy …")
+    panel_df = pd.DataFrame(
+        panel_lookup_rows(), columns=["vocabulary_id", "concept_code", "panel"])
+    con.register("_panels", panel_df)
+
+    parts_sql: list = []
+    params: list = []
+
+    # ── Labs ────────────────────────────────────────────────────────────────
+    if "labs" in feature_types:
+        max_window = max(windows_days)
+        loinc_filter = ""
+        if loinc_codes:
+            loinc_filter = f"AND c.concept_code IN ({', '.join('?' * len(loinc_codes))})"
+            params.extend(loinc_codes)
+        _log(f"[skeleton] labs: scanning measurement.csv (window={max_window} d) …")
+        parts_sql.append(f"""
+            SELECT
+                a.impression_id,
+                a.person_id                                                              AS patient_id,
+                a.anchor_time,
+                COALESCE(p.panel, 'Other lab')                                            AS panel,
+                'lab'                                                                     AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.measurement_datetime AS TIMESTAMP),
+                    CAST(t.measurement_date AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.measurement_date AS DATE)                                          AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa
+            FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.measurement_concept_id AS BIGINT) = c.concept_id
+            LEFT  JOIN _panels p
+                    ON p.vocabulary_id = c.vocabulary_id AND p.concept_code = c.concept_code
+            WHERE t.measurement_date IS NOT NULL
+              AND CAST(t.measurement_concept_id AS BIGINT) != 0
+              {loinc_filter}
+              AND DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {max_window}
+        """)
+
+    # ── Count feature types ──────────────────────────────────────────────────
+    for ft, (tbl, date_col, datetime_col, concept_col, label, _value_expr) in _TIMELINE_TABLE_CONFIG.items():
+        if ft not in feature_types:
+            continue
+        csv_path = Path(omop_dir) / f"{tbl}.csv"
+        if not csv_path.exists():
+            _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
+            continue
+        window_days = count_window_days.get(ft, 365)
+        _log(f"[skeleton] {ft}: scanning {tbl}.csv (window={window_days} d) …")
+        parts_sql.append(f"""
+            SELECT
+                a.impression_id,
+                a.person_id                                                              AS patient_id,
+                a.anchor_time,
+                COALESCE(p.panel, 'Other {label}')                                        AS panel,
+                '{label}'                                                                 AS event_type,
+                COALESCE(c.vocabulary_id, 'Unknown')                                      AS vocabulary,
+                COALESCE(c.concept_code,  '')                                             AS concept_code,
+                COALESCE(c.concept_name,  '')                                             AS concept_name,
+                COALESCE(
+                    TRY_CAST(t.{datetime_col} AS TIMESTAMP),
+                    CAST(t.{date_col} AS TIMESTAMP)
+                )                                                                         AS event_datetime,
+                CAST(t.{date_col} AS DATE)                                                AS event_date,
+                -DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE))                      AS days_before_ctpa
+            FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+            INNER JOIN anchors_tbl a
+                    ON CAST(t.person_id AS BIGINT) = a.person_id
+            LEFT  JOIN _concept c
+                    ON CAST(t.{concept_col} AS BIGINT) = c.concept_id
+            LEFT  JOIN _panels p
+                    ON p.vocabulary_id = c.vocabulary_id AND p.concept_code = c.concept_code
+            WHERE t.{date_col} IS NOT NULL
+              AND CAST(t.{concept_col} AS BIGINT) != 0
+              AND DATEDIFF('day',
+                    CAST(t.{date_col} AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                  ) BETWEEN 1 AND {window_days}
+        """)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if not parts_sql:
+            out_path.write_text(
+                "impression_id,patient_id,anchor_time,panel,event_type,vocabulary,"
+                "concept_code,concept_name,event_datetime,event_date,"
+                "days_before_ctpa\n"
+            )
+            return 0
+
+        union_sql = "\nUNION ALL\n".join(parts_sql)
+        _log(f"[skeleton] writing directly to {out_path} …")
+        escaped_out = str(out_path).replace("'", "''")
+        # No ORDER BY, deliberately — same reasoning as build_event_timeline_streamed.
+        con.execute(f"""
+            COPY (
+                {union_sql}
+            ) TO '{escaped_out}' (HEADER, DELIMITER ',')
+        """, params)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        if tmp_db.exists():
+            tmp_db.unlink(missing_ok=True)
+
+    with open(out_path, "rb") as f:
+        n_rows = sum(1 for _ in f) - 1
+    n_rows = max(n_rows, 0)
+    _log(f"[skeleton] {n_rows:,} rows written")
     return n_rows
 
 
