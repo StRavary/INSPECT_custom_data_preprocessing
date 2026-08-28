@@ -10,11 +10,19 @@ published Image-modality (CT-only) AUROCs from the INSPECT paper.
 
 import glob
 import os
+import sys
 
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 CHECKPOINT_DIR = "/data/processed/INSPECT/checkpoints"
+# Output is always written here too (in addition to stdout) -- this table
+# has repeatedly appeared to be "missing" its last row (PH 12m) when read
+# straight off a terminal, confirmed to be a scrollback/copy artifact, not
+# a bug in this script (every target always gets a row; verified earlier by
+# redirecting to a file). Writing to a real file every run removes any
+# dependency on catching the full terminal output.
+OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auroc_table.txt")
 
 # (display name, dataset.target string used in run_classify_*.sh, published CT-only AUROC)
 TARGETS = [
@@ -57,13 +65,18 @@ def main():
         diff = auroc - published
         rows.append((name, published, auroc, run_dir, f"{diff:+.3f}"))
 
-    print(f"{'Target':<18}{'Published':>10}{'Ours':>10}{'Diff':>10}   Run dir")
-    print("-" * 110)
+    lines = [f"{'Target':<18}{'Published':>10}{'Ours':>10}{'Diff':>10}   Run dir", "-" * 110]
     for name, published, auroc, run_dir, note in rows:
         auroc_str = f"{auroc:.3f}" if auroc is not None else "N/A"
         diff_str = note if auroc is not None else ""
         run_dir_str = run_dir if run_dir else note
-        print(f"{name:<18}{published:>10.3f}{auroc_str:>10}{diff_str:>10}   {run_dir_str}")
+        lines.append(f"{name:<18}{published:>10.3f}{auroc_str:>10}{diff_str:>10}   {run_dir_str}")
+
+    output = "\n".join(lines)
+    print(output)
+    with open(OUTPUT_PATH, "w") as f:
+        f.write(output + "\n")
+    print(f"\n({len(rows)} rows -- also written to {OUTPUT_PATH})", file=sys.stderr)
 
 
 if __name__ == "__main__":
