@@ -1,6 +1,6 @@
 # Requirements for app_feature_extraction.py and its appd_ dependencies
 # Install with:
-#   pip install -r extract_requirements.txt
+#   pip install -r appd_extract_requirements.txt
 
 # ── UI framework ─────────────────────────────────────────────────────────────
 streamlit>=1.35.0

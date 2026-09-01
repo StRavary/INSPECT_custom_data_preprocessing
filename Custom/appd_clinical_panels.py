@@ -6,7 +6,7 @@ individual OMOP-vocabulary codes to a clinically meaningful "panel" (lane)
 name, e.g. LOINC 2160-0 (creatinine) -> "Renal function".
 
 This is the SAME curated taxonomy documented in
-EHR_FEATURE_EXTRACTION_GUIDE.md §4.6 (labs/diagnoses/procedures/drugs/visits)
+appd_EHR_FEATURE_EXTRACTION_GUIDE.md §4.6 (labs/diagnoses/procedures/drugs/visits)
 — kept here as data, not re-derived, so the timeline viewer's lanes and the
 guide's reference tables describe the same groupings. If you add a code to
 one, add it to the other.

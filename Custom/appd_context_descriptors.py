@@ -34,7 +34,7 @@ intervals, per-measurement values -- is NOT available here; the count matrix has
 already aggregated it away. Two proxies are provided and named as such:
 `frac_with_oldest_window_events` (history depth) and `mean_distinct_codes`
 (record richness). For genuine temporal descriptors, extract from
-DATA_RAW/EHR_CSV/ instead -- see EHR_FEATURE_EXTRACTION_GUIDE.md.
+DATA_RAW/EHR_CSV/ instead -- see appd_EHR_FEATURE_EXTRACTION_GUIDE.md.
 """
 
 from __future__ import annotations

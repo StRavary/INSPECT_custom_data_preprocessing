@@ -82,7 +82,7 @@ the offset only in its PE branch.
 
 ```bash
 cd Custom
-pip install -r extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
+pip install -r appd_extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
 streamlit run app_feature_extraction.py
 ```
 
@@ -138,8 +138,8 @@ ds.to_frame()
 print(ds.describe())
 ```
 
-Requires the packages in `Custom/extract_requirements.txt`
-(`pip install -r Custom/extract_requirements.txt`) — duckdb, streamlit,
+Requires the packages in `Custom/appd_extract_requirements.txt`
+(`pip install -r Custom/appd_extract_requirements.txt`) — duckdb, streamlit,
 numpy, pandas, scipy.
 
 ### Available tasks
@@ -805,8 +805,9 @@ Things not yet settled, flagged so you do not assume they are:
 
 | file                               | purpose |
 |------------------------------------|---------|
-| `Custom/app_feature_extraction.py` | Streamlit interface — 5-tab UI (Load, Data sources, Extract, Describe, Export) |
+| `Custom/app_feature_extraction.py` | Streamlit interface — 6-tab UI (Load, Data sources, Extract, Describe, Export, Timeline) |
 | `Custom/appd_route_b_labs.py`      | Core extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` |
 | `Custom/appd_route_b_worker.py`    | Subprocess worker spawned by the Streamlit app to run an extraction |
 | `Custom/appd_context_descriptors.py` | Per-slice descriptor tables (`ContextDescriber`) |
-| `Custom/extract_requirements.txt`  | Pip requirements (duckdb, streamlit, numpy, pandas, scipy) |
+| `Custom/appd_clinical_panels.py`   | Clinical sub-panel taxonomy for the Timeline viewer (`assign_panel()`) — mirrors §4.6's groupings |
+| `Custom/appd_extract_requirements.txt` | Pip requirements (duckdb, streamlit, numpy, pandas, scipy, plotly) |

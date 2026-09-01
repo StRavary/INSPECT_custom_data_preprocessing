@@ -6,12 +6,12 @@ large loads into RAM), so it's safe to run against the full ~22 GB
 `measurement.csv` directly.
 
 ```bash
-pip install -r Custom/extract_requirements.txt
+pip install -r Custom/appd_extract_requirements.txt
 streamlit run Custom/app_feature_extraction.py
 ```
 
 For column-level definitions and task semantics, see
-`EHR_FEATURE_EXTRACTION_GUIDE.md`. This page is just the fast on-ramp.
+`appd_EHR_FEATURE_EXTRACTION_GUIDE.md`. This page is just the fast on-ramp.
 
 ---
 
@@ -87,5 +87,5 @@ whatever you extract — no extra step needed.
 - Exported arrays: wherever you point Tab 4's **Export directory** (default
   `DATA_PROCESSED/exports/<task>/`).
 
-Questions or something looks wrong? See EHR_FEATURE_EXTRACTION_GUIDE.md. or check the live log in Tab 2 first, most extraction issues (missing table, empty LOINC filter, bad path) show
+Questions or something looks wrong? See appd_EHR_FEATURE_EXTRACTION_GUIDE.md. or check the live log in Tab 2 first, most extraction issues (missing table, empty LOINC filter, bad path) show
 up there in plain English.

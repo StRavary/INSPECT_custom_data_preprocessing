@@ -13,7 +13,7 @@ Tabs
   4 · Export        Write flat arrays and long-format CSV ready for modelling
 
 Run (from the Custom/ directory):
-    pip install -r extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
+    pip install -r appd_extract_requirements.txt   # duckdb, streamlit, numpy, pandas, scipy
     streamlit run app_feature_extraction.py
     # or, with the bundled legacy venv (already has these installed):
     ../../.venv_legacy/bin/python -m streamlit run ./app_feature_extraction.py
@@ -90,7 +90,7 @@ PATIENT_ID_CANDIDATES = ("patient_id", "PatientID", "person_id")
 # Column glossary — plain-English descriptions surfaced two ways: as hover
 # tooltips on dataframe column headers (see _glossary_column_config) and as
 # an in-app "what do these columns mean?" expander (see _render_glossary),
-# so a first-time user isn't sent to EHR_FEATURE_EXTRACTION_GUIDE.md just to
+# so a first-time user isn't sent to appd_EHR_FEATURE_EXTRACTION_GUIDE.md just to
 # find out that "tte" means "time to event".
 # ---------------------------------------------------------------------------
 
@@ -222,7 +222,7 @@ def _render_glossary(st, key: str) -> None:
               "admission-to-anchor span. `_preadm` and `_delta_{agg}` "
               "columns (see the `labs:` prefix above) only appear when a "
               "pre-admission baseline window was also configured.\n\n"
-              "Full reference: `EHR_FEATURE_EXTRACTION_GUIDE.md`."
+              "Full reference: `appd_EHR_FEATURE_EXTRACTION_GUIDE.md`."
         )
 
 
@@ -1062,7 +1062,7 @@ def main() -> None:  # pragma: no cover
     st.caption(
         "Extract structured EHR features from raw OMOP CSVs via DuckDB, "
         "explore per-impression event histories, and export flat arrays for modelling. "
-        "See EHR_FEATURE_EXTRACTION_GUIDE.md for column definitions.")
+        "See appd_EHR_FEATURE_EXTRACTION_GUIDE.md for column definitions.")
 
     tab_load, tab_src, tab_b, tab_desc, tab_exp, tab_timeline = st.tabs([
         "0 · Load",
@@ -2140,7 +2140,7 @@ def main() -> None:  # pragma: no cover
             _has_plotly = False
             st.error(
                 "This viewer needs `plotly` — `pip install plotly` "
-                "(already listed in `extract_requirements.txt`) and "
+                "(already listed in `appd_extract_requirements.txt`) and "
                 "restart the app."
             )
 
