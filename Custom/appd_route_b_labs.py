@@ -128,10 +128,19 @@ TRUTHY             = {"TRUE", "1", "1.0", "YES", "T"}
 SKIP_LABEL_VALUES  = {"CENSORED", "CENSOR", "NAN", "NA", "NONE", ""}
 CATCH_ALL_DAYS     = 36500  # 100 years
 
-# visit_concept_ids treated as a qualifying inpatient stay for
-# admission-anchored extraction: Inpatient Visit, and Emergency Room +
-# Inpatient Visit (an ER visit that rolled straight into an admission).
-ADMISSION_VISIT_CONCEPT_IDS = (9201, 262)
+# visit_concept_ids treated as a qualifying "arrival" for admission-anchored
+# extraction — i.e. the anchor falling inside one of these gives a study a
+# per-patient start date to window from, instead of a fixed number of days
+# for everyone. Deliberately broader than strict inpatient admission:
+#   9201 = Inpatient Visit
+#   262  = Emergency Room and Inpatient Visit (ER that rolled into admission)
+#   9203 = Emergency Room Visit (ED workup that never became a formal
+#          admission — still "arrived at a care unit", which is what this is
+#          meant to capture; requirements clarified this should NOT be
+#          restricted to admitted-only patients).
+# Was named ADMISSION_VISIT_CONCEPT_IDS; renamed because "admission" implied
+# a narrower, inpatient-only reading than what this is actually used for.
+ARRIVAL_VISIT_CONCEPT_IDS = (9201, 262, 9203)
 
 # ---------------------------------------------------------------------------
 # OMOP concept-name helpers (previously in temporal_features.py)
@@ -1426,6 +1435,228 @@ def build_timeline_skeleton_streamed(
     return n_rows
 
 
+def build_cohort_trajectory(
+    fm: "LabFeatureMatrix",
+    omop_dir: "Path",
+    measurement_path: "Path",
+    concept_path: "Path",
+    loinc_codes: Optional[list] = None,
+    bin_days: int = 7,
+    memory_limit_gb: float = 4.0,
+    verbose: bool = True,
+) -> "pd.DataFrame":
+    """Population-level, binned event density relative to CTPA — one row per
+    (clinical panel, time bin), for a whole cohort of potentially thousands
+    of studies. The aggregate counterpart to build_timeline_skeleton_streamed:
+    instead of one row per raw event (tens of millions of rows for a big
+    cohort — too many to usefully plot, let alone hold in memory), events are
+    binned by ``bin_days``-wide windows of "days before anchor" and counted
+    *inside DuckDB*, so the only thing that ever reaches Python is a summary
+    table of at most (number of panels) × (number of bins) rows — a few
+    thousand at the absolute widest, regardless of cohort size. This is what
+    makes "an overview of the cohort's temporal trajectory" (binned, not
+    per-event) tractable at population scale, where the per-study timeline
+    viewer (query_events_stack / build_event_timeline*) is not — plotting
+    thousands of individual patient timelines on one axis is unreadable even
+    before considering memory.
+
+    Same on-disk-connection / capped-memory-limit safety measures as
+    build_event_timeline_streamed and build_timeline_skeleton_streamed, for
+    the same reasons — this still has to scan the same raw OMOP CSVs.
+
+    Parameters
+    ----------
+    fm, omop_dir, measurement_path, concept_path, loinc_codes,
+    memory_limit_gb, verbose : see build_event_timeline_streamed
+    bin_days : width of each time bin, in days before anchor. 7 (weekly) is
+        a reasonable default for a ~1 year lookback; widen it for a longer
+        history or narrow it for a short, dense one — the row count this
+        returns is (panels × ceil(max_window / bin_days)), so this is the
+        one knob that trades resolution for how much a human can actually
+        look at in one heatmap.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        panel, event_type, bin_index (0 = the bin closest to anchor),
+        bin_start_days, bin_end_days (the bin's [start, end] in days before
+        anchor — e.g. bin_start_days=1, bin_end_days=7 for the first weekly
+        bin), n_events (total event count in that panel/bin across the whole
+        cohort), n_studies (distinct studies with >=1 such event),
+        pct_studies (n_studies / total studies in fm, as a percentage — the
+        recommended default metric to plot, since raw counts conflate "lots
+        of activity" with "lots of patients still have data this far back",
+        while pct_studies normalizes for that).
+    """
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    try:
+        import duckdb
+    except ImportError:
+        raise ImportError("pip install duckdb")
+    import pandas as pd
+    import tempfile
+    from Custom.appd_clinical_panels import panel_lookup_rows
+
+    if bin_days < 1:
+        raise ValueError(f"bin_days must be >= 1, got {bin_days}")
+
+    feature_types     = list(getattr(fm, "feature_types", None) or [])
+    count_window_days = dict(getattr(fm, "count_window_days", None) or {})
+    windows_days       = list(fm.windows_days) if fm.windows_days else [365]
+    n_total_studies    = len(fm.impression_ids)
+
+    out_cols = ["panel", "event_type", "bin_index", "bin_start_days",
+                "bin_end_days", "n_events", "n_studies", "pct_studies"]
+
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+    })
+
+    tmp_db = Path(tempfile.mktemp(suffix="_cohort_trajectory.duckdb"))
+    con = duckdb.connect(str(tmp_db))
+    con.execute("PRAGMA threads=4")
+    con.execute(f"PRAGMA memory_limit='{memory_limit_gb}GB'")
+    con.register("anchors_tbl", anchors_df)
+
+    try:
+        _log("[trajectory] loading concept.csv …")
+        con.execute(f"""
+            CREATE TEMP TABLE _concept AS
+            SELECT
+                CAST(concept_id AS BIGINT) AS concept_id,
+                vocabulary_id,
+                concept_code,
+                concept_name
+            FROM read_csv_auto('{concept_path}', ignore_errors=true)
+            WHERE concept_id IS NOT NULL
+        """)
+
+        _log("[trajectory] loading clinical panel taxonomy …")
+        panel_df = pd.DataFrame(
+            panel_lookup_rows(), columns=["vocabulary_id", "concept_code", "panel"])
+        con.register("_panels", panel_df)
+
+        parts_sql: list = []
+        params: list = []
+
+        # ── Labs ────────────────────────────────────────────────────────────
+        if "labs" in feature_types:
+            max_window = max(windows_days)
+            loinc_filter = ""
+            if loinc_codes:
+                loinc_filter = f"AND c.concept_code IN ({', '.join('?' * len(loinc_codes))})"
+                params.extend(loinc_codes)
+            _log(f"[trajectory] labs: scanning measurement.csv (window={max_window} d) …")
+            parts_sql.append(f"""
+                SELECT
+                    COALESCE(p.panel, 'Other lab')                                        AS panel,
+                    'lab'                                                                 AS event_type,
+                    CAST(FLOOR((DATEDIFF('day',
+                        CAST(t.measurement_date AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                    ) - 1) / {bin_days}) AS INTEGER)                                      AS bin_index,
+                    a.impression_id
+                FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
+                INNER JOIN anchors_tbl a
+                        ON CAST(t.person_id AS BIGINT) = a.person_id
+                LEFT  JOIN _concept c
+                        ON CAST(t.measurement_concept_id AS BIGINT) = c.concept_id
+                LEFT  JOIN _panels p
+                        ON p.vocabulary_id = c.vocabulary_id AND p.concept_code = c.concept_code
+                WHERE t.measurement_date IS NOT NULL
+                  AND CAST(t.measurement_concept_id AS BIGINT) != 0
+                  {loinc_filter}
+                  AND DATEDIFF('day',
+                        CAST(t.measurement_date AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      ) BETWEEN 1 AND {max_window}
+            """)
+
+        # ── Count feature types ──────────────────────────────────────────────
+        for ft, (tbl, date_col, _datetime_col, concept_col, label, _value_expr) in _TIMELINE_TABLE_CONFIG.items():
+            if ft not in feature_types:
+                continue
+            csv_path = Path(omop_dir) / f"{tbl}.csv"
+            if not csv_path.exists():
+                _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
+                continue
+            window_days = count_window_days.get(ft, 365)
+            _log(f"[trajectory] {ft}: scanning {tbl}.csv (window={window_days} d) …")
+            parts_sql.append(f"""
+                SELECT
+                    COALESCE(p.panel, 'Other {label}')                                    AS panel,
+                    '{label}'                                                             AS event_type,
+                    CAST(FLOOR((DATEDIFF('day',
+                        CAST(t.{date_col} AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                    ) - 1) / {bin_days}) AS INTEGER)                                      AS bin_index,
+                    a.impression_id
+                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                INNER JOIN anchors_tbl a
+                        ON CAST(t.person_id AS BIGINT) = a.person_id
+                LEFT  JOIN _concept c
+                        ON CAST(t.{concept_col} AS BIGINT) = c.concept_id
+                LEFT  JOIN _panels p
+                        ON p.vocabulary_id = c.vocabulary_id AND p.concept_code = c.concept_code
+                WHERE t.{date_col} IS NOT NULL
+                  AND CAST(t.{concept_col} AS BIGINT) != 0
+                  AND DATEDIFF('day',
+                        CAST(t.{date_col} AS DATE),
+                        CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                      ) BETWEEN 1 AND {window_days}
+            """)
+
+        if not parts_sql:
+            _log("[trajectory] no feature types configured — returning empty result")
+            return pd.DataFrame(columns=out_cols)
+
+        union_sql = "\nUNION ALL\n".join(parts_sql)
+        _log("[trajectory] aggregating inside DuckDB …")
+        # The GROUP BY (not the raw UNION ALL) is what actually reaches
+        # Python — one row per (panel, event_type, bin_index), never one row
+        # per event. Safe to .df() directly; this result is small by
+        # construction regardless of how many raw events fed into it.
+        agg_df = con.execute(f"""
+            SELECT
+                panel, event_type, bin_index,
+                COUNT(*)                        AS n_events,
+                COUNT(DISTINCT impression_id)   AS n_studies
+            FROM ({union_sql})
+            GROUP BY panel, event_type, bin_index
+            ORDER BY panel, bin_index
+        """, params).df()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        if tmp_db.exists():
+            tmp_db.unlink(missing_ok=True)
+
+    if agg_df.empty:
+        _log("[trajectory] no events matched — empty result")
+        return pd.DataFrame(columns=out_cols)
+
+    # bin_index counts bin_days-wide steps back from anchor, 0-based:
+    # bin_index=0 -> days [1, bin_days], bin_index=1 -> [bin_days+1, 2*bin_days], …
+    agg_df["bin_start_days"] = agg_df["bin_index"] * bin_days + 1
+    agg_df["bin_end_days"]   = (agg_df["bin_index"] + 1) * bin_days
+    agg_df["pct_studies"] = (
+        100.0 * agg_df["n_studies"] / n_total_studies if n_total_studies else 0.0
+    )
+
+    _log(
+        f"[trajectory] {len(agg_df):,} (panel, bin) rows "
+        f"({agg_df['panel'].nunique():,} panels × "
+        f"{agg_df['bin_index'].nunique():,} bins) from {n_total_studies:,} studies")
+    return agg_df[out_cols]
+
+
 # ---------------------------------------------------------------------------
 # LabExtractor — the extraction pipeline
 # ---------------------------------------------------------------------------
@@ -1621,15 +1852,19 @@ class LabExtractor:
     # -- admission anchoring ------------------------------------------------
 
     def _find_encompassing_admissions(self, cohort_rows: list) -> "pd.DataFrame":
-        """For each cohort row, find the inpatient admission the anchor falls
-        inside — i.e. visit_start_date <= anchor_date <= visit_end_date (or
-        the visit is still open, visit_end_date IS NULL).
+        """For each cohort row, find the qualifying arrival visit the anchor
+        falls inside — i.e. visit_start_date <= anchor_date <= visit_end_date
+        (or the visit is still open, visit_end_date IS NULL). "Qualifying"
+        means visit_concept_id IN ARRIVAL_VISIT_CONCEPT_IDS — inpatient
+        admission or an ED visit (not necessarily one that became a formal
+        admission); see that constant's comment for the reasoning.
 
         Used by admission-anchored extraction (``build(admission_anchored=True)``):
         the feature window becomes [admission_start_date, anchor_time] per
         patient instead of a fixed number of days before anchor for everyone.
-        Studies with no qualifying admission have no row in the result and are
-        dropped from the cohort by the caller.
+        Studies with no qualifying arrival simply have no row in the result —
+        the caller (``build()``) keeps them in the cohort regardless and
+        falls back to the plain fixed window for them, it does not drop them.
 
         A single DuckDB join against the whole cohort at once — no per-patient
         Python loop.
@@ -1658,7 +1893,7 @@ class LabExtractor:
         )
         anchors_df["person_id"] = anchors_df["person_id"].astype("int64")
 
-        concept_ids = ", ".join(str(c) for c in ADMISSION_VISIT_CONCEPT_IDS)
+        concept_ids = ", ".join(str(c) for c in ARRIVAL_VISIT_CONCEPT_IDS)
         con = duckdb.connect()
         con.register("anchors_tbl", anchors_df)
         df = con.execute(f"""
@@ -1692,9 +1927,9 @@ class LabExtractor:
         con.close()
 
         self._log(
-            f"  encompassing admission: {df['impression_id'].nunique():,}/"
+            f"  encompassing arrival visit: {df['impression_id'].nunique():,}/"
             f"{len(cohort_rows):,} studies matched "
-            f"(visit_concept_id IN {ADMISSION_VISIT_CONCEPT_IDS})")
+            f"(visit_concept_id IN {ARRIVAL_VISIT_CONCEPT_IDS})")
         return df
 
     # -- DuckDB-native scan + pivot ----------------------------------------
@@ -1724,9 +1959,11 @@ class LabExtractor:
             given (admission-anchored mode), each study's effective upper
             bound becomes ``LEAST(w, admission -> anchor gap)`` instead of the
             fixed ``w`` for every study — a per-row SQL expression, still one
-            vectorized scan, not a per-patient loop. Every impression_id in
-            ``cohort_rows`` must have an entry (the caller is expected to have
-            already dropped studies with no qualifying admission).
+            vectorized scan, not a per-patient loop. Coverage need not be
+            complete: a study with no entry (no qualifying admission/arrival
+            visit) falls back to the plain fixed window ``w``, uncapped,
+            rather than being excluded — the caller no longer drops
+            unmatched studies from the cohort.
         col_suffix : appended to every generated column name, right after the
             ``_{w}d`` window tag (e.g. ``"_preadm"`` → ``..._last_7d_preadm``).
             Used by ``build()`` to run this same function a second time with
@@ -1756,10 +1993,15 @@ class LabExtractor:
             anchors_df["admission_date"] = anchors_df["impression_id"].map(admission_dates)
 
         if admission_dates is not None:
+            # COALESCE(..., max_window): a study with no admission_date (no
+            # qualifying arrival visit for this patient) falls back to the
+            # plain fixed window instead of the DATEDIFF/LEAST producing NULL
+            # — which would silently zero out that study's results (NULL
+            # never satisfies BETWEEN 1 AND NULL), not just leave it uncapped.
             max_window_expr = (
-                f"LEAST({max_window}, DATEDIFF('day', "
+                f"LEAST({max_window}, COALESCE(DATEDIFF('day', "
                 "CAST(a.admission_date AS DATE), "
-                "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+                f"CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)), {max_window}))"
             )
         else:
             max_window_expr = str(max_window)
@@ -1967,10 +2209,23 @@ class LabExtractor:
         X_extra, columns_extra : baseline columns followed by delta columns,
             ready to ``np.hstack`` onto the combined feature matrix.
         """
+        # Only studies with an admission_date have a "before admission" to
+        # measure from — unlike the window-capping elsewhere in this class,
+        # there's no fixed-window fallback that makes sense here. Studies
+        # without one are simply left out of baseline_rows; _run_duckdb_and_
+        # pivot still reindexes onto the full imp_ids list below, so they
+        # come back as NaN on these columns rather than raising a KeyError
+        # or being dropped from the cohort.
         baseline_rows = [
             (pid, datetime.date.fromisoformat(admission_dates[imp]), imp, split, y)
             for pid, _anchor, imp, split, y in cohort_rows
+            if imp in admission_dates
         ]
+        if not baseline_rows:
+            self._log(
+                "  WARNING: no studies have an admission_date — skipping "
+                "pre-admission baseline/delta")
+            return np.zeros((len(imp_ids), 0), dtype=np.float32), []
         try:
             X_pre, columns_pre = self._run_duckdb_and_pivot(
                 baseline_rows, [pre_admission_days], loinc_codes,
@@ -2099,10 +2354,13 @@ class LabExtractor:
             con.register(tbl_alias, concepts_df)
             window_days = window_days_per_table.get(tbl, 365)
             if admission_dates is not None:
+                # COALESCE(..., window_days): no admission_date for this study
+                # -> fall back to the plain fixed window instead of NULLing
+                # out the row (see _run_duckdb_and_pivot's max_window_expr).
                 window_upper_expr = (
-                    f"LEAST({window_days}, DATEDIFF('day', "
+                    f"LEAST({window_days}, COALESCE(DATEDIFF('day', "
                     "CAST(a.admission_date AS DATE), "
-                    "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+                    f"CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)), {window_days}))"
                 )
             else:
                 window_upper_expr = str(window_days)
@@ -2418,10 +2676,13 @@ class LabExtractor:
                 anc_prefix  = f"{col_prefix}_anc"
                 window_days = window_days_per_table.get(tbl, 365)
                 if admission_dates is not None:
+                    # COALESCE(..., window_days): see _run_duckdb_and_pivot's
+                    # max_window_expr — no admission_date for this study falls
+                    # back to the plain fixed window, not NULL.
                     window_upper_expr = (
-                        f"LEAST({window_days}, DATEDIFF('day', "
+                        f"LEAST({window_days}, COALESCE(DATEDIFF('day', "
                         "CAST(a.admission_date AS DATE), "
-                        "CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)))"
+                        f"CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)), {window_days}))"
                     )
                 else:
                     window_upper_expr = str(window_days)
@@ -2604,17 +2865,20 @@ class LabExtractor:
                                     long-format/timeline export size) proportionally
                                     to how many patients have multiple studies. See
                                     `_read_cohort` for the tie-breaking rule.
-            admission_anchored    : if True, restrict the cohort to studies whose
-                                    anchor falls inside an inpatient admission
-                                    (visit_concept_id IN ADMISSION_VISIT_CONCEPT_IDS,
-                                    visit_start_date <= anchor <= visit_end_date or
-                                    still open) and extract features from
-                                    [admission_start_date, anchor] instead of a
-                                    fixed lookback — windows_days/count_window_days
+            admission_anchored    : if True, for studies whose anchor falls
+                                    inside a qualifying arrival visit
+                                    (visit_concept_id IN ARRIVAL_VISIT_CONCEPT_IDS
+                                    — inpatient admission or an ED visit,
+                                    visit_start_date <= anchor <= visit_end_date
+                                    or still open), extract features from
+                                    [arrival_date, anchor] instead of a fixed
+                                    lookback — windows_days/count_window_days
                                     still apply as an outer ceiling per study
-                                    (LEAST(window, admission -> anchor gap)).
-                                    Studies with no qualifying admission are
-                                    dropped from the cohort entirely. See
+                                    (LEAST(window, arrival -> anchor gap)).
+                                    Studies with no qualifying arrival record
+                                    are NOT dropped — they simply use the
+                                    plain fixed window like a normal
+                                    extraction. See
                                     `_find_encompassing_admissions`.
             pre_admission_days    : if set (requires admission_anchored=True and
                                     "labs" in feature_types), also extract a
@@ -2693,11 +2957,20 @@ class LabExtractor:
         # 1. Read cohort
         cohort_rows = self._read_cohort(task, anchor_kind, one_study_per_patient)
 
-        # 1b. Admission-anchored mode: restrict the cohort to studies with an
-        #     encompassing inpatient admission, and derive a per-study
-        #     [admission_start, anchor] window that steps 2-4 below cap their
-        #     lookback windows against. Single vectorized DuckDB join across
-        #     the whole cohort — no per-patient loop.
+        # 1b. Admission-anchored mode: for studies whose anchor falls inside a
+        #     qualifying arrival visit (see ARRIVAL_VISIT_CONCEPT_IDS), derive
+        #     a per-study [arrival, anchor] window that steps 2-4 below cap
+        #     their lookback windows against. Single vectorized DuckDB join
+        #     across the whole cohort — no per-patient loop.
+        #
+        #     Studies with no qualifying arrival record are KEPT in the
+        #     cohort, not dropped — they simply fall back to the plain fixed
+        #     windows_days/count_window_days for every feature (the SQL-side
+        #     COALESCE in _run_duckdb_and_pivot etc. does this per row). This
+        #     was the original design and got corrected after a requirements
+        #     mismatch: the intent was always "use a relative window when we
+        #     have an arrival date, else fall back to the normal fixed one,"
+        #     not "restrict the cohort to admitted patients only."
         admission_meta  = None
         admission_dates = None
         if admission_anchored:
@@ -2705,17 +2978,18 @@ class LabExtractor:
             admission_meta = self._find_encompassing_admissions(cohort_rows)
             admission_dates = dict(zip(admission_meta["impression_id"],
                                         admission_meta["admission_date"]))
-            n_before = len(cohort_rows)
-            cohort_rows = [r for r in cohort_rows if r[2] in admission_dates]
+            n_matched = len(admission_dates)
+            n_total   = len(cohort_rows)
             self._log(
-                f"  {n_before:,} -> {len(cohort_rows):,} studies "
-                f"({n_before - len(cohort_rows):,} dropped — no encompassing "
-                f"admission in visit_occurrence.csv)")
-            if not cohort_rows:
-                raise RuntimeError(
-                    "No studies had an encompassing inpatient admission — check "
-                    "that visit_occurrence.csv covers this cohort, or disable "
-                    "admission_anchored.")
+                f"  {n_matched:,}/{n_total:,} studies have a qualifying "
+                f"arrival record ({n_total - n_matched:,} will use the plain "
+                f"fixed window instead of a relative one)")
+            if n_matched == 0:
+                self._log(
+                    "  WARNING: zero studies matched — check that "
+                    "visit_occurrence.csv covers this cohort and "
+                    "ARRIVAL_VISIT_CONCEPT_IDS is right for this data; "
+                    "every study will use the plain fixed window.")
 
         imp_ids     = [r[2] for r in cohort_rows]
         pat_ids     = np.array([r[0] for r in cohort_rows], dtype=np.int64)

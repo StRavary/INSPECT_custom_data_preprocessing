@@ -108,14 +108,17 @@ COLUMN_GLOSSARY = {
     "event":          "Survival event indicator: 1 = event observed, 0 = censored "
                        "(no event seen before the patient's data ends), NaN = unknown.",
     "admission_date": "Admission-anchored extractions only. Start date (visit_start_date) "
-                       "of the inpatient stay the anchor falls inside — the window for "
-                       "every feature type starts here instead of a fixed lookback. "
-                       "Studies with no such admission are dropped from the cohort "
-                       "entirely, so this is never missing when the column is present.",
+                       "of the qualifying arrival visit (inpatient admission or an ED "
+                       "visit) the anchor falls inside — the window for every feature "
+                       "type starts here instead of a fixed lookback. NaN for a study "
+                       "with no qualifying arrival record; that study isn't dropped, it "
+                       "just falls back to the plain fixed window like a normal "
+                       "extraction.",
     "days_since_admission": "Admission-anchored extractions only. anchor_time minus "
                        "admission_date, in days — the actual per-study window length "
                        "before any windows_days ceiling is applied "
-                       "(effective window = min(windows_days, days_since_admission)).",
+                       "(effective window = min(windows_days, days_since_admission)). "
+                       "NaN wherever admission_date is NaN.",
     "sex":            "Derived display field — female / male / unknown, from "
                        "demo:is_female / demo:sex_unknown. Shown in the Describe and "
                        "long-format views for filtering; not itself a column in the "
@@ -215,13 +218,18 @@ def _render_glossary(st, key: str) -> None:
               "since the most recent measurement).\n\n"
               "**Admission-anchored extractions** (\"Anchor extraction window "
               "to encompassing admission\" in the Extract tab) change what "
-              "`_Nd` means: the window is capped at min(N, "
-              "days_since_admission), so it never reaches before "
-              "admission_date. A window of `_36500d` (100 years) means no "
-              "fixed ceiling was configured — the feature just uses the full "
-              "admission-to-anchor span. `_preadm` and `_delta_{agg}` "
-              "columns (see the `labs:` prefix above) only appear when a "
-              "pre-admission baseline window was also configured.\n\n"
+              "`_Nd` means *for studies with an admission_date*: the window "
+              "is capped at min(N, days_since_admission), so it never "
+              "reaches before admission_date. Studies with no qualifying "
+              "arrival record (admission_date is NaN) just use the plain "
+              "`_Nd` window, uncapped by anything admission-related — same "
+              "as a normal extraction. A window of `_36500d` (100 years) "
+              "means no fixed ceiling was configured at all — for a matched "
+              "study that's the full admission-to-anchor span; for an "
+              "unmatched one it's genuinely the full history. `_preadm` and "
+              "`_delta_{agg}` columns (see the `labs:` prefix above) only "
+              "appear when a pre-admission baseline window was also "
+              "configured, and are NaN for studies with no admission_date.\n\n"
               "Full reference: `appd_EHR_FEATURE_EXTRACTION_GUIDE.md`."
         )
 
@@ -288,6 +296,72 @@ def _build_timeline_figure(events_df: "pd.DataFrame", anchor_time, title: str = 
         height=max(320, 45 * max(len(panels), 1)),
         showlegend=False,
         margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+_TRAJECTORY_METRIC_LABELS = {
+    "pct_studies": "% of studies with an event",
+    "n_studies":   "# studies with an event",
+    "n_events":    "total event count",
+}
+
+
+def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct_studies",
+                                      bin_days: int = 7, title: str = ""):
+    """Population-level heatmap: one row per clinical panel, one column per
+    time bin relative to CTPA, color = the chosen metric. traj_df is
+    appd_route_b_labs.build_cohort_trajectory()'s output — already reduced
+    to (panels × bins) rows inside DuckDB, so this never touches per-event
+    data regardless of cohort size.
+
+    Panels are ordered by total activity (sum of the chosen metric across
+    all bins), most active at the top — for an "at a glance" overview,
+    that's more useful than alphabetical. T0 (the bin closest to anchor) is
+    placed on the right edge, matching _build_timeline_figure's convention
+    for the individual viewer above.
+    """
+    import plotly.graph_objects as go
+    import pandas as pd
+
+    if traj_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title or "No events matched this cohort/window.")
+        return fig
+
+    pivot = traj_df.pivot_table(
+        index="panel", columns="bin_index", values=metric, fill_value=0, aggfunc="sum")
+    all_bins = range(int(traj_df["bin_index"].min()), int(traj_df["bin_index"].max()) + 1)
+    pivot = pivot.reindex(columns=all_bins, fill_value=0)
+    # most-active-first — pivot_table already sorted the index alphabetically;
+    # re-sort by row totals instead.
+    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+
+    bin_start = pivot.columns.to_numpy() * bin_days + 1
+    bin_end   = (pivot.columns.to_numpy() + 1) * bin_days
+    x_labels  = [f"-{e}d..-{s}d" for s, e in zip(bin_start, bin_end)]
+
+    metric_label = _TRAJECTORY_METRIC_LABELS.get(metric, metric)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.to_numpy(),
+        x=x_labels,
+        y=pivot.index.tolist(),
+        colorscale="YlOrRd",
+        colorbar=dict(title=metric_label),
+        hovertemplate="%{y}<br>%{x} before CTPA<br>" + metric_label + ": %{z}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis=dict(
+            title="Time before CTPA (T0, right edge)",
+            categoryorder="array", categoryarray=x_labels,
+            autorange="reversed",   # T0 (bin 0, first label) ends up on the right
+        ),
+        yaxis=dict(title="Clinical panel", categoryorder="array",
+                   categoryarray=pivot.index.tolist()[::-1]),
+        height=max(400, 32 * max(len(pivot.index), 1)),
+        margin=dict(l=10, r=10, t=60, b=40),
     )
     return fig
 
@@ -930,9 +1004,12 @@ def _do_export(fm, export_dir: str, drop_zero: bool, concept_map: dict,
 load_survival.py  —  auto-generated by app_feature_extraction.py
 Load {fm.task} EHR features for survival analysis.
 All studies are in a single flat array — apply your own train/test split downstream.
-{"Admission-anchored: each study's window is [admission_date, anchor_time] "
- "(see metadata.csv columns admission_date / days_since_admission), capped by "
- "the configured windows as an outer ceiling." if has_admission else ""}
+{"Admission-anchored: studies with an admission_date (see metadata.csv "
+ "columns admission_date / days_since_admission) have a window of "
+ "[admission_date, anchor_time], capped by the configured windows as an "
+ "outer ceiling. Studies with admission_date = NaN (no qualifying arrival "
+ "record) used the plain fixed window instead, same as a normal extraction."
+ if has_admission else ""}
 """
 import numpy as np
 import pandas as pd
@@ -1131,10 +1208,12 @@ def main() -> None:  # pragma: no cover
                              "(prognostic tasks).")
             if getattr(fm, "admission_anchored", False):
                 st.caption(
-                    "🛏️ Admission-anchored: window per study is "
-                    "[admission_date, anchor_time], capped by the configured "
-                    "windows as an outer ceiling. See `admission_date` / "
-                    "`days_since_admission` in the exported metadata.csv.")
+                    "🛏️ Admission-anchored: studies with a qualifying arrival "
+                    "record use [admission_date, anchor_time], capped by the "
+                    "configured windows as an outer ceiling; studies without "
+                    "one use the plain fixed window instead. See "
+                    "`admission_date` / `days_since_admission` (NaN where no "
+                    "arrival record matched) in the exported metadata.csv.")
 
     # ── 1 · Data sources ────────────────────────────────────────────────────
     with tab_src:
@@ -1314,24 +1393,30 @@ def main() -> None:  # pragma: no cover
             "Anchor extraction window to encompassing admission",
             value=False, key="b_admission_anchored",
             help="Instead of a fixed lookback from anchor_time for every study, "
-                 "find the inpatient admission the anchor falls inside "
-                 "(visit_concept_id = Inpatient or ER+Inpatient, "
+                 "find the qualifying arrival visit the anchor falls inside "
+                 "(visit_concept_id = Inpatient, ER+Inpatient, or ER — "
                  "visit_start_date ≤ anchor ≤ visit_end_date or still open) and "
                  "extract features from [admission_start_date, anchor] instead. "
                  "The window settings above still apply as an outer ceiling per "
                  "study — e.g. a 365d lab window becomes "
                  "min(365, days since admission). "
-                 "⚠️ Studies with no encompassing admission are dropped from the "
-                 "cohort entirely (shrinks n and can shift prevalence). "
-                 "admission_date and days_since_admission are added to "
-                 "metadata.csv for the export.",
+                 "Studies with no qualifying arrival record are **not** "
+                 "dropped — they use the plain fixed window above instead, "
+                 "same as a normal extraction. admission_date and "
+                 "days_since_admission are added to metadata.csv (NaN for "
+                 "those studies) for the export.",
         )
 
         b_windows_empty_ok = b_admission_anchored and b_ft_labs and not b_windows
         if b_windows_empty_ok:
             st.caption(
-                "ℹ️ Lab windows left blank — using the full admission-to-anchor "
-                "span only, with no fixed ceiling.")
+                "ℹ️ Lab windows left blank — matched studies use the full "
+                "admission-to-anchor span with no fixed ceiling. "
+                "⚠️ Studies with **no** qualifying arrival record get no "
+                "ceiling *at all* in that case — their fixed-window fallback "
+                "becomes their full history (100y), not a bounded window. "
+                "Set an explicit window above unless you actually want that "
+                "for unmatched studies.")
         elif b_ft_labs and not b_windows and not b_admission_anchored:
             st.error(
                 "Lab windows can't be blank unless \"Anchor extraction window "
@@ -2255,6 +2340,122 @@ def main() -> None:  # pragma: no cover
                         fig = _build_timeline_figure(
                             sub, anchor_time=anchor, title=f"{imp}  ·  T0 = {anchor}")
                         st.plotly_chart(fig, use_container_width=True, key=f"tl5_fig_{imp}")
+
+            st.markdown("---")
+
+            # ── Cohort-wide trajectory overview (binned, population-level) ──
+            st.markdown("### Cohort trajectory overview")
+            st.caption(
+                "A population-level view for the *whole* loaded cohort — "
+                "thousands of studies at once, each anchored to its own "
+                "CTPA (T0), events binned into fixed-width windows before "
+                "anchor so the result is one small heatmap instead of an "
+                "unreadable (and unplottable) pile of per-event points. "
+                "Binning happens entirely inside DuckDB — the aggregated "
+                "(panel × time bin) table is all that ever reaches this "
+                "app, regardless of cohort size."
+            )
+            fm = st.session_state.get("fm")
+            if fm is None:
+                st.info("Load an extraction first (Tab 0 · Load).")
+            else:
+                omop_dir    = st.session_state.get(
+                    "path_omop", str(DATA_SOURCES["omop"][2]))
+                concept_csv = str(Path(omop_dir) / "concept.csv")
+                _ft_traj = getattr(fm, "feature_types", None) or []
+
+                if not _ft_traj:
+                    st.warning(
+                        "Feature types not stored in this extraction (older "
+                        "pkl). Re-run the extraction to enable this view.")
+                else:
+                    col_bin, col_metric, col_mem = st.columns(3)
+                    traj_bin_days = col_bin.number_input(
+                        "Bin width (days before CTPA)",
+                        min_value=1, max_value=365, value=7, step=1,
+                        key="traj_bin_days",
+                        help="Weekly (7d) bins are a reasonable start for a "
+                             "~1 year lookback. Narrower bins give more "
+                             "temporal resolution but more columns to look "
+                             "at; wider bins trade resolution for a more "
+                             "readable overview. Changing this requires "
+                             "rebuilding (re-queries DuckDB) — the metric "
+                             "choice to the right does not.",
+                    )
+                    traj_metric = col_metric.selectbox(
+                        "Metric",
+                        ["pct_studies", "n_studies", "n_events"],
+                        format_func=lambda m: _TRAJECTORY_METRIC_LABELS.get(m, m),
+                        key="traj_metric",
+                        help="pct_studies (recommended): % of the cohort with "
+                             "at least one event in that panel/bin — "
+                             "normalized, so it isn't confounded by how many "
+                             "studies still have data that far back from "
+                             "CTPA. n_studies: raw count instead of %. "
+                             "n_events: total event count, unnormalized — "
+                             "can be dominated by a few patients with many "
+                             "repeat measurements.",
+                    )
+                    traj_memory_limit_gb = col_mem.number_input(
+                        "DuckDB memory limit (GB)",
+                        min_value=1.0, max_value=64.0, value=4.0, step=1.0,
+                        key="traj_memory_limit_gb",
+                    )
+
+                    if st.button("📊 Build cohort trajectory", type="primary",
+                                 key="traj_build"):
+                        from Custom.appd_route_b_labs import build_cohort_trajectory
+                        _omop_dir        = Path(omop_dir)
+                        _measurement_csv = _omop_dir / "measurement.csv"
+                        _concept_csv     = Path(concept_csv)
+                        with st.spinner(
+                            "Scanning and binning via DuckDB … this can "
+                            "take a while for a wide window over a large "
+                            "cohort, same as the other DuckDB-backed views "
+                            "in this tab."
+                        ):
+                            traj_df = build_cohort_trajectory(
+                                fm=fm,
+                                omop_dir=_omop_dir,
+                                measurement_path=_measurement_csv,
+                                concept_path=_concept_csv,
+                                bin_days=int(traj_bin_days),
+                                memory_limit_gb=float(traj_memory_limit_gb),
+                                verbose=True,
+                            )
+                        st.session_state["traj_df"]          = traj_df
+                        st.session_state["traj_df_bin_days"] = int(traj_bin_days)
+                        st.session_state["traj_df_task"]     = fm.task
+
+                    traj_df = st.session_state.get("traj_df")
+                    if (traj_df is not None
+                            and st.session_state.get("traj_df_task") != fm.task):
+                        traj_df = None
+                        st.session_state.pop("traj_df", None)
+
+                    if traj_df is not None:
+                        if traj_df.empty:
+                            st.info("No events matched — nothing to plot.")
+                        else:
+                            n_studies_total = len(fm.impression_ids)
+                            st.success(
+                                f"{len(traj_df):,} (panel × bin) cells · "
+                                f"{traj_df['panel'].nunique():,} panels · "
+                                f"{n_studies_total:,} studies in cohort")
+                            traj_fig = _build_cohort_trajectory_heatmap(
+                                traj_df, metric=traj_metric,
+                                bin_days=st.session_state.get("traj_df_bin_days", 7),
+                                title=f"{fm.task} · cohort trajectory relative to CTPA",
+                            )
+                            st.plotly_chart(traj_fig, use_container_width=True,
+                                             key="traj_heatmap")
+                            st.download_button(
+                                "⬇️ Download binned trajectory CSV",
+                                traj_df.to_csv(index=False),
+                                file_name=f"{fm.task}_cohort_trajectory.csv",
+                                mime="text/csv",
+                                key="traj_download",
+                            )
 
             st.markdown("---")
 
