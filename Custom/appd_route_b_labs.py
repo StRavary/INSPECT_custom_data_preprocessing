@@ -1442,6 +1442,7 @@ def build_cohort_trajectory(
     concept_path: "Path",
     loinc_codes: Optional[list] = None,
     bin_days: int = 7,
+    lookback_days: Optional[int] = 365,
     memory_limit_gb: float = 4.0,
     verbose: bool = True,
 ) -> "pd.DataFrame":
@@ -1471,9 +1472,24 @@ def build_cohort_trajectory(
     bin_days : width of each time bin, in days before anchor. 7 (weekly) is
         a reasonable default for a ~1 year lookback; widen it for a longer
         history or narrow it for a short, dense one — the row count this
-        returns is (panels × ceil(max_window / bin_days)), so this is the
+        returns is (panels × ceil(scan_window / bin_days)), so this is the
         one knob that trades resolution for how much a human can actually
         look at in one heatmap.
+    lookback_days : how far back from anchor this *overview* should scan,
+        independent of fm.windows_days / fm.count_window_days. Deliberately
+        decoupled from the extraction's own window settings: those are often
+        set generously large (e.g. to guarantee admission-anchored data
+        never gets capped — see the app's admission-anchoring help text) for
+        reasons that have nothing to do with what's readable in a heatmap.
+        Reusing them directly here would make the number of bins (and thus
+        how crowded the x-axis is) an accidental side effect of an unrelated
+        setting. Each feature type is scanned out to
+        ``min(lookback_days, that type's own configured window)`` — never
+        further back than the extraction actually reaches, but capped at
+        this value even if the extraction's window is much larger. Pass
+        None to fall back to each type's own window uncapped (the old
+        behavior) — the wider the cohort's real history, the more likely
+        that produces hundreds of mostly-empty bins.
 
     Returns
     -------
@@ -1547,6 +1563,8 @@ def build_cohort_trajectory(
         # ── Labs ────────────────────────────────────────────────────────────
         if "labs" in feature_types:
             max_window = max(windows_days)
+            if lookback_days is not None:
+                max_window = min(max_window, lookback_days)
             loinc_filter = ""
             if loinc_codes:
                 loinc_filter = f"AND c.concept_code IN ({', '.join('?' * len(loinc_codes))})"
@@ -1586,6 +1604,8 @@ def build_cohort_trajectory(
                 _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
                 continue
             window_days = count_window_days.get(ft, 365)
+            if lookback_days is not None:
+                window_days = min(window_days, lookback_days)
             _log(f"[trajectory] {ft}: scanning {tbl}.csv (window={window_days} d) …")
             parts_sql.append(f"""
                 SELECT

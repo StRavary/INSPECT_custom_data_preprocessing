@@ -343,6 +343,16 @@ def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct
 
     metric_label = _TRAJECTORY_METRIC_LABELS.get(metric, metric)
 
+    # Plotly renders every category on a category axis by default — with a
+    # wide lookback and a narrow bin width that's hundreds of overlapping,
+    # unreadable tick labels (this is what a garbled/smeared x-axis is:
+    # too many bins for the pixel width, not a rendering bug). Thin ticks
+    # to a legible count; the underlying data/columns are unaffected, only
+    # which labels get text drawn under them.
+    _MAX_TICKS = 30
+    step = max(1, -(-len(x_labels) // _MAX_TICKS))  # ceil division
+    tick_labels = x_labels[::step]
+
     fig = go.Figure(data=go.Heatmap(
         z=pivot.to_numpy(),
         x=x_labels,
@@ -357,6 +367,8 @@ def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct
             title="Time before CTPA (T0, right edge)",
             categoryorder="array", categoryarray=x_labels,
             autorange="reversed",   # T0 (bin 0, first label) ends up on the right
+            tickmode="array", tickvals=tick_labels, ticktext=tick_labels,
+            tickangle=-45,
         ),
         yaxis=dict(title="Clinical panel", categoryorder="array",
                    categoryarray=pivot.index.tolist()[::-1]),
@@ -1392,14 +1404,22 @@ def main() -> None:  # pragma: no cover
         b_admission_anchored = st.checkbox(
             "Anchor extraction window to encompassing admission",
             value=False, key="b_admission_anchored",
-            help="Instead of a fixed lookback from anchor_time for every study, "
-                 "find the qualifying arrival visit the anchor falls inside "
-                 "(visit_concept_id = Inpatient, ER+Inpatient, or ER — "
-                 "visit_start_date ≤ anchor ≤ visit_end_date or still open) and "
-                 "extract features from [admission_start_date, anchor] instead. "
-                 "The window settings above still apply as an outer ceiling per "
+            help="**anchor_time (CTPA/StudyTime) stays day 0 for every study — "
+                 "that never changes.** What this checkbox changes is how far "
+                 "*back* from that day-0 the window is allowed to reach: instead "
+                 "of every study looking back the same fixed number of days, "
+                 "each study looks back only as far as *that patient's own* "
+                 "admission. Concretely: find the qualifying arrival visit the "
+                 "anchor falls inside (visit_concept_id = Inpatient, ER+Inpatient, "
+                 "or ER — visit_start_date ≤ anchor ≤ visit_end_date or still "
+                 "open), then use [admission_start_date, anchor] as the window "
+                 "instead of [anchor − windows_days, anchor]. Since admission "
+                 "dates differ patient to patient, so does how far back each "
+                 "study reaches — but the day-0 reference point every value is "
+                 "measured against is still anchor_time for all of them. The "
+                 "window settings above still apply as an outer ceiling per "
                  "study — e.g. a 365d lab window becomes "
-                 "min(365, days since admission). "
+                 "min(365, days since admission), never more than 365d back. "
                  "Studies with no qualifying arrival record are **not** "
                  "dropped — they use the plain fixed window above instead, "
                  "same as a normal extraction. admission_date and "
@@ -2369,7 +2389,27 @@ def main() -> None:  # pragma: no cover
                         "Feature types not stored in this extraction (older "
                         "pkl). Re-run the extraction to enable this view.")
                 else:
-                    col_bin, col_metric, col_mem = st.columns(3)
+                    col_look, col_bin, col_metric, col_mem = st.columns(4)
+                    traj_lookback_days = col_look.number_input(
+                        "Lookback (days before CTPA)",
+                        min_value=1, max_value=None, value=365, step=30,
+                        key="traj_lookback_days",
+                        help="How far back this overview scans — deliberately "
+                             "**independent** of the lab/count windows set in "
+                             "Tab 2. Those are often set very large (e.g. to "
+                             "guarantee admission-anchored data never gets "
+                             "capped) for reasons that have nothing to do "
+                             "with what fits legibly on a heatmap axis. If "
+                             "this extraction's own window for a feature "
+                             "type is smaller than this value, the smaller "
+                             "one wins — this can only shrink the scan, "
+                             "never see further back than the extraction "
+                             "actually reaches. No upper limit, but a large "
+                             "value with a narrow bin width below produces "
+                             "many mostly-empty columns and an unreadable "
+                             "x-axis — that combination is the #1 cause of "
+                             "a garbled/overlapping axis.",
+                    )
                     traj_bin_days = col_bin.number_input(
                         "Bin width (days before CTPA)",
                         min_value=1, max_value=365, value=7, step=1,
@@ -2420,6 +2460,7 @@ def main() -> None:  # pragma: no cover
                                 measurement_path=_measurement_csv,
                                 concept_path=_concept_csv,
                                 bin_days=int(traj_bin_days),
+                                lookback_days=int(traj_lookback_days),
                                 memory_limit_gb=float(traj_memory_limit_gb),
                                 verbose=True,
                             )
