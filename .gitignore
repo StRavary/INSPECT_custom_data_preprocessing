@@ -18,3 +18,14 @@ feature_ceiling.png
 # Understand-Anything knowledge graph tool data
 .ua/
 .understand-anything/
+
+# AI / Coding Agent directories
+.claude/
+.agents/
+.gemini/
+.cline/
+.cursor/
+.aider*
+.continue/
+.windsurf/
+.roo/
