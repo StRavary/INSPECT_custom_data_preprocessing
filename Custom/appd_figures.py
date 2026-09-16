@@ -92,7 +92,9 @@ def _build_timeline_figure(events_df: "pd.DataFrame", anchor_time, title: str = 
 
 
 def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct_studies",
-                                      bin_days: int = 7, title: str = ""):
+                                      bin_days: int = 7, title: str = "",
+                                      x_axis_label: str = "Time before CTPA (T0, right edge)",
+                                      reverse_x: bool = True):
     """Population-level heatmap: one row per clinical panel, one column per
     time bin relative to CTPA, color = the chosen metric. traj_df is
     appd_route_b_labs.build_cohort_trajectory()'s output — already reduced
@@ -147,9 +149,9 @@ def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct
     fig.update_layout(
         title=title,
         xaxis=dict(
-            title="Time before CTPA (T0, right edge)",
+            title=x_axis_label,
             categoryorder="array", categoryarray=x_labels,
-            autorange="reversed",   # T0 (bin 0, first label) ends up on the right
+            autorange="reversed" if reverse_x else True,
             tickmode="array", tickvals=tick_labels, ticktext=tick_labels,
             tickangle=-45,
         ),

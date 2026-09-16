@@ -1052,3 +1052,270 @@ def build_cohort_trajectory(
         f"({agg_df['panel'].nunique():,} panels × "
         f"{agg_df['bin_index'].nunique():,} bins) from {n_total_studies:,} studies")
     return agg_df[out_cols]
+
+
+def build_admission_cohort_trajectory(
+    fm: "LabFeatureMatrix",
+    omop_dir: "Path",
+    measurement_path: "Path",
+    concept_path: "Path",
+    loinc_codes: Optional[list] = None,
+    bin_days: int = 1,
+    memory_limit_gb: float = 4.0,
+    verbose: bool = True,
+) -> "pd.DataFrame":
+    """Population-level, binned event density relative to *admission date*.
+
+    Same DuckDB mechanism as build_cohort_trajectory, but the x-axis is
+    **days since qualifying arrival** (0 = admission day, increasing toward
+    anchor/CTPA) rather than days before CTPA.
+
+    The qualifying arrival per study is the most recent visit in
+    visit_occurrence.csv whose date range encompasses the anchor_time and
+    whose visit_concept_id is one of ARRIVAL_VISIT_CONCEPT_IDS (9201 =
+    Inpatient, 262 = ER+Inpatient, 9203 = ER).  Studies with no such visit
+    are excluded from all counts — n_total_matched in the returned DataFrame
+    reflects only studies that were successfully matched.
+
+    Parameters
+    ----------
+    fm, omop_dir, measurement_path, concept_path, loinc_codes,
+    memory_limit_gb, verbose : see build_cohort_trajectory
+    bin_days : width of each time bin in days since admission (default 1 —
+        daily bins suit admission windows which are typically 1–30 days;
+        use 7 for a longer admission tail).
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        panel, event_type, bin_index (0 = day 0 of admission),
+        bin_start_days, bin_end_days (in days since admission),
+        n_events, n_studies, pct_studies,
+        n_total_matched (constant — studies with a qualifying admission).
+    """
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    try:
+        import duckdb
+    except ImportError:
+        raise ImportError("pip install duckdb")
+    import pandas as pd
+    import tempfile
+    from Custom.appd_clinical_panels import panel_lookup_rows
+    from Custom.appd_route_b_constants import ARRIVAL_VISIT_CONCEPT_IDS
+
+    if bin_days < 1:
+        raise ValueError(f"bin_days must be >= 1, got {bin_days}")
+
+    visit_csv = Path(omop_dir) / "visit_occurrence.csv"
+    if not visit_csv.exists():
+        raise FileNotFoundError(
+            f"visit_occurrence.csv not found at {visit_csv} — "
+            "admission trajectory requires visit_occurrence.csv")
+
+    feature_types     = list(getattr(fm, "feature_types", None) or [])
+    count_window_days = dict(getattr(fm, "count_window_days", None) or {})
+    windows_days      = list(fm.windows_days) if fm.windows_days else [365]
+
+    out_cols = [
+        "panel", "event_type", "bin_index",
+        "bin_start_days", "bin_end_days",
+        "n_events", "n_studies", "pct_studies", "n_total_matched",
+    ]
+
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+    })
+
+    tmp_db = Path(tempfile.mktemp(suffix="_adm_trajectory.duckdb"))
+    con = duckdb.connect(str(tmp_db))
+    con.execute("PRAGMA threads=4")
+    con.execute(f"PRAGMA memory_limit='{memory_limit_gb}GB'")
+    con.register("anchors_tbl", anchors_df)
+
+    arrival_ids_sql = ", ".join(str(v) for v in ARRIVAL_VISIT_CONCEPT_IDS)
+
+    try:
+        _log("[adm-trajectory] loading concept.csv …")
+        con.execute(f"""
+            CREATE TEMP TABLE _concept AS
+            SELECT
+                CAST(concept_id AS BIGINT) AS concept_id,
+                vocabulary_id,
+                concept_code,
+                concept_name
+            FROM read_csv_auto('{concept_path}', ignore_errors=true)
+            WHERE concept_id IS NOT NULL
+        """)
+
+        _log("[adm-trajectory] loading clinical panel taxonomy …")
+        panel_df = pd.DataFrame(
+            panel_lookup_rows(), columns=["vocabulary_id", "concept_code", "panel"])
+        con.register("_panels", panel_df)
+
+        # ── Find the qualifying arrival per study ──────────────────────────
+        # For each study, find the most recent qualifying arrival whose
+        # date range encompasses anchor_time (start ≤ anchor ≤ end, or
+        # still open).  Uses QUALIFY to pick one row per impression_id.
+        _log("[adm-trajectory] matching qualifying arrivals from visit_occurrence.csv …")
+        con.execute(f"""
+            CREATE TEMP TABLE _study_admissions AS
+            SELECT
+                a.impression_id,
+                a.person_id,
+                CAST(a.anchor_time AS TIMESTAMP)                AS anchor_time,
+                CAST(v.visit_start_date AS DATE)                AS admission_date,
+                DATEDIFF('day',
+                    CAST(v.visit_start_date AS DATE),
+                    CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                )                                               AS los_days
+            FROM anchors_tbl a
+            INNER JOIN read_csv_auto('{visit_csv}', ignore_errors=true) v
+                    ON CAST(v.person_id AS BIGINT) = a.person_id
+                   AND CAST(v.visit_concept_id AS BIGINT) IN ({arrival_ids_sql})
+                   AND CAST(v.visit_start_date AS DATE)
+                           <= CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                   AND (
+                       v.visit_end_date IS NULL
+                       OR CAST(v.visit_end_date AS DATE)
+                               >= CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                   )
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY a.impression_id
+                ORDER BY CAST(v.visit_start_date AS DATE) DESC
+            ) = 1
+        """)
+
+        n_matched = con.execute(
+            "SELECT COUNT(*) FROM _study_admissions").fetchone()[0]
+        n_total   = len(fm.impression_ids)
+        _log(f"[adm-trajectory] {n_matched:,} / {n_total:,} studies matched to "
+             f"a qualifying arrival")
+
+        if n_matched == 0:
+            _log("[adm-trajectory] no studies matched — returning empty result")
+            return pd.DataFrame(columns=out_cols)
+
+        parts_sql: list = []
+        params: list = []
+
+        # ── Labs ─────────────────────────────────────────────────────────
+        if "labs" in feature_types:
+            max_window = max(windows_days)
+            loinc_filter = ""
+            if loinc_codes:
+                loinc_filter = (
+                    f"AND c.concept_code IN "
+                    f"({', '.join('?' * len(loinc_codes))})"
+                )
+                params.extend(loinc_codes)
+            _log(f"[adm-trajectory] labs: scanning measurement.csv …")
+            parts_sql.append(f"""
+                SELECT
+                    COALESCE(p.panel, 'Other lab')                              AS panel,
+                    'lab'                                                       AS event_type,
+                    CAST(FLOOR(
+                        DATEDIFF('day',
+                            sa.admission_date,
+                            CAST(t.measurement_date AS DATE)
+                        ) / {bin_days}
+                    ) AS INTEGER)                                               AS bin_index,
+                    sa.impression_id
+                FROM read_csv_auto('{measurement_path}', ignore_errors=true) t
+                INNER JOIN _study_admissions sa
+                        ON CAST(t.person_id AS BIGINT) = sa.person_id
+                LEFT  JOIN _concept c
+                        ON CAST(t.measurement_concept_id AS BIGINT) = c.concept_id
+                LEFT  JOIN _panels p
+                        ON p.vocabulary_id = c.vocabulary_id
+                       AND p.concept_code = c.concept_code
+                WHERE t.measurement_date IS NOT NULL
+                  AND CAST(t.measurement_concept_id AS BIGINT) != 0
+                  {loinc_filter}
+                  AND CAST(t.measurement_date AS DATE) >= sa.admission_date
+                  AND CAST(t.measurement_date AS DATE)
+                          <= CAST(sa.anchor_time AS DATE)
+            """)
+
+        # ── Count feature types ──────────────────────────────────────────
+        for ft, (tbl, date_col, _datetime_col, concept_col, label, _value_expr) \
+                in _TIMELINE_TABLE_CONFIG.items():
+            if ft not in feature_types:
+                continue
+            csv_path = Path(omop_dir) / f"{tbl}.csv"
+            if not csv_path.exists():
+                _log(f"  WARNING: {tbl}.csv not found — skipping {ft}")
+                continue
+            _log(f"[adm-trajectory] {ft}: scanning {tbl}.csv …")
+            parts_sql.append(f"""
+                SELECT
+                    COALESCE(p.panel, 'Other {label}')                          AS panel,
+                    '{label}'                                                   AS event_type,
+                    CAST(FLOOR(
+                        DATEDIFF('day',
+                            sa.admission_date,
+                            CAST(t.{date_col} AS DATE)
+                        ) / {bin_days}
+                    ) AS INTEGER)                                               AS bin_index,
+                    sa.impression_id
+                FROM read_csv_auto('{csv_path}', ignore_errors=true) t
+                INNER JOIN _study_admissions sa
+                        ON CAST(t.person_id AS BIGINT) = sa.person_id
+                LEFT  JOIN _concept c
+                        ON CAST(t.{concept_col} AS BIGINT) = c.concept_id
+                LEFT  JOIN _panels p
+                        ON p.vocabulary_id = c.vocabulary_id
+                       AND p.concept_code = c.concept_code
+                WHERE t.{date_col} IS NOT NULL
+                  AND CAST(t.{concept_col} AS BIGINT) != 0
+                  AND CAST(t.{date_col} AS DATE) >= sa.admission_date
+                  AND CAST(t.{date_col} AS DATE)
+                          <= CAST(sa.anchor_time AS DATE)
+            """)
+
+        if not parts_sql:
+            _log("[adm-trajectory] no feature types configured — returning empty result")
+            return pd.DataFrame(columns=out_cols)
+
+        union_sql = "\nUNION ALL\n".join(parts_sql)
+        _log("[adm-trajectory] aggregating inside DuckDB …")
+        agg_df = con.execute(f"""
+            SELECT
+                panel, event_type, bin_index,
+                COUNT(*)                      AS n_events,
+                COUNT(DISTINCT impression_id) AS n_studies
+            FROM ({union_sql})
+            WHERE bin_index >= 0
+            GROUP BY panel, event_type, bin_index
+            ORDER BY panel, bin_index
+        """, params).df()
+
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+        if tmp_db.exists():
+            tmp_db.unlink(missing_ok=True)
+
+    if agg_df.empty:
+        _log("[adm-trajectory] no events matched — empty result")
+        return pd.DataFrame(columns=out_cols)
+
+    agg_df["bin_start_days"]   = agg_df["bin_index"] * bin_days
+    agg_df["bin_end_days"]     = (agg_df["bin_index"] + 1) * bin_days - 1
+    agg_df["pct_studies"]      = (
+        100.0 * agg_df["n_studies"] / n_matched if n_matched else 0.0
+    )
+    agg_df["n_total_matched"] = n_matched
+
+    _log(
+        f"[adm-trajectory] {len(agg_df):,} (panel, bin) rows "
+        f"({agg_df['panel'].nunique():,} panels × "
+        f"{agg_df['bin_index'].nunique():,} bins) "
+        f"from {n_matched:,} admission-matched studies")
+    return agg_df[out_cols]

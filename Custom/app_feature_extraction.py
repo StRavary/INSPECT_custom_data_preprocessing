@@ -1690,52 +1690,59 @@ def main() -> None:  # pragma: no cover
                         "Feature types not stored in this extraction (older "
                         "pkl). Re-run the extraction to enable this view.")
                 else:
+                    # ── Anchor mode ────────────────────────────────────────
+                    traj_anchor_mode = st.radio(
+                        "Anchor",
+                        ["CTPA (days before scan)", "Admission (days since arrival)"],
+                        horizontal=True,
+                        key="traj_anchor_mode",
+                        help="**CTPA**: x-axis = days before the CTPA — every "
+                             "study contributes from a fixed lookback window. "
+                             "**Admission**: x-axis = days since the qualifying "
+                             "arrival visit (inpatient / ER+inpatient / ER) that "
+                             "encompasses the anchor — window is [admission_date, "
+                             "anchor_time] per patient, length varies by LOS. "
+                             "Studies with no matching arrival are excluded and "
+                             "counted in the info box. Requires visit_occurrence.csv.",
+                    )
+                    adm_mode = traj_anchor_mode.startswith("Admission")
+
                     col_look, col_bin, col_metric, col_mem = st.columns(4)
-                    traj_lookback_days = col_look.number_input(
-                        "Lookback (days before CTPA)",
-                        min_value=1, max_value=None, value=365, step=30,
-                        key="traj_lookback_days",
-                        help="How far back this overview scans — deliberately "
-                             "**independent** of the lab/count windows set in "
-                             "Tab 2. Those are often set very large (e.g. to "
-                             "guarantee admission-anchored data never gets "
-                             "capped) for reasons that have nothing to do "
-                             "with what fits legibly on a heatmap axis. If "
-                             "this extraction's own window for a feature "
-                             "type is smaller than this value, the smaller "
-                             "one wins — this can only shrink the scan, "
-                             "never see further back than the extraction "
-                             "actually reaches. No upper limit, but a large "
-                             "value with a narrow bin width below produces "
-                             "many mostly-empty columns and an unreadable "
-                             "x-axis — that combination is the #1 cause of "
-                             "a garbled/overlapping axis.",
-                    )
-                    traj_bin_days = col_bin.number_input(
-                        "Bin width (days before CTPA)",
-                        min_value=1, max_value=365, value=7, step=1,
-                        key="traj_bin_days",
-                        help="Weekly (7d) bins are a reasonable start for a "
-                             "~1 year lookback. Narrower bins give more "
-                             "temporal resolution but more columns to look "
-                             "at; wider bins trade resolution for a more "
-                             "readable overview. Changing this requires "
-                             "rebuilding (re-queries DuckDB) — the metric "
-                             "choice to the right does not.",
-                    )
+
+                    if adm_mode:
+                        traj_lookback_days = None
+                        traj_bin_days = col_bin.number_input(
+                            "Bin width (days since admission)",
+                            min_value=1, max_value=30, value=1, step=1,
+                            key="traj_bin_days_adm",
+                            help="Daily bins (1 d) suit short in-hospital "
+                                 "windows (typical LOS 1–14 d). Widen to 2–7 "
+                                 "if the LOS tail is long.",
+                        )
+                    else:
+                        traj_lookback_days = col_look.number_input(
+                            "Lookback (days before CTPA)",
+                            min_value=1, max_value=None, value=365, step=30,
+                            key="traj_lookback_days",
+                            help="How far back this overview scans — deliberately "
+                                 "independent of the lab/count windows set in Tab 2.",
+                        )
+                        traj_bin_days = col_bin.number_input(
+                            "Bin width (days before CTPA)",
+                            min_value=1, max_value=365, value=7, step=1,
+                            key="traj_bin_days",
+                            help="Weekly (7d) bins are a reasonable start for a "
+                                 "~1 year lookback.",
+                        )
+
                     traj_metric = col_metric.selectbox(
                         "Metric",
                         ["pct_studies", "n_studies", "n_events"],
                         format_func=lambda m: _TRAJECTORY_METRIC_LABELS.get(m, m),
                         key="traj_metric",
-                        help="pct_studies (recommended): % of the cohort with "
-                             "at least one event in that panel/bin — "
-                             "normalized, so it isn't confounded by how many "
-                             "studies still have data that far back from "
-                             "CTPA. n_studies: raw count instead of %. "
-                             "n_events: total event count, unnormalized — "
-                             "can be dominated by a few patients with many "
-                             "repeat measurements.",
+                        help="pct_studies (recommended): % of the cohort (or of "
+                             "admission-matched studies) with at least one event "
+                             "in that panel/bin.",
                     )
                     traj_memory_limit_gb = col_mem.number_input(
                         "DuckDB memory limit (GB)",
@@ -1743,31 +1750,42 @@ def main() -> None:  # pragma: no cover
                         key="traj_memory_limit_gb",
                     )
 
-                    if st.button("📊 Build cohort trajectory", type="primary",
-                                 key="traj_build"):
-                        from Custom.appd_route_b_labs import build_cohort_trajectory
+                    btn_label = ("📊 Build admission trajectory"
+                                 if adm_mode else "📊 Build cohort trajectory")
+                    if st.button(btn_label, type="primary", key="traj_build"):
+                        from Custom.appd_route_b_labs import (
+                            build_cohort_trajectory,
+                            build_admission_cohort_trajectory,
+                        )
                         _omop_dir        = Path(omop_dir)
                         _measurement_csv = _omop_dir / "measurement.csv"
                         _concept_csv     = Path(concept_csv)
-                        with st.spinner(
-                            "Scanning and binning via DuckDB … this can "
-                            "take a while for a wide window over a large "
-                            "cohort, same as the other DuckDB-backed views "
-                            "in this tab."
-                        ):
-                            traj_df = build_cohort_trajectory(
-                                fm=fm,
-                                omop_dir=_omop_dir,
-                                measurement_path=_measurement_csv,
-                                concept_path=_concept_csv,
-                                bin_days=int(traj_bin_days),
-                                lookback_days=int(traj_lookback_days),
-                                memory_limit_gb=float(traj_memory_limit_gb),
-                                verbose=True,
-                            )
+                        with st.spinner("Scanning and binning via DuckDB …"):
+                            if adm_mode:
+                                traj_df = build_admission_cohort_trajectory(
+                                    fm=fm,
+                                    omop_dir=_omop_dir,
+                                    measurement_path=_measurement_csv,
+                                    concept_path=_concept_csv,
+                                    bin_days=int(traj_bin_days),
+                                    memory_limit_gb=float(traj_memory_limit_gb),
+                                    verbose=True,
+                                )
+                            else:
+                                traj_df = build_cohort_trajectory(
+                                    fm=fm,
+                                    omop_dir=_omop_dir,
+                                    measurement_path=_measurement_csv,
+                                    concept_path=_concept_csv,
+                                    bin_days=int(traj_bin_days),
+                                    lookback_days=int(traj_lookback_days),
+                                    memory_limit_gb=float(traj_memory_limit_gb),
+                                    verbose=True,
+                                )
                         st.session_state["traj_df"]          = traj_df
                         st.session_state["traj_df_bin_days"] = int(traj_bin_days)
                         st.session_state["traj_df_task"]     = fm.task
+                        st.session_state["traj_df_adm_mode"] = adm_mode
 
                     traj_df = st.session_state.get("traj_df")
                     if (traj_df is not None
@@ -1779,35 +1797,54 @@ def main() -> None:  # pragma: no cover
                         if traj_df.empty:
                             st.info("No events matched — nothing to plot.")
                         else:
-                            n_studies_total = len(fm.impression_ids)
-                            st.success(
-                                f"{len(traj_df):,} (panel × bin) cells · "
-                                f"{traj_df['panel'].nunique():,} panels · "
-                                f"{n_studies_total:,} studies in cohort")
+                            _adm = st.session_state.get("traj_df_adm_mode", False)
+                            n_matched = int(traj_df.get("n_total_matched", [0]).iloc[0]) \
+                                if _adm and "n_total_matched" in traj_df.columns else None
+                            n_total   = len(fm.impression_ids)
+                            if _adm and n_matched is not None:
+                                st.success(
+                                    f"{len(traj_df):,} (panel × bin) cells · "
+                                    f"{traj_df['panel'].nunique():,} panels · "
+                                    f"{n_matched:,} / {n_total:,} studies matched "
+                                    f"to a qualifying admission")
+                                if n_matched < n_total:
+                                    st.caption(
+                                        f"ℹ️ {n_total - n_matched:,} studies had no "
+                                        f"qualifying arrival record in "
+                                        f"visit_occurrence.csv and are excluded from "
+                                        f"this view. pct_studies is normalised to "
+                                        f"{n_matched:,} matched studies.")
+                            else:
+                                st.success(
+                                    f"{len(traj_df):,} (panel × bin) cells · "
+                                    f"{traj_df['panel'].nunique():,} panels · "
+                                    f"{n_total:,} studies in cohort")
+
+                            _adm_flag = st.session_state.get("traj_df_adm_mode", False)
+                            x_label = ("days since admission"
+                                       if _adm_flag else "days before CTPA")
                             traj_view = st.radio(
                                 "View as", ["Heatmap", "Bubble timeline"],
                                 horizontal=True, key="traj_view_mode",
-                                help="Heatmap: color = density, every bin "
-                                     "shown (including empty). Bubble "
-                                     "timeline: bubble area = density, empty "
-                                     "bins draw nothing — closer to the "
-                                     "individual live viewer's look, and a "
-                                     "real numeric x-axis so drag-to-zoom "
-                                     "narrows the visible range natively. "
-                                     "Neither auto-shrinks bin width on "
-                                     "zoom — use the bin width control above "
-                                     "for that once you've zoomed in.",
                             )
                             if traj_view == "Heatmap":
                                 traj_fig = _build_cohort_trajectory_heatmap(
                                     traj_df, metric=traj_metric,
                                     bin_days=st.session_state.get("traj_df_bin_days", 7),
-                                    title=f"{fm.task} · cohort trajectory relative to CTPA",
+                                    title=(f"{fm.task} · cohort trajectory "
+                                           f"({x_label})"),
+                                    x_axis_label=(
+                                        "Days since admission → CTPA"
+                                        if _adm_flag
+                                        else "Time before CTPA (T0, right edge)"
+                                    ),
+                                    reverse_x=not _adm_flag,
                                 )
                             else:
                                 traj_fig = _build_cohort_bubble_timeline(
                                     traj_df, metric=traj_metric,
-                                    title=f"{fm.task} · cohort trajectory relative to CTPA",
+                                    title=(f"{fm.task} · cohort trajectory "
+                                           f"({x_label})"),
                                 )
                             st.plotly_chart(traj_fig, use_container_width=True,
                                              key="traj_heatmap")

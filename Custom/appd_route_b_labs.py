@@ -82,6 +82,7 @@ from Custom.appd_route_b_timeline import (
     build_event_timeline_streamed,
     build_timeline_skeleton_streamed,
     build_cohort_trajectory,
+    build_admission_cohort_trajectory,
 )
 
 # ---------------------------------------------------------------------------
