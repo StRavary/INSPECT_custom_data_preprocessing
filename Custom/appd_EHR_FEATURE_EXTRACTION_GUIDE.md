@@ -696,6 +696,13 @@ vanish otherwise, so the sampling process is not missing-at-random. The
 measurement frequency; the NaN in the `last`/`min`/`max`/`mean` value columns
 captures absence.
 
+**NaN vs 0 for count features.** Lab features use NaN for absence;
+count features (`diag:`, `drug:`, `proc:`, `obs:`, `visit:`) use 0.
+Do not mix imputation strategies. The matrix viewer (§11) and coverage
+tab (§11.2) explicitly handle this distinction — if you write your own
+analysis code, apply the same logic: for count features, "no event" = 0,
+not NaN.
+
 ### 5.2 `concept_id = 0`
 
 In OMOP this means "no matching concept". The extractor filters it
@@ -807,7 +814,155 @@ Things not yet settled, flagged so you do not assume they are:
 |------------------------------------|---------|
 | `Custom/app_feature_extraction.py` | Streamlit interface — 6-tab UI (Load, Data sources, Extract, Describe, Export, Timeline) |
 | `Custom/appd_route_b_labs.py`      | Core extraction API (`LabExtractor`, `LabFeatureMatrix`); also contains `load_demographic_features()` and `append_demographics()` |
+| `Custom/appd_route_b_timeline.py`  | Trajectory and timeline builders — `build_cohort_trajectory`, `build_admission_cohort_trajectory`, `query_events_stack` |
 | `Custom/appd_route_b_worker.py`    | Subprocess worker spawned by the Streamlit app to run an extraction |
+| `Custom/appd_figures.py`           | Plotly figure builders — `_build_timeline_figure`, `_build_cohort_trajectory_heatmap`, `_build_cohort_bubble_timeline` |
 | `Custom/appd_context_descriptors.py` | Per-slice descriptor tables (`ContextDescriber`) |
 | `Custom/appd_clinical_panels.py`   | Clinical sub-panel taxonomy for the Timeline viewer (`assign_panel()`) — mirrors §4.6's groupings |
+| `Custom/appd_matrix_viewer.py`     | Standalone Streamlit matrix viewer — z-score heatmap, values mode, coverage tab |
 | `Custom/appd_extract_requirements.txt` | Pip requirements (duckdb, streamlit, numpy, pandas, scipy, plotly) |
+
+---
+
+## 10. Timeline tab (Tab 5)
+
+Tab 5 in the main app builds population-level event-density charts from
+`visit_occurrence.csv` and `measurement.csv` (no re-extraction needed — it
+reads the OMOP CSVs directly in a fast DuckDB pass). Two anchor modes are
+available.
+
+### 10.1 CTPA-anchored mode
+
+Events are binned relative to CTPA time (T0). Bin labels count backwards:
+`-1d..-7d`, `-8d..-14d`, … — the rightmost bin is closest to CTPA. The
+x-axis is reversed so T0 sits on the right, matching the individual
+swimlane viewer above it.
+
+### 10.2 Admission-anchored mode — two-phase matching
+
+"Build admission trajectory" attempts to find each study's hospital
+admission and align events to day-of-admission. Because `visit_occurrence`
+does not cover all studies (some patients have no structured visit record),
+the algorithm runs in two phases:
+
+**Phase 1 — `visit_occurrence` match**
+
+For each study find a visit that:
+- starts on or before CTPA and
+- ends on or after the day before CTPA (i.e., patient is still admitted
+  at CTPA time), and
+- has a length of stay ≤ `max_los_days` (default **60 days**).
+
+The 60-day LOS cap is critical: without it, long outpatient chronic-disease
+management entries spanning months match as "admissions" and inflate lab
+coverage across all bins uniformly. Genuine acute hospital admissions are
+≤ 60 days in the vast majority of cases.
+
+**Phase 2 — consecutive-lab-day fallback**
+
+Studies not matched in Phase 1 go through a streak detector.
+`measurement.csv` is scanned for distinct measurement dates in the
+`fallback_window_days` (default **30 days**) before CTPA. Dates are grouped
+into contiguous "streaks" (consecutive calendar days, gap ≤ 1 day). A
+streak qualifies as an inferred admission when:
+- it contains ≥ `min_consecutive_days` (default **2**) distinct measurement
+  days, and
+- its most recent date is ≤ 1 day before CTPA (i.e., the streak reaches
+  the eve of the scan — consistent with inpatient labs drawn daily until
+  the procedure).
+
+The inferred admission start is the first date of the qualifying streak.
+
+Both matched sets are combined (`UNION ALL`) and the result is aligned to
+day-of-admission. The app reports the source breakdown under the charts:
+"N via visit_occurrence · M via consecutive-lab fallback."
+
+**Parameters exposed in the UI:**
+
+| parameter | default | effect |
+|-----------|---------|--------|
+| `max_los_days` | 60 | LOS cap for visit_occurrence match — excludes outpatient chronic visits |
+| `min_consecutive_days` | 2 | Minimum streak length for fallback match |
+| `fallback_window_days` | 30 | How many days before CTPA to scan for lab streaks |
+
+**X-axis labels:** unlike CTPA-anchored mode, the x-axis counts *forward*
+from the admission day. Bin labels are "Day 0", "Day 1", … (or "Day 0–6",
+"Day 7–13", … for multi-day bins).
+
+### 10.3 Filtering "Other …" panels
+
+Panels named "Other visit", "Other drug", "Other procedure", etc. are
+catch-all categories containing uncoded or miscellaneous events — they
+provide no interpretable clinical signal. The **"Hide 'Other …' panels"**
+checkbox (default: on) filters them from both the heatmap and the bubble
+timeline. Uncheck it only if you need to audit uncoded volume.
+
+### 10.4 Cohort trajectory colorscale
+
+The heatmap uses a perceptually linear black→red→pale-yellow scale anchored
+at true zero (`zmin=0`). Without explicit `zmin=0`, Plotly normalises the
+colorscale to `[data_min, data_max]`, so a panel with a minimum of 2%
+activity would map 2% to black — making sparse panels appear identical to
+zero-activity panels. The explicit anchor ensures black always means "no
+events in this bin."
+
+| scale stop | color | meaning |
+|------------|-------|---------|
+| 0.0 | `#000000` black | 0 — no events |
+| 0.2 | `#7F0000` deep red | low activity |
+| 0.4 | `#CC0000` red | |
+| 0.6 | `#FF6600` orange | |
+| 0.8 | `#FFD700` gold | |
+| 1.0 | `#FFFF99` pale yellow | maximum in this cohort |
+
+---
+
+## 11. Matrix viewer (`appd_matrix_viewer.py`)
+
+A standalone Streamlit app for visually inspecting exported feature matrices.
+
+```bash
+streamlit run Custom/appd_matrix_viewer.py
+```
+
+### 11.1 Heatmap modes
+
+**Z-score mode** z-scores each feature column across the loaded studies (or
+the selected cohort filter) and renders the matrix as a heatmap. Colorscale:
+
+| z-score range | color | |
+|---------------|-------|-|
+| ≤ −3 | `#003080` dark blue | strongly below mean |
+| −3 → 0 | blue → light blue | below mean |
+| 0 | `#000000` black | at mean |
+| 0 → +3 | red → yellow | above mean |
+| ≥ +3 | `#FFE000` gold-yellow | strongly above mean |
+
+NaN cells are transparent (rendered as black because `plot_bgcolor="black"`).
+
+**Values mode** shows raw feature values instead of z-scores. For count
+features (`diag:`, `drug:`, `proc:`, `obs:`, `visit:`), a value of `0`
+means "event not observed" — it is converted to NaN before rendering so
+the cell appears black rather than as a spurious data point in the colour
+scale. Columns that are all-NaN after this conversion are hidden, and a
+caption reports how many were dropped.
+
+**Heatmap x-axis uniqueness:** Plotly's categorical axis collapses duplicate
+column labels. Features are identified by their raw internal name (always
+unique) on the axis; human-readable concept names appear only in the hover
+tooltip via a 2D `customdata` array matching the Z matrix shape.
+
+### 11.2 Coverage tab
+
+Shows what fraction of studies have a non-missing value for each feature.
+
+- **Lab features** (`labs:`): coverage = fraction of studies where the mask
+  is `1` (i.e., the lab was drawn at least once in the window).
+- **Count features** (`diag:`, `drug:`, `proc:`, `obs:`, `visit:`): these
+  columns store `0` for "event not observed," not `NaN`. A mask-based
+  coverage would show 100% for every count feature (the mask is always 1).
+  Instead, coverage is computed as `(X > 0).mean()` — the fraction of
+  studies where at least one event was recorded.
+
+Without this distinction, every count feature would appear at 100% coverage,
+masking the actual sparsity of rare diagnoses or drugs.

@@ -812,6 +812,60 @@ def build_timeline_skeleton_streamed(
     return n_rows
 
 
+def classify_acute_outpatient(
+    fm: "LabFeatureMatrix",
+    measurement_path: "Path",
+    window_days: int = 7,
+) -> "pd.Series":
+    """Classify each study as 'Acute' or 'Outpatient'.
+
+    'Acute' = at least one measurement recorded in the *window_days* before
+    anchor (labs drawn close to CTPA → likely admitted or ED).
+    'Outpatient' = no measurements in that window.
+
+    Parameters
+    ----------
+    fm              : loaded LabFeatureMatrix.
+    measurement_path: path to measurement.csv.
+    window_days     : look-back window in days (default 7).
+
+    Returns
+    -------
+    pd.Series indexed by impression_id, values 'Acute' or 'Outpatient'.
+    """
+    import duckdb
+    import pandas as pd
+
+    anchors_df = pd.DataFrame({
+        "person_id":     fm.patient_ids.astype("int64"),
+        "impression_id": fm.impression_ids,
+        "anchor_time":   [str(a) for a in fm.anchor_times],
+    })
+
+    con = duckdb.connect()
+    con.register("anchors_tbl", anchors_df)
+
+    acute_df = con.execute(f"""
+        SELECT DISTINCT a.impression_id
+        FROM anchors_tbl a
+        INNER JOIN read_csv_auto('{measurement_path}', ignore_errors=true) m
+               ON CAST(m.person_id AS BIGINT) = a.person_id
+        WHERE m.measurement_date IS NOT NULL
+          AND CAST(m.measurement_date AS DATE)
+              BETWEEN CAST(a.anchor_time AS DATE) - INTERVAL '{window_days}' DAY
+                  AND CAST(a.anchor_time AS DATE)
+    """).df()
+    con.close()
+
+    acute_ids = set(acute_df["impression_id"])
+    return pd.Series(
+        ["Acute" if iid in acute_ids else "Outpatient"
+         for iid in fm.impression_ids],
+        index=fm.impression_ids,
+        name="admission_type",
+    )
+
+
 def build_cohort_trajectory(
     fm: "LabFeatureMatrix",
     omop_dir: "Path",
@@ -822,6 +876,7 @@ def build_cohort_trajectory(
     lookback_days: Optional[int] = 365,
     memory_limit_gb: float = 4.0,
     verbose: bool = True,
+    impression_id_filter: Optional[set] = None,
 ) -> "pd.DataFrame":
     """Population-level, binned event density relative to CTPA — one row per
     (clinical panel, time bin), for a whole cohort of potentially thousands
@@ -909,6 +964,8 @@ def build_cohort_trajectory(
         "impression_id": fm.impression_ids,
         "anchor_time":   [str(a) for a in fm.anchor_times],
     })
+    if impression_id_filter is not None:
+        anchors_df = anchors_df[anchors_df["impression_id"].isin(impression_id_filter)]
 
     tmp_db = Path(tempfile.mktemp(suffix="_cohort_trajectory.duckdb"))
     con = duckdb.connect(str(tmp_db))
@@ -1063,6 +1120,10 @@ def build_admission_cohort_trajectory(
     bin_days: int = 1,
     memory_limit_gb: float = 4.0,
     verbose: bool = True,
+    min_consecutive_days: int = 2,
+    fallback_window_days: int = 30,
+    max_los_days: int = 60,
+    streak_end_max_days: int = 3,
 ) -> "pd.DataFrame":
     """Population-level, binned event density relative to *admission date*.
 
@@ -1070,20 +1131,31 @@ def build_admission_cohort_trajectory(
     **days since qualifying arrival** (0 = admission day, increasing toward
     anchor/CTPA) rather than days before CTPA.
 
-    The qualifying arrival per study is the most recent visit in
-    visit_occurrence.csv whose date range encompasses the anchor_time and
-    whose visit_concept_id is one of ARRIVAL_VISIT_CONCEPT_IDS (9201 =
-    Inpatient, 262 = ER+Inpatient, 9203 = ER).  Studies with no such visit
-    are excluded from all counts — n_total_matched in the returned DataFrame
-    reflects only studies that were successfully matched.
+    Admission anchor strategy (applied in order):
+    1. **visit_occurrence** — most recent qualifying arrival
+       (visit_concept_id in ARRIVAL_VISIT_CONCEPT_IDS) whose date range
+       encompasses anchor_time.  anchor_source = 'visit'.
+    2. **Consecutive-lab fallback** — for studies with no visit record, scan
+       measurement for the earliest day of a run of ≥ min_consecutive_days
+       consecutive days with at least one measurement, where the run ends
+       within 1 day of anchor_time.  anchor_source = 'inferred_labs'.
+       fallback_window_days controls how far back to search (default 30 d).
+
+    Studies that match neither criterion are excluded.  n_total_matched,
+    n_matched_visit, and n_matched_inferred in the returned DataFrame all
+    reflect only matched studies, so you can stratify or sensitivity-analyse
+    by anchor source.
 
     Parameters
     ----------
     fm, omop_dir, measurement_path, concept_path, loinc_codes,
     memory_limit_gb, verbose : see build_cohort_trajectory
-    bin_days : width of each time bin in days since admission (default 1 —
-        daily bins suit admission windows which are typically 1–30 days;
-        use 7 for a longer admission tail).
+    bin_days : width of each time bin in days since admission (default 1).
+    min_consecutive_days : minimum streak length for the lab fallback (default 2).
+    fallback_window_days : how far before CTPA to search for lab streaks (default 30).
+    streak_end_max_days  : maximum gap (days) between the last streak measurement and
+                           anchor time (default 3). The original value of 1 is too strict
+                           — a Monday CTPA after Friday labs gives a gap of 3 days.
 
     Returns
     -------
@@ -1091,7 +1163,7 @@ def build_admission_cohort_trajectory(
         panel, event_type, bin_index (0 = day 0 of admission),
         bin_start_days, bin_end_days (in days since admission),
         n_events, n_studies, pct_studies,
-        n_total_matched (constant — studies with a qualifying admission).
+        n_total_matched, n_matched_visit, n_matched_inferred.
     """
     def _log(msg: str) -> None:
         if verbose:
@@ -1122,7 +1194,8 @@ def build_admission_cohort_trajectory(
     out_cols = [
         "panel", "event_type", "bin_index",
         "bin_start_days", "bin_end_days",
-        "n_events", "n_studies", "pct_studies", "n_total_matched",
+        "n_events", "n_studies", "pct_studies",
+        "n_total_matched", "n_matched_visit", "n_matched_inferred",
     ]
 
     anchors_df = pd.DataFrame({
@@ -1157,13 +1230,13 @@ def build_admission_cohort_trajectory(
             panel_lookup_rows(), columns=["vocabulary_id", "concept_code", "panel"])
         con.register("_panels", panel_df)
 
-        # ── Find the qualifying arrival per study ──────────────────────────
-        # For each study, find the most recent qualifying arrival whose
-        # date range encompasses anchor_time (start ≤ anchor ≤ end, or
-        # still open).  Uses QUALIFY to pick one row per impression_id.
-        _log("[adm-trajectory] matching qualifying arrivals from visit_occurrence.csv …")
+        # ── Phase 1: visit_occurrence ──────────────────────────────────────
+        # Most recent qualifying arrival whose date range encompasses
+        # anchor_time (start ≤ anchor ≤ end, or still open).
+        _log(f"[adm-trajectory] phase 1 — matching qualifying arrivals from "
+             f"visit_occurrence.csv (max LOS {max_los_days}d) …")
         con.execute(f"""
-            CREATE TEMP TABLE _study_admissions AS
+            CREATE TEMP TABLE _visit_admissions AS
             SELECT
                 a.impression_id,
                 a.person_id,
@@ -1172,7 +1245,8 @@ def build_admission_cohort_trajectory(
                 DATEDIFF('day',
                     CAST(v.visit_start_date AS DATE),
                     CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
-                )                                               AS los_days
+                )                                               AS los_days,
+                'visit'                                         AS anchor_source
             FROM anchors_tbl a
             INNER JOIN read_csv_auto('{visit_csv}', ignore_errors=true) v
                     ON CAST(v.person_id AS BIGINT) = a.person_id
@@ -1184,17 +1258,135 @@ def build_admission_cohort_trajectory(
                        OR CAST(v.visit_end_date AS DATE)
                                >= CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
                    )
+                   AND DATEDIFF('day',
+                       CAST(v.visit_start_date AS DATE),
+                       CAST(CAST(a.anchor_time AS TIMESTAMP) AS DATE)
+                   ) <= {max_los_days}
             QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY a.impression_id
                 ORDER BY CAST(v.visit_start_date AS DATE) DESC
             ) = 1
         """)
 
-        n_matched = con.execute(
-            "SELECT COUNT(*) FROM _study_admissions").fetchone()[0]
-        n_total   = len(fm.impression_ids)
-        _log(f"[adm-trajectory] {n_matched:,} / {n_total:,} studies matched to "
-             f"a qualifying arrival")
+        n_matched_visit = con.execute(
+            "SELECT COUNT(*) FROM _visit_admissions").fetchone()[0]
+        n_total = len(fm.impression_ids)
+        _log(f"[adm-trajectory]   visit match: {n_matched_visit:,} / {n_total:,}")
+
+        # ── Phase 2: consecutive-lab fallback ──────────────────────────────
+        # For studies with no visit record, find the earliest day of the
+        # most recent run of ≥ min_consecutive_days consecutive lab days
+        # that ends within 1 day of anchor_time.
+        _log(f"[adm-trajectory] phase 2 — consecutive-lab fallback "
+             f"(window={fallback_window_days}d, min_streak={min_consecutive_days}d) …")
+        con.execute(f"""
+            CREATE TEMP TABLE _unmatched AS
+            SELECT a.impression_id, a.person_id,
+                   CAST(a.anchor_time AS TIMESTAMP) AS anchor_time
+            FROM anchors_tbl a
+            LEFT JOIN _visit_admissions va ON a.impression_id = va.impression_id
+            WHERE va.impression_id IS NULL
+        """)
+
+        con.execute(f"""
+            CREATE TEMP TABLE _fallback_meas_days AS
+            SELECT
+                u.impression_id,
+                u.person_id,
+                u.anchor_time,
+                CAST(t.measurement_date AS DATE) AS meas_date,
+                DATEDIFF('day',
+                    CAST(t.measurement_date AS DATE),
+                    CAST(u.anchor_time AS DATE)
+                ) AS days_before_ctpa
+            FROM _unmatched u
+            INNER JOIN read_csv_auto('{measurement_path}', ignore_errors=true) t
+                    ON CAST(t.person_id AS BIGINT) = u.person_id
+            WHERE t.measurement_date IS NOT NULL
+              AND CAST(t.measurement_date AS DATE) <= CAST(u.anchor_time AS DATE)
+              AND CAST(t.measurement_date AS DATE)
+                      >= CAST(u.anchor_time AS DATE) - INTERVAL '{fallback_window_days}' DAY
+            GROUP BY u.impression_id, u.person_id, u.anchor_time,
+                     CAST(t.measurement_date AS DATE)
+        """)
+
+        n_unmatched_with_meas = con.execute(
+            "SELECT COUNT(DISTINCT impression_id) FROM _fallback_meas_days"
+        ).fetchone()[0]
+        _log(f"[adm-trajectory]   fallback: {n_unmatched_with_meas:,} unmatched studies "
+             f"have ≥1 measurement in the {fallback_window_days}-day window")
+
+        # Gap marker: 1 where the gap from the previous measurement day > 1 day
+        # (i.e. the streak broke), then cumulative sum gives a streak ID.
+        # DuckDB does not allow window functions nested inside other window
+        # functions, so LAG is computed in an inner subquery first.
+        con.execute("""
+            CREATE TEMP TABLE _fallback_streaks AS
+            SELECT
+                impression_id, person_id, anchor_time, meas_date, days_before_ctpa,
+                SUM(CASE
+                    WHEN prev_meas_date IS NULL
+                      OR DATEDIFF('day', prev_meas_date, meas_date) > 1
+                    THEN 1 ELSE 0
+                END) OVER (PARTITION BY impression_id ORDER BY meas_date) AS streak_id
+            FROM (
+                SELECT
+                    impression_id, person_id, anchor_time, meas_date, days_before_ctpa,
+                    LAG(meas_date) OVER (
+                        PARTITION BY impression_id ORDER BY meas_date
+                    ) AS prev_meas_date
+                FROM _fallback_meas_days
+            ) _lagged
+        """)
+
+        con.execute(f"""
+            CREATE TEMP TABLE _inferred_admissions AS
+            SELECT
+                impression_id,
+                person_id,
+                anchor_time,
+                streak_start                        AS admission_date,
+                DATEDIFF('day', streak_start,
+                    CAST(anchor_time AS DATE))      AS los_days,
+                'inferred_labs'                     AS anchor_source
+            FROM (
+                SELECT
+                    impression_id, person_id, anchor_time, streak_id,
+                    MIN(meas_date) AS streak_start,
+                    MAX(meas_date) AS streak_end,
+                    COUNT(*)       AS streak_days,
+                    MIN(days_before_ctpa) AS closest_to_ctpa,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY impression_id
+                        ORDER BY MIN(days_before_ctpa) ASC, COUNT(*) DESC
+                    ) AS rn
+                FROM _fallback_streaks
+                GROUP BY impression_id, person_id, anchor_time, streak_id
+                HAVING COUNT(*) >= {min_consecutive_days}        -- streak long enough
+                   AND MIN(days_before_ctpa) <= {streak_end_max_days}  -- ends near CTPA
+            ) ranked
+            WHERE rn = 1
+        """)
+
+        n_matched_inferred = con.execute(
+            "SELECT COUNT(*) FROM _inferred_admissions").fetchone()[0]
+        _log(f"[adm-trajectory]   lab fallback: {n_matched_inferred:,} additional studies")
+
+        # ── Combine both sources ───────────────────────────────────────────
+        con.execute("""
+            CREATE TEMP TABLE _study_admissions AS
+            SELECT impression_id, person_id, anchor_time,
+                   admission_date, los_days, anchor_source
+            FROM _visit_admissions
+            UNION ALL
+            SELECT impression_id, person_id, anchor_time,
+                   admission_date, los_days, anchor_source
+            FROM _inferred_admissions
+        """)
+
+        n_matched = n_matched_visit + n_matched_inferred
+        _log(f"[adm-trajectory] total matched: {n_matched:,} / {n_total:,} "
+             f"({n_matched_visit:,} visit + {n_matched_inferred:,} inferred)")
 
         if n_matched == 0:
             _log("[adm-trajectory] no studies matched — returning empty result")
@@ -1306,12 +1498,14 @@ def build_admission_cohort_trajectory(
         _log("[adm-trajectory] no events matched — empty result")
         return pd.DataFrame(columns=out_cols)
 
-    agg_df["bin_start_days"]   = agg_df["bin_index"] * bin_days
-    agg_df["bin_end_days"]     = (agg_df["bin_index"] + 1) * bin_days - 1
-    agg_df["pct_studies"]      = (
+    agg_df["bin_start_days"]    = agg_df["bin_index"] * bin_days
+    agg_df["bin_end_days"]      = (agg_df["bin_index"] + 1) * bin_days - 1
+    agg_df["pct_studies"]       = (
         100.0 * agg_df["n_studies"] / n_matched if n_matched else 0.0
     )
-    agg_df["n_total_matched"] = n_matched
+    agg_df["n_total_matched"]   = n_matched
+    agg_df["n_matched_visit"]   = n_matched_visit
+    agg_df["n_matched_inferred"] = n_matched_inferred
 
     _log(
         f"[adm-trajectory] {len(agg_df):,} (panel, bin) rows "

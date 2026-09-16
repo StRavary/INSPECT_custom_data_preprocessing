@@ -122,9 +122,17 @@ def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct
     # re-sort by row totals instead.
     pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
 
-    bin_start = pivot.columns.to_numpy() * bin_days + 1
-    bin_end   = (pivot.columns.to_numpy() + 1) * bin_days
-    x_labels  = [f"-{e}d..-{s}d" for s, e in zip(bin_start, bin_end)]
+    bin_start = pivot.columns.to_numpy() * bin_days      # 0-indexed day start
+    bin_end   = (pivot.columns.to_numpy() + 1) * bin_days - 1  # inclusive end
+    if reverse_x:
+        # CTPA-anchored: bins count backwards from T0, so show as "-Xd"
+        x_labels = [f"-{e+1}d..-{s+1}d" for s, e in zip(bin_start, bin_end)]
+    else:
+        # Admission-anchored: bins count forward from day 0
+        if bin_days == 1:
+            x_labels = [f"Day {s}" for s in bin_start]
+        else:
+            x_labels = [f"Day {s}–{e}" for s, e in zip(bin_start, bin_end)]
 
     metric_label = _TRAJECTORY_METRIC_LABELS.get(metric, metric)
 
@@ -142,7 +150,15 @@ def _build_cohort_trajectory_heatmap(traj_df: "pd.DataFrame", metric: str = "pct
         z=pivot.to_numpy(),
         x=x_labels,
         y=pivot.index.tolist(),
-        colorscale="YlOrRd",
+        colorscale=[
+            [0.00, "#000000"],  # black        (0 — no events)
+            [0.20, "#7F0000"],  # deep red
+            [0.40, "#CC0000"],  # red
+            [0.60, "#FF6600"],  # orange
+            [0.80, "#FFD700"],  # gold
+            [1.00, "#FFFF99"],  # pale yellow  (max)
+        ],
+        zmin=0,               # anchor black to true zero, not data minimum
         colorbar=dict(title=metric_label),
         hovertemplate="%{y}<br>%{x} before CTPA<br>" + metric_label + ": %{z}<extra></extra>",
     ))

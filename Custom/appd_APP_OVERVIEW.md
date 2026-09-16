@@ -34,6 +34,15 @@ For column-level definitions and task semantics, see
 5. **Tab 4 · Export** — write `X.npy` / `y.npy` / `metadata.csv` to a
    folder, or export a long-format CSV if you'd rather work in
    pandas/Excel/R. Every export ships a ready-to-run `load_survival.py`.
+6. **Tab 5 · Timeline** — explore event density relative to CTPA or hospital
+   admission. Two views: a **Cohort trajectory heatmap** (panel × time bin,
+   black→red→pale-yellow colorscale, zero anchored to black) and a **Bubble
+   timeline** (same data, bubble area proportional to the metric). Switch
+   between CTPA-anchored mode (x-axis counts backwards to T0) and
+   **Admission-anchored** mode (x-axis counts forward from day of admission
+   as "Day 0", "Day 1", …). Toggle **"Hide 'Other …' panels"** (on by
+   default) to suppress uninformative catch-all categories such as
+   "Other drug" or "Other visit".
 
 ---
 
@@ -61,7 +70,11 @@ whatever you extract — no extra step needed.
   not just one bucket.
 - **NaN ≠ 0.** Labs use `NaN` for "not measured"; diagnoses/drugs/
   procedures/observations/visits use `0` for "not observed." Don't impute
-  count columns with the same strategy you'd use for labs.
+  count columns with the same strategy you'd use for labs. The matrix
+  viewer and coverage tab honour this distinction: a count feature with
+  value `0` is treated as "not observed" (coverage = 0), not as a valid
+  measurement — this prevents count features from appearing at 100%
+  coverage when most patients simply had zero events.
 - **`dx` vs `px` anchor.** Diagnostic tasks (e.g. `pe_positive`) anchor one
   day *before* `StudyTime`; prognostic tasks (e.g. `12_month_PH`,
   mortality/readmission) anchor *at* `StudyTime`. "auto" gets this right
@@ -76,6 +89,10 @@ whatever you extract — no extra step needed.
   fingerprinted (MD5 hash of task + windows + feature types + paths, etc.)
   and cached under `DATA_PROCESSED/femr_cache/`. Changing one slider
   produces a new cache entry; it never overwrites an old one.
+- **Admission trajectory re-run is free.** "Build admission trajectory" is
+  a lightweight post-processing step over an already-extracted matrix — it
+  does not re-run DuckDB extraction. The two-phase admission matching (see
+  `appd_EHR_FEATURE_EXTRACTION_GUIDE.md §10.2`) runs in seconds.
 
 ---
 
@@ -87,5 +104,30 @@ whatever you extract — no extra step needed.
 - Exported arrays: wherever you point Tab 4's **Export directory** (default
   `DATA_PROCESSED/exports/<task>/`).
 
-Questions or something looks wrong? See appd_EHR_FEATURE_EXTRACTION_GUIDE.md. or check the live log in Tab 2 first, most extraction issues (missing table, empty LOINC filter, bad path) show
-up there in plain English.
+---
+
+## Matrix viewer (`appd_matrix_viewer.py`)
+
+A standalone Streamlit app for visually inspecting the exported feature
+matrix (`X.npy`).  Run it separately from the main extractor:
+
+```bash
+streamlit run Custom/appd_matrix_viewer.py
+```
+
+| mode | colorscale | NaN handling |
+|------|-----------|-------------|
+| **Z-score** | dark-blue (−3) → black (0) → red → yellow (+3) | NaN renders as black (plot background) |
+| **Values** | same scale, raw values | count features: `0` converted to NaN before z-scoring so "not observed" = black; all-NaN columns hidden |
+| **Coverage** | % of studies with a non-missing value | count features: `X > 0` used as observed (not the NaN-based mask), so diagnoses/drugs/procedures report genuine event coverage |
+
+The **Coverage** tab shows what fraction of studies have a non-missing value
+for each feature. For lab features this uses the binary observed/absent mask;
+for count features (`diag:`, `drug:`, `proc:`, `obs:`, `visit:`) it uses
+`X > 0` because these columns encode absence as `0`, not `NaN`. Without this
+distinction, every count feature would appear at 100% coverage (every study
+has a `0`).
+
+Questions or something looks wrong? See `appd_EHR_FEATURE_EXTRACTION_GUIDE.md`
+or check the live log in Tab 2 first — most extraction issues (missing table,
+empty LOINC filter, bad path) show up there in plain English.

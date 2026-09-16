@@ -70,9 +70,21 @@ def _prefix(col: str) -> str:
     return "other"
 
 
-def _coverage(X: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Per-feature fraction of studies with an observed value (mask==1), as %."""
-    return mask.mean(axis=0) * 100.0
+def _coverage(X: np.ndarray, mask: np.ndarray, raw_names: list[str]) -> np.ndarray:
+    """Per-feature fraction of studies with an observed value, as %.
+
+    X_mask.npy is NaN-based: mask=1 wherever X is not NaN. For lab features
+    that is correct. For count features (diag:, drug:, proc:, obs:, visit:)
+    X stores 0 for 'not observed' and the mask is therefore 1 for every study
+    — which would report 100% coverage for rare diagnoses. We override those
+    columns with (X > 0) so coverage means 'at least one event recorded'.
+    """
+    _COUNT_PREFIXES = {"diag:", "drug:", "proc:", "obs:", "visit:"}
+    obs = mask.astype(float)  # start from the NaN-based mask
+    for j, raw in enumerate(raw_names):
+        if _prefix(raw) in _COUNT_PREFIXES:
+            obs[:, j] = (X[:, j] > 0).astype(float)
+    return obs.mean(axis=0) * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +223,7 @@ def _tab_coverage(X, mask, raw_names, human_names, y, use_human: bool):
         "Sort and filter to find sparse features, or set a coverage floor before "
         "downstream analysis.")
 
-    cov = _coverage(X, mask)   # shape (n_features,)
+    cov = _coverage(X, mask, raw_names)   # shape (n_features,)
     display_names = human_names if use_human else raw_names
     prefixes = [_prefix(r) for r in raw_names]
 
@@ -512,9 +524,16 @@ def _tab_heatmap(X, mask, raw_names, human_names, y, use_human: bool):
     # ── build the plot matrix ─────────────────────────────────────────────
     if mode == "Values":
         Z = X[np.ix_(study_idx, feat_idx)].astype(float)
-        # standardise each column (z-score across observed values) so that
-        # different units (creatinine in µmol/L vs albumin in g/dL) don't
-        # swamp each other on a shared color scale.
+        # Count features (diag:, drug:, proc:, obs:, visit:) store 0 for
+        # "not observed" rather than NaN, so every study would show a slight
+        # negative z-score instead of a grey/absent cell. Replace those zeros
+        # with NaN before z-scoring so they render as missing, matching labs.
+        _COUNT_PREFIXES = {"diag:", "drug:", "proc:", "obs:", "visit:"}
+        for _j, _raw in enumerate([raw_names[i] for i in feat_idx]):
+            if _prefix(_raw) in _COUNT_PREFIXES:
+                Z[Z[:, _j] == 0, _j] = np.nan
+        # Standardise each column (z-score across observed values) so that
+        # different units don't swamp each other on a shared colour scale.
         with np.errstate(invalid="ignore", divide="ignore", all="ignore"):
             import warnings
             with warnings.catch_warnings():
@@ -524,7 +543,30 @@ def _tab_heatmap(X, mask, raw_names, human_names, y, use_human: bool):
             col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
             col_std  = np.where((col_std == 0) | np.isnan(col_std), 1.0, col_std)
             Z = (Z - col_mean) / col_std
-        colorscale = "RdBu_r"
+        # Drop columns where every cell is NaN in this sample — they add no
+        # information and fill the heatmap with blank space.
+        _col_any = ~np.all(np.isnan(Z), axis=0)
+        if not np.all(_col_any):
+            _keep = np.where(_col_any)[0]
+            n_dropped = Z.shape[1] - len(_keep)
+            Z = Z[:, _keep]
+            feat_idx = feat_idx[_keep]
+            if n_dropped:
+                st.caption(
+                    f"ℹ️ {n_dropped:,} features hidden in Values mode "
+                    "(no observations in this sample — use Mask mode to see coverage).")
+        # Black = NaN / zero (matches plot_bgcolor).
+        # Negative z: dark blue → light blue → black.
+        # Positive z: black → red → yellow.
+        colorscale = [
+            [0.00, "#003080"],  # dark blue      (z = -3)
+            [0.30, "#2196F3"],  # medium blue    (z = -1.2)
+            [0.48, "#B3D9FF"],  # pale blue      (z = -0.12)
+            [0.50, "#000000"],  # black          (z =  0)
+            [0.52, "#FF6030"],  # dark orange-red(z = +0.12)
+            [0.70, "#FF3300"],  # vivid red      (z = +1.2)
+            [1.00, "#FFE000"],  # yellow         (z = +3)
+        ]
         colorbar_title = "z-score"
         zmid = 0
         zmin, zmax = -3, 3
@@ -543,6 +585,10 @@ def _tab_heatmap(X, mask, raw_names, human_names, y, use_human: bool):
     x_human = [human_names[i] for i in feat_idx]
     y_labels = [str(i) for i in study_idx]
 
+    # Heatmap customdata must match Z's shape (n_studies × n_features); broadcast
+    # the per-column human name list across every row so %{customdata} works.
+    custom_2d = np.array(x_human, dtype=object)[np.newaxis, :].repeat(len(study_idx), axis=0)
+
     fig = go.Figure(go.Heatmap(
         z=Z,
         x=x_raw,
@@ -551,7 +597,7 @@ def _tab_heatmap(X, mask, raw_names, human_names, y, use_human: bool):
         zmid=zmid,
         zmin=zmin, zmax=zmax,
         colorbar=dict(title=colorbar_title, thickness=14),
-        customdata=x_human,
+        customdata=custom_2d,
         hovertemplate="study %{y}<br>%{customdata}<br>value: %{z:.3g}<extra></extra>",
     ))
     # Show human-readable tick labels on the axis, but keep unique raw values
@@ -571,7 +617,7 @@ def _tab_heatmap(X, mask, raw_names, human_names, y, use_human: bool):
         yaxis=dict(title="Study index", showgrid=False, autorange="reversed"),
         height=max(400, min(900, 2 * len(study_idx))),
         margin=dict(l=10, r=10, t=30, b=80),
-        plot_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="black",
         paper_bgcolor="rgba(0,0,0,0)",
     )
     st.plotly_chart(fig, width="stretch", key="hm_chart")

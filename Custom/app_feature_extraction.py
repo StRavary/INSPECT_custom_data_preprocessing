@@ -1750,10 +1750,56 @@ def main() -> None:  # pragma: no cover
                         key="traj_memory_limit_gb",
                     )
 
+                    # ── Acute / outpatient stratification (CTPA mode only) ─
+                    _traj_id_filter = None
+                    if not adm_mode:
+                        with st.expander("Stratify by admission type (optional)", expanded=False):
+                            st.caption(
+                                "Classifies each study as **Acute** (≥1 lab drawn "
+                                "in the chosen window before CTPA) or **Outpatient** "
+                                "(no labs in that window). Run classification first, "
+                                "then choose which group to plot."
+                            )
+                            _cls_col1, _cls_col2 = st.columns([1, 2])
+                            _cls_window = _cls_col1.number_input(
+                                "Lab window (days before CTPA)",
+                                min_value=1, max_value=30, value=7, step=1,
+                                key="traj_cls_window",
+                            )
+                            if _cls_col2.button("🔍 Classify studies", key="traj_classify"):
+                                from Custom.appd_route_b_timeline import classify_acute_outpatient
+                                _omop_dir_cls    = Path(omop_dir)
+                                _measurement_cls = _omop_dir_cls / "measurement.csv"
+                                with st.spinner("Scanning measurement.csv …"):
+                                    _cls = classify_acute_outpatient(
+                                        fm=fm,
+                                        measurement_path=_measurement_cls,
+                                        window_days=int(_cls_window),
+                                    )
+                                st.session_state["traj_classification"] = _cls
+
+                            _cls = st.session_state.get("traj_classification")
+                            if _cls is not None:
+                                _n_acute = (_cls == "Acute").sum()
+                                _n_out   = (_cls == "Outpatient").sum()
+                                st.info(
+                                    f"**{_n_acute:,} Acute** (labs in ≤{_cls_window}d window) · "
+                                    f"**{_n_out:,} Outpatient** (no labs in that window)"
+                                )
+                                _grp = st.radio(
+                                    "Plot trajectory for",
+                                    ["All studies", "Acute only", "Outpatient only"],
+                                    horizontal=True, key="traj_cls_filter",
+                                )
+                                if _grp == "Acute only":
+                                    _traj_id_filter = set(_cls[_cls == "Acute"].index)
+                                elif _grp == "Outpatient only":
+                                    _traj_id_filter = set(_cls[_cls == "Outpatient"].index)
+
                     btn_label = ("📊 Build admission trajectory"
                                  if adm_mode else "📊 Build cohort trajectory")
                     if st.button(btn_label, type="primary", key="traj_build"):
-                        from Custom.appd_route_b_labs import (
+                        from Custom.appd_route_b_timeline import (
                             build_cohort_trajectory,
                             build_admission_cohort_trajectory,
                         )
@@ -1780,12 +1826,17 @@ def main() -> None:  # pragma: no cover
                                     bin_days=int(traj_bin_days),
                                     lookback_days=int(traj_lookback_days),
                                     memory_limit_gb=float(traj_memory_limit_gb),
+                                    impression_id_filter=_traj_id_filter,
                                     verbose=True,
                                 )
                         st.session_state["traj_df"]          = traj_df
                         st.session_state["traj_df_bin_days"] = int(traj_bin_days)
                         st.session_state["traj_df_task"]     = fm.task
                         st.session_state["traj_df_adm_mode"] = adm_mode
+                        st.session_state["traj_df_cls_filter"] = (
+                            st.session_state.get("traj_cls_filter", "All studies")
+                            if not adm_mode else None
+                        )
 
                     traj_df = st.session_state.get("traj_df")
                     if (traj_df is not None
@@ -1800,6 +1851,10 @@ def main() -> None:  # pragma: no cover
                             _adm = st.session_state.get("traj_df_adm_mode", False)
                             n_matched = int(traj_df.get("n_total_matched", [0]).iloc[0]) \
                                 if _adm and "n_total_matched" in traj_df.columns else None
+                            n_visit    = int(traj_df["n_matched_visit"].iloc[0]) \
+                                if _adm and "n_matched_visit" in traj_df.columns else None
+                            n_inferred = int(traj_df["n_matched_inferred"].iloc[0]) \
+                                if _adm and "n_matched_inferred" in traj_df.columns else None
                             n_total   = len(fm.impression_ids)
                             if _adm and n_matched is not None:
                                 st.success(
@@ -1807,18 +1862,37 @@ def main() -> None:  # pragma: no cover
                                     f"{traj_df['panel'].nunique():,} panels · "
                                     f"{n_matched:,} / {n_total:,} studies matched "
                                     f"to a qualifying admission")
+                                parts = []
+                                if n_visit is not None:
+                                    parts.append(f"{n_visit:,} via visit_occurrence")
+                                if n_inferred is not None and n_inferred > 0:
+                                    parts.append(f"{n_inferred:,} via consecutive-lab fallback")
+                                if parts:
+                                    st.caption("Anchor source: " + " · ".join(parts))
                                 if n_matched < n_total:
                                     st.caption(
                                         f"ℹ️ {n_total - n_matched:,} studies had no "
-                                        f"qualifying arrival record in "
-                                        f"visit_occurrence.csv and are excluded from "
-                                        f"this view. pct_studies is normalised to "
-                                        f"{n_matched:,} matched studies.")
+                                        f"qualifying arrival record and no consecutive "
+                                        f"lab streak — excluded. pct_studies is "
+                                        f"normalised to {n_matched:,} matched studies.")
                             else:
+                                _cls_label = st.session_state.get(
+                                    "traj_df_cls_filter", "All studies")
+                                _n_shown = (
+                                    len(_traj_id_filter)
+                                    if _traj_id_filter is not None
+                                    else n_total
+                                )
+                                _suffix = (
+                                    f" · filter: {_cls_label}"
+                                    if _cls_label and _cls_label != "All studies"
+                                    else ""
+                                )
                                 st.success(
                                     f"{len(traj_df):,} (panel × bin) cells · "
                                     f"{traj_df['panel'].nunique():,} panels · "
-                                    f"{n_total:,} studies in cohort")
+                                    f"{_n_shown:,} / {n_total:,} studies{_suffix}"
+                                )
 
                             _adm_flag = st.session_state.get("traj_df_adm_mode", False)
                             x_label = ("days since admission"
@@ -1827,9 +1901,20 @@ def main() -> None:  # pragma: no cover
                                 "View as", ["Heatmap", "Bubble timeline"],
                                 horizontal=True, key="traj_view_mode",
                             )
+                            hide_other = st.checkbox(
+                                "Hide 'Other …' panels", value=True,
+                                key="traj_hide_other",
+                                help="Removes catch-all panels (Other lab, Other drug, "
+                                     "Other visit, …) that group unclassified codes "
+                                     "and are rarely informative.",
+                            )
+                            _plot_traj = (
+                                traj_df[~traj_df["panel"].str.startswith("Other")]
+                                if hide_other else traj_df
+                            )
                             if traj_view == "Heatmap":
                                 traj_fig = _build_cohort_trajectory_heatmap(
-                                    traj_df, metric=traj_metric,
+                                    _plot_traj, metric=traj_metric,
                                     bin_days=st.session_state.get("traj_df_bin_days", 7),
                                     title=(f"{fm.task} · cohort trajectory "
                                            f"({x_label})"),
@@ -1842,7 +1927,7 @@ def main() -> None:  # pragma: no cover
                                 )
                             else:
                                 traj_fig = _build_cohort_bubble_timeline(
-                                    traj_df, metric=traj_metric,
+                                    _plot_traj, metric=traj_metric,
                                     title=(f"{fm.task} · cohort trajectory "
                                            f"({x_label})"),
                                 )
